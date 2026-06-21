@@ -1,0 +1,28 @@
+[package]
+name = "xlh"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+plotters = "0.3"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "1"
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+
+[[bin]]
+name = "xlh"
+path = "src/main.rs"
+
+[lib]
+name = "xlh"
+path = "src/lib.rs"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

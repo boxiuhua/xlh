@@ -1,0 +1,41 @@
+[data]
+fund_code = "161725"
+start = "2020-01-01"
+end   = "2024-12-31"
+cache_dir = ".cache"
+
+[fees]
+buy_rate = 0.0015
+sell_tiers = [
+  { max_days = 7,   rate = 0.015 },
+  { max_days = 365, rate = 0.005 },
+  { max_days = 0,   rate = 0.000 },
+]
+
+# 单次路径要求 [strategy] 可解析（寻优模式下忽略内容）
+[strategy]
+kind = "dca"
+[strategy.params]
+period = "monthly"
+day = 1
+base_amount = 1000.0
+
+[report]
+chart = false
+html = false
+out_dir = "output"
+
+[portfolio]
+initial_cash = 0.0
+
+[optimize]
+strategy = "smart_dca"
+metric   = "sharpe"
+top_n    = 5
+
+[optimize.grid]
+period      = ["monthly"]
+day         = [1]
+base_amount = [1000.0]
+ma_window   = [120, 250, 500]
+k           = [0.5, 1.0, 1.5]

@@ -1,0 +1,34 @@
+[data]
+fund_code = "161725"        # 招商中证白酒
+start = "2020-01-01"
+end   = "2024-12-31"
+cache_dir = ".cache"
+
+[fees]
+buy_rate = 0.0015
+sell_tiers = [
+  { max_days = 7,   rate = 0.015 },
+  { max_days = 365, rate = 0.005 },
+  { max_days = 0,   rate = 0.000 },
+]
+
+[strategy]
+kind = "smart_dca"
+[strategy.params]
+period = "monthly"
+day = 1
+base_amount = 1000.0
+ma_window = 250
+k = 1.0
+
+[[rules]]
+kind = "take_profit"
+target_return = 0.30
+
+[portfolio]
+initial_cash = 0.0
+
+[report]
+chart = true
+html  = true
+out_dir = "output"

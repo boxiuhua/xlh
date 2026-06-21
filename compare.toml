@@ -1,0 +1,57 @@
+[data]
+fund_code = "161725"
+start = "2020-01-01"
+end = "2024-12-31"
+cache_dir = ".cache"
+
+[fees]
+buy_rate = 0.0015
+sell_tiers = [
+  { max_days = 7, rate = 0.015 },
+  { max_days = 365, rate = 0.005 },
+  { max_days = 0, rate = 0.0 },
+]
+
+[strategy]
+kind = "dca"
+[strategy.params]
+period = "monthly"
+day = 1
+base_amount = 1000.0
+
+[report]
+chart = false
+html = false
+out_dir = "output"
+
+[[compare]]
+name = "普通定投"
+fund_code = "161725"
+[compare.strategy]
+kind = "dca"
+[compare.strategy.params]
+period = "monthly"
+day = 1
+base_amount = 1000.0
+
+[[compare]]
+name = "智能定投"
+fund_code = "161725"
+[compare.strategy]
+kind = "smart_dca"
+[compare.strategy.params]
+period = "monthly"
+day = 1
+base_amount = 1000.0
+ma_window = 250
+k = 1.0
+
+[[compare]]
+name = "均线择时"
+fund_code = "161725"
+[compare.strategy]
+kind = "trend"
+[compare.strategy.params]
+short_window = 20
+long_window = 60
+amount = 1000.0
