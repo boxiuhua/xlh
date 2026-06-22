@@ -15,6 +15,57 @@ pub struct RegimeReport {
     pub rec_strategy: String,
     pub rec_name: String,
     pub rationale: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<ActionPlan>,
+}
+
+/// 单条触发线及其对应操作（净值阈值 + 文案）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Tier {
+    pub label: String,
+    pub nav: f64,
+    pub action: String,
+}
+
+/// 当下判读：最新净值落在哪一档、该做什么、距下一档还差多少。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CurrentRead {
+    pub nav: f64,
+    pub date: String,
+    pub z: f64,
+    pub signal: String,
+    pub action: String,
+    pub next_hint: String,
+}
+
+/// 高抛低吸行动计划：均线 ±k·σ 波动带 + 分档仓位 + 当下指引 + 形态修正。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ActionPlan {
+    pub ma: f64,
+    pub sigma: f64,
+    pub band_window: usize,
+    pub buy_strong: f64,
+    pub buy: f64,
+    pub sell: f64,
+    pub sell_strong: f64,
+    pub tiers: Vec<Tier>,
+    pub current: CurrentRead,
+    pub buy_hits: usize,
+    pub sell_hits: usize,
+    pub caveat: String,
+}
+
+/// 行动计划参数：波动带窗口、买入基准金额、卖出基准比例。
+pub struct PlanParams {
+    pub band_window: usize,
+    pub base_amount: f64,
+    pub sell_pct: f64,
+}
+
+impl Default for PlanParams {
+    fn default() -> Self {
+        Self { band_window: 60, base_amount: 1000.0, sell_pct: 0.20 }
+    }
 }
 
 pub struct RegimeParams {
@@ -86,7 +137,120 @@ pub fn detect_regime(points: &[NavPoint], p: &RegimeParams) -> anyhow::Result<Re
         rec_strategy: rec_strategy.to_string(),
         rec_name: rec_name.to_string(),
         rationale: rationale.to_string(),
+        plan: None,
     })
+}
+
+/// 由历史净值与已判定的行情形态，构建高抛低吸行动计划。纯函数，不做 IO。
+pub fn build_action_plan(
+    points: &[NavPoint],
+    report: &RegimeReport,
+    p: &PlanParams,
+) -> anyhow::Result<ActionPlan> {
+    let n = p.band_window;
+    if points.len() < n {
+        return Err(anyhow::anyhow!("数据不足: 行动计划需要至少 {} 个净值点，当前 {}", n, points.len()));
+    }
+    let slice = &points[points.len() - n..];
+    let navs: Vec<f64> = slice.iter().map(|q| q.acc_nav).collect();
+    let ma = navs.iter().sum::<f64>() / n as f64;
+    let sigma = stdev(&navs);
+    if sigma <= 0.0 {
+        return Err(anyhow::anyhow!("波动为零，无法构建波动带（窗口内净值长期不变）"));
+    }
+    let buy_strong = ma - 2.0 * sigma;
+    let buy = ma - sigma;
+    let sell = ma + sigma;
+    let sell_strong = ma + 2.0 * sigma;
+
+    let base = p.base_amount;
+    let pct = p.sell_pct;
+    let buy_amt = |x: f64| format!("买入 {:.0} 元", x);
+    let sell_amt = |q: f64| format!("卖出持仓 {:.0}%", q * 100.0);
+
+    let tiers = vec![
+        Tier { label: "强力低吸".into(), nav: buy_strong, action: buy_amt(base * 2.0) },
+        Tier { label: "低吸".into(),     nav: buy,         action: buy_amt(base) },
+        Tier { label: "观望".into(),     nav: ma,          action: "持有不动".into() },
+        Tier { label: "高抛".into(),     nav: sell,        action: sell_amt(pct) },
+        Tier { label: "强力高抛".into(), nav: sell_strong, action: sell_amt(pct * 2.0) },
+    ];
+
+    let last = points.last().unwrap();
+    let nav = last.acc_nav;
+    let z = (nav - ma) / sigma;
+    let (signal, mut action) = if z <= -2.0 {
+        ("强力低吸", buy_amt(base * 2.0))
+    } else if z <= -1.0 {
+        ("低吸", buy_amt(base))
+    } else if z < 1.0 {
+        ("观望", "持有不动".to_string())
+    } else if z < 2.0 {
+        ("高抛", sell_amt(pct))
+    } else {
+        ("强力高抛", sell_amt(pct * 2.0))
+    };
+
+    // 形态修正：上涨趋势削弱减仓力度，下跌趋势谨慎抄底。
+    match report.regime.as_str() {
+        "上涨趋势" => match signal {
+            "高抛" => action = "趋势向上，建议持有观望（暂不减仓，待 +2σ 再减）".to_string(),
+            "强力高抛" => action = sell_amt(pct), // 2× 减半为 1×
+            _ => {}
+        },
+        "下跌趋势" => {
+            if signal == "低吸" {
+                action = "趋势向下，暂不抄底（仅 -2σ 小额试探）".to_string();
+            }
+        }
+        _ => {}
+    }
+
+    let pct_to = |target: f64| (target / nav - 1.0) * 100.0;
+    let next_hint = if z < 1.0 {
+        format!("距低吸线 {:.4} 需 {:+.1}%，距高抛线 {:.4} 需 {:+.1}%",
+            buy, pct_to(buy), sell, pct_to(sell))
+    } else {
+        format!("距强力高抛线 {:.4} 需 {:+.1}%", sell_strong, pct_to(sell_strong))
+    };
+
+    // 结合历史：窗口内净值下穿低吸线/上穿高抛线的次数。
+    let mut buy_hits = 0usize;
+    let mut sell_hits = 0usize;
+    for w in slice.windows(2) {
+        let (a, b) = (w[0].acc_nav, w[1].acc_nav);
+        if a > buy && b <= buy { buy_hits += 1; }
+        if a < sell && b >= sell { sell_hits += 1; }
+    }
+
+    let caveat = match report.regime.as_str() {
+        "上涨趋势" => "上涨趋势：顺势持有，低吸照做、高抛减半执行，勿过早下车。",
+        "下跌趋势" => "下跌趋势：高抛照做、低吸只在 -2σ 小额试探，注意下行风险。",
+        _ => "震荡：区间内高抛低吸吃波动，按触发线分档执行。",
+    }.to_string();
+
+    Ok(ActionPlan {
+        ma, sigma, band_window: n,
+        buy_strong, buy, sell, sell_strong,
+        tiers,
+        current: CurrentRead {
+            nav, date: last.date.to_string(), z,
+            signal: signal.to_string(), action, next_hint,
+        },
+        buy_hits, sell_hits, caveat,
+    })
+}
+
+/// 一次性给出形态判定 + 行动计划（web 层使用）。
+pub fn detect_regime_with_plan(
+    points: &[NavPoint],
+    rp: &RegimeParams,
+    pp: &PlanParams,
+) -> anyhow::Result<RegimeReport> {
+    let mut report = detect_regime(points, rp)?;
+    let plan = build_action_plan(points, &report, pp)?;
+    report.plan = Some(plan);
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -141,5 +305,81 @@ mod tests {
         let vals: Vec<f64> = (0..130).map(|i| 1.0 + i as f64 / 129.0).collect();
         let r = detect_regime(&series(&vals), &RegimeParams::default()).unwrap();
         assert!(r.annualized_vol > 0.0, "上涨序列应有正波动率");
+    }
+
+    /// 构造仅 regime 字段不同的最小 RegimeReport，用于隔离测试形态修正。
+    fn report_with(regime: &str) -> RegimeReport {
+        RegimeReport {
+            regime: regime.to_string(),
+            window: 60, window_return: 0.0, annualized_vol: 0.0,
+            ma_short: 1.0, ma_long: 1.0, ma_relation: "纠缠".into(),
+            rec_strategy: "rsi".into(), rec_name: "RSI超买超卖".into(),
+            rationale: "".into(), plan: None,
+        }
+    }
+
+    #[test]
+    fn plan_deep_below_is_strong_buy() {
+        // 59 点在 1.0 附近小幅波动，最后一点深跌到 0.5 → 远低于 MA-2σ
+        let mut vals: Vec<f64> = (0..59).map(|i| if i % 2 == 0 { 0.99 } else { 1.01 }).collect();
+        vals.push(0.5);
+        let plan = build_action_plan(&series(&vals), &report_with("震荡"), &PlanParams::default()).unwrap();
+        assert_eq!(plan.current.signal, "强力低吸", "深跌应判强力低吸: z={}", plan.current.z);
+        assert!(plan.current.action.contains("2000"), "应买入 2× 基准=2000: {}", plan.current.action);
+    }
+
+    #[test]
+    fn plan_high_above_is_sell() {
+        let mut vals: Vec<f64> = (0..59).map(|i| if i % 2 == 0 { 0.99 } else { 1.01 }).collect();
+        vals.push(2.0);
+        let plan = build_action_plan(&series(&vals), &report_with("震荡"), &PlanParams::default()).unwrap();
+        assert!(plan.current.signal.contains("高抛"), "高位应判高抛: {}", plan.current.signal);
+        assert!(plan.current.action.contains("卖"), "应给出卖出动作: {}", plan.current.action);
+    }
+
+    #[test]
+    fn plan_counts_history_triggers() {
+        // 围绕 1.0 的较大幅振荡 → 反复穿越 ±1σ 线
+        let vals: Vec<f64> = (0..60).map(|i| 1.0 + 0.1 * ((i as f64) * 0.7).sin()).collect();
+        let plan = build_action_plan(&series(&vals), &report_with("震荡"), &PlanParams::default()).unwrap();
+        assert!(plan.buy_hits > 0, "振荡序列应有低吸触发计数");
+        assert!(plan.sell_hits > 0, "振荡序列应有高抛触发计数");
+    }
+
+    #[test]
+    fn plan_caveat_varies_by_regime() {
+        let vals: Vec<f64> = (0..60).map(|i| 1.0 + 0.05 * ((i as f64) * 0.5).sin()).collect();
+        let pts = series(&vals);
+        let up = build_action_plan(&pts, &report_with("上涨趋势"), &PlanParams::default()).unwrap();
+        let down = build_action_plan(&pts, &report_with("下跌趋势"), &PlanParams::default()).unwrap();
+        let range = build_action_plan(&pts, &report_with("震荡"), &PlanParams::default()).unwrap();
+        assert!(up.caveat.contains("顺势") || up.caveat.contains("上涨"), "上涨提示: {}", up.caveat);
+        assert!(down.caveat.contains("风险") || down.caveat.contains("下跌"), "下跌提示: {}", down.caveat);
+        assert!(range.caveat.contains("震荡") || range.caveat.contains("高抛低吸"), "震荡提示: {}", range.caveat);
+    }
+
+    #[test]
+    fn detect_with_plan_serializes_frontend_keys() {
+        // 130 点温和上涨，足够 detect_regime 与波动带窗口
+        let vals: Vec<f64> = (0..130).map(|i| 1.0 + 0.002 * i as f64).collect();
+        let r = detect_regime_with_plan(&series(&vals), &RegimeParams::default(), &PlanParams::default()).unwrap();
+        let j = serde_json::to_string(&r).unwrap();
+        for key in ["\"plan\"", "\"tiers\"", "\"current\"", "\"buy_strong\"", "\"sell_strong\"", "\"caveat\"", "\"signal\""] {
+            assert!(j.contains(key), "JSON 应含 {key}: {j}");
+        }
+    }
+
+    #[test]
+    fn plan_uptrend_softens_sell_in_high_zone() {
+        // last 落在 +1σ~+2σ 高抛区：震荡下应卖出，上涨趋势下应改为持有观望
+        let mut vals: Vec<f64> = (0..59).map(|i| if i % 2 == 0 { 0.97 } else { 1.03 }).collect();
+        vals.push(1.05);
+        let pts = series(&vals);
+        let range = build_action_plan(&pts, &report_with("震荡"), &PlanParams::default()).unwrap();
+        let up = build_action_plan(&pts, &report_with("上涨趋势"), &PlanParams::default()).unwrap();
+        assert_eq!(range.current.signal, "高抛", "震荡高抛区: z={}", range.current.z);
+        assert!(range.current.action.contains("卖"), "震荡应卖出: {}", range.current.action);
+        assert_eq!(up.current.signal, "高抛", "上涨同样在高抛区: z={}", up.current.z);
+        assert!(up.current.action.contains("持有"), "上涨趋势下高抛区应改持有: {}", up.current.action);
     }
 }

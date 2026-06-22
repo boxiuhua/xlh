@@ -415,6 +415,12 @@ pub struct RegimeQuery {
     pub fund_code: String,
     #[serde(default)]
     pub window: Option<usize>,
+    #[serde(default)]
+    pub band_window: Option<usize>,
+    #[serde(default)]
+    pub base_amount: Option<f64>,
+    #[serde(default)]
+    pub sell_pct: Option<f64>,
 }
 
 async fn regime_handler(
@@ -429,13 +435,22 @@ async fn regime_handler(
 fn regime_blocking(q: RegimeQuery) -> Result<crate::analyze::RegimeReport> {
     validate_fund_code(&q.fund_code)?;
     let window = q.window.unwrap_or(120);
+    let default_plan = crate::analyze::PlanParams::default();
+    let band_window = q.band_window.unwrap_or(default_plan.band_window);
     let end = chrono::Local::now().date_naive();
-    let start = end - chrono::Duration::days((window as i64) * 2 + 120);
+    // 多取数据以覆盖 window、均线与波动带窗口
+    let lookback = (window.max(band_window) as i64) * 2 + 120;
+    let start = end - chrono::Duration::days(lookback);
     let points = crate::data::cache::load_or_fetch(
         &q.fund_code, std::path::Path::new(".cache"), start, end)
         .map_err(|e| anyhow!("加载净值失败: {e}"))?;
     let params = crate::analyze::RegimeParams { window, ..Default::default() };
-    crate::analyze::detect_regime(&points, &params)
+    let plan = crate::analyze::PlanParams {
+        band_window,
+        base_amount: q.base_amount.unwrap_or(default_plan.base_amount),
+        sell_pct: q.sell_pct.unwrap_or(default_plan.sell_pct),
+    };
+    crate::analyze::detect_regime_with_plan(&points, &params, &plan)
 }
 
 pub struct AppError(pub anyhow::Error);

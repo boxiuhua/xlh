@@ -157,6 +157,9 @@ button.del{color:#c0392b;border-color:#e8b9b3}
       <div class="row">
         <div class="field combo"><label>基金代码</label><input id="diag-fund" value="161725"/></div>
         <div class="field"><label>窗口(交易日)</label><input type="number" id="diag-window" value="120"/></div>
+        <div class="field"><label>波动带窗口</label><input type="number" id="diag-band" value="60"/></div>
+        <div class="field"><label>买入基准(元)</label><input type="number" id="diag-base" value="1000"/></div>
+        <div class="field"><label>卖出基准(%)</label><input type="number" id="diag-sell" value="20"/></div>
         <button class="run" id="run-diagnose">诊断</button>
       </div>
       <div id="diag-result" style="margin-top:14px"></div>
@@ -405,6 +408,38 @@ document.getElementById('sync-one').addEventListener('click', function(){
 });
 attachCombobox(document.getElementById('sync-code'));
 
+function diagSignalColor(sig){
+  if(sig && sig.indexOf('低吸')>=0) return '#27ae60';
+  if(sig && sig.indexOf('高抛')>=0) return '#c0392b';
+  return '#7f8c8d';
+}
+function renderPlan(p){
+  if(!p || !p.current) return '';
+  var c = p.current;
+  var sc = diagSignalColor(c.signal);
+  var rows = (p.tiers||[]).map(function(t){
+    var hit = c.signal === t.label;
+    var bg = hit ? 'background:#fff7e6;font-weight:700' : '';
+    return '<tr style="'+bg+'"><td style="padding:4px 8px">'+esc(t.label)+'</td>'
+      + '<td style="padding:4px 8px;text-align:right">'+t.nav.toFixed(4)+'</td>'
+      + '<td style="padding:4px 8px">'+esc(t.action)+'</td></tr>';
+  }).join('');
+  return ''
+    + '<div style="margin-top:14px;padding:12px;border:1px solid #eee;border-radius:8px">'
+    + '<div style="font-size:1.1rem">当下：<strong style="color:'+sc+'">'+esc(c.signal)+'</strong>'
+    + ' — '+esc(c.action)+'</div>'
+    + '<div style="color:#5a6a7a;margin-top:4px">当前净值 '+c.nav.toFixed(4)+'（'+esc(c.date)+'）'
+    + ' · z = '+c.z.toFixed(2)+'</div>'
+    + '<div style="color:#5a6a7a;margin-top:2px">'+esc(c.next_hint)+'</div>'
+    + '</div>'
+    + '<div style="margin-top:10px;color:#34495e">波动带（'+p.band_window+' 交易日）中轴 '+p.ma.toFixed(4)+' · σ '+p.sigma.toFixed(4)+'</div>'
+    + '<table style="margin-top:6px;border-collapse:collapse;width:100%;font-size:.95rem">'
+    + '<tr style="color:#7f8c8d;text-align:left"><th style="padding:4px 8px">信号</th>'
+    + '<th style="padding:4px 8px;text-align:right">触发净值</th><th style="padding:4px 8px">操作</th></tr>'
+    + rows + '</table>'
+    + '<div style="margin-top:8px;color:#5a6a7a">历史窗口内触发：低吸 '+p.buy_hits+' 次 · 高抛 '+p.sell_hits+' 次</div>'
+    + '<div style="margin-top:8px;padding:8px 10px;background:#f3f7ff;border-radius:6px;color:#34495e">'+esc(p.caveat)+'</div>';
+}
 function renderDiag(r){
   var box = document.getElementById('diag-result');
   if(!r || !r.regime){ box.innerHTML = '<span style="color:#c0392b">诊断失败</span>'; return; }
@@ -415,15 +450,22 @@ function renderDiag(r){
     + ' · 年化波动 '+(r.annualized_vol*100).toFixed(2)+'%'
     + ' · 均线 '+esc(r.ma_relation)+'（'+r.window+' 交易日）</div>'
     + '<div style="margin-top:10px;font-size:1.05rem">建议策略：<strong>'+esc(r.rec_name)+'</strong></div>'
-    + '<div style="color:#5a6a7a;margin-top:4px">'+esc(r.rationale)+'</div>';
+    + '<div style="color:#5a6a7a;margin-top:4px">'+esc(r.rationale)+'</div>'
+    + renderPlan(r.plan);
 }
 document.getElementById('run-diagnose').addEventListener('click', function(){
   var btn = this;
   var fund = document.getElementById('diag-fund').value.trim();
   var win = document.getElementById('diag-window').value.trim();
+  var band = document.getElementById('diag-band').value.trim();
+  var base = document.getElementById('diag-base').value.trim();
+  var sell = document.getElementById('diag-sell').value.trim();
   if(!fund){ document.getElementById('diag-result').innerHTML = '<span style="color:#c0392b">请先填基金代码</span>'; return; }
   var qs = new URLSearchParams({fund_code: fund});
   if(win) qs.append('window', win);
+  if(band) qs.append('band_window', band);
+  if(base) qs.append('base_amount', base);
+  if(sell) qs.append('sell_pct', (parseFloat(sell)/100).toString());
   var t = btn.textContent; btn.disabled = true; btn.textContent = '诊断中…';
   document.getElementById('diag-result').textContent = '诊断中…';
   fetch('/api/regime?' + qs.toString())
