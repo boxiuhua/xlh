@@ -422,20 +422,23 @@ function renderPlan(p){
     var bg = hit ? 'background:#fff7e6;font-weight:700' : '';
     return '<tr style="'+bg+'"><td style="padding:4px 8px">'+esc(t.label)+'</td>'
       + '<td style="padding:4px 8px;text-align:right">'+t.nav.toFixed(4)+'</td>'
+      + '<td style="padding:4px 8px;text-align:right">'+t.unit_nav.toFixed(4)+'</td>'
       + '<td style="padding:4px 8px">'+esc(t.action)+'</td></tr>';
   }).join('');
   return ''
     + '<div style="margin-top:14px;padding:12px;border:1px solid #eee;border-radius:8px">'
     + '<div style="font-size:1.1rem">当下：<strong style="color:'+sc+'">'+esc(c.signal)+'</strong>'
     + ' — '+esc(c.action)+'</div>'
-    + '<div style="color:#5a6a7a;margin-top:4px">当前净值 '+c.nav.toFixed(4)+'（'+esc(c.date)+'）'
+    + '<div style="color:#5a6a7a;margin-top:4px">当前累计净值 <strong>'+c.nav.toFixed(4)+'</strong>'
+    + ' · 单位净值 <strong>'+c.unit_nav.toFixed(4)+'</strong>（'+esc(c.date)+'）'
     + ' · z = '+c.z.toFixed(2)+'</div>'
     + '<div style="color:#5a6a7a;margin-top:2px">'+esc(c.next_hint)+'</div>'
     + '</div>'
-    + '<div style="margin-top:10px;color:#34495e">波动带（'+p.band_window+' 交易日）中轴 '+p.ma.toFixed(4)+' · σ '+p.sigma.toFixed(4)+'</div>'
+    + '<div style="margin-top:10px;color:#34495e">波动带按<strong>累计净值</strong>口径（'+p.band_window+' 交易日）中轴 '+p.ma.toFixed(4)+' · σ '+p.sigma.toFixed(4)+'</div>'
     + '<table style="margin-top:6px;border-collapse:collapse;width:100%;font-size:.95rem">'
     + '<tr style="color:#7f8c8d;text-align:left"><th style="padding:4px 8px">信号</th>'
-    + '<th style="padding:4px 8px;text-align:right">触发净值</th><th style="padding:4px 8px">操作</th></tr>'
+    + '<th style="padding:4px 8px;text-align:right">触发累计净值</th>'
+    + '<th style="padding:4px 8px;text-align:right">≈单位净值</th><th style="padding:4px 8px">操作</th></tr>'
     + rows + '</table>'
     + '<div style="margin-top:8px;color:#5a6a7a">历史窗口内触发：低吸 '+p.buy_hits+' 次 · 高抛 '+p.sell_hits+' 次</div>'
     + '<div style="margin-top:8px;padding:8px 10px;background:#f3f7ff;border-radius:6px;color:#34495e">'+esc(p.caveat)+'</div>';

@@ -19,18 +19,24 @@ pub struct RegimeReport {
     pub plan: Option<ActionPlan>,
 }
 
-/// 单条触发线及其对应操作（净值阈值 + 文案）。
+/// 单条触发线及其对应操作（累计净值阈值 + 等价单位净值 + 文案）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Tier {
     pub label: String,
+    /// 触发累计净值（波动带口径）。
     pub nav: f64,
+    /// 等价单位净值 = 累计净值 − 分红累计偏移（窗口内无分红时近似恒定）。
+    pub unit_nav: f64,
     pub action: String,
 }
 
 /// 当下判读：最新净值落在哪一档、该做什么、距下一档还差多少。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CurrentRead {
+    /// 当前累计净值。
     pub nav: f64,
+    /// 当前单位净值（基金App显示口径）。
+    pub unit_nav: f64,
     pub date: String,
     pub z: f64,
     pub signal: String,
@@ -168,16 +174,23 @@ pub fn build_action_plan(
     let buy_amt = |x: f64| format!("买入 {:.0} 元", x);
     let sell_amt = |q: f64| format!("卖出持仓 {:.0}%", q * 100.0);
 
+    let last = points.last().unwrap();
+    let nav = last.acc_nav;       // 累计净值（波动带口径）
+    let unit = last.nav;          // 单位净值（基金App显示口径）
+    let d_offset = nav - unit;    // 分红累计偏移，窗口内无分红时近似恒定
+    let unit_of = |acc: f64| acc - d_offset;   // 累计净值 → 等价单位净值
+
+    let tier = |label: &str, acc: f64, action: String| Tier {
+        label: label.into(), nav: acc, unit_nav: unit_of(acc), action,
+    };
     let tiers = vec![
-        Tier { label: "强力低吸".into(), nav: buy_strong, action: buy_amt(base * 2.0) },
-        Tier { label: "低吸".into(),     nav: buy,         action: buy_amt(base) },
-        Tier { label: "观望".into(),     nav: ma,          action: "持有不动".into() },
-        Tier { label: "高抛".into(),     nav: sell,        action: sell_amt(pct) },
-        Tier { label: "强力高抛".into(), nav: sell_strong, action: sell_amt(pct * 2.0) },
+        tier("强力低吸", buy_strong, buy_amt(base * 2.0)),
+        tier("低吸",     buy,         buy_amt(base)),
+        tier("观望",     ma,          "持有不动".into()),
+        tier("高抛",     sell,        sell_amt(pct)),
+        tier("强力高抛", sell_strong, sell_amt(pct * 2.0)),
     ];
 
-    let last = points.last().unwrap();
-    let nav = last.acc_nav;
     let z = (nav - ma) / sigma;
     let (signal, mut action) = if z <= -2.0 {
         ("强力低吸", buy_amt(base * 2.0))
@@ -206,12 +219,14 @@ pub fn build_action_plan(
         _ => {}
     }
 
-    let pct_to = |target: f64| (target / nav - 1.0) * 100.0;
+    // 百分比按单位净值（真实价格）计算，与基金App涨跌口径一致
+    let pct_to = |acc_target: f64| (unit_of(acc_target) / unit - 1.0) * 100.0;
     let next_hint = if z < 1.0 {
-        format!("距低吸线 {:.4} 需 {:+.1}%，距高抛线 {:.4} 需 {:+.1}%",
-            buy, pct_to(buy), sell, pct_to(sell))
+        format!("距低吸线 累计{:.4}/单位{:.4} 需 {:+.1}%，距高抛线 累计{:.4}/单位{:.4} 需 {:+.1}%",
+            buy, unit_of(buy), pct_to(buy), sell, unit_of(sell), pct_to(sell))
     } else {
-        format!("距强力高抛线 {:.4} 需 {:+.1}%", sell_strong, pct_to(sell_strong))
+        format!("距强力高抛线 累计{:.4}/单位{:.4} 需 {:+.1}%",
+            sell_strong, unit_of(sell_strong), pct_to(sell_strong))
     };
 
     // 结合历史：窗口内净值下穿低吸线/上穿高抛线的次数。
@@ -234,7 +249,7 @@ pub fn build_action_plan(
         buy_strong, buy, sell, sell_strong,
         tiers,
         current: CurrentRead {
-            nav, date: last.date.to_string(), z,
+            nav, unit_nav: unit, date: last.date.to_string(), z,
             signal: signal.to_string(), action, next_hint,
         },
         buy_hits, sell_hits, caveat,
@@ -356,6 +371,29 @@ mod tests {
         assert!(up.caveat.contains("顺势") || up.caveat.contains("上涨"), "上涨提示: {}", up.caveat);
         assert!(down.caveat.contains("风险") || down.caveat.contains("下跌"), "下跌提示: {}", down.caveat);
         assert!(range.caveat.contains("震荡") || range.caveat.contains("高抛低吸"), "震荡提示: {}", range.caveat);
+    }
+
+    /// 单位净值与累计净值不同的序列（恒定分红偏移 d）。
+    fn series_split(acc: &[f64], d: f64) -> Vec<NavPoint> {
+        acc.iter().enumerate().map(|(i, a)| NavPoint {
+            date: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap() + chrono::Duration::days(i as i64),
+            nav: *a - d, acc_nav: *a,
+        }).collect()
+    }
+
+    #[test]
+    fn plan_reports_unit_nav_equivalents() {
+        // 累计净值在 2.2 附近波动；单位净值 = 累计 − 1.5（恒定分红偏移）
+        let acc: Vec<f64> = (0..60).map(|i| 2.2 + 0.02 * ((i as f64) * 0.5).sin()).collect();
+        let pts = series_split(&acc, 1.5);
+        let plan = build_action_plan(&pts, &report_with("震荡"), &PlanParams::default()).unwrap();
+        // 当前单位净值 = 最后一点的 nav，且≠累计净值
+        assert!((plan.current.unit_nav - pts.last().unwrap().nav).abs() < 1e-9);
+        assert!((plan.current.nav - plan.current.unit_nav - 1.5).abs() < 1e-6, "累计应比单位高 1.5");
+        // 每条触发线的等价单位净值 = 累计净值 − 1.5
+        for t in &plan.tiers {
+            assert!((t.unit_nav - (t.nav - 1.5)).abs() < 1e-6, "{} 等价单位净值应为累计−1.5", t.label);
+        }
     }
 
     #[test]
