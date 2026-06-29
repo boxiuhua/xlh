@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use serde::Serialize;
 
-#[allow(unused_imports)]
 use crate::analyze::{self, PlanParams, RegimeParams, RegimeReport};
 use crate::broker::{FeeModel, SellTier};
 use crate::config::build_strategy_from;
@@ -14,9 +13,7 @@ use crate::runner;
 pub const DISCLAIMER: &str =
     "基于历史净值的统计回测与启发式规则，不预测未来走势，不构成任何投资建议。";
 
-#[allow(dead_code)]
 const MIN_TRAIN: usize = 120;
-#[allow(dead_code)]
 const MIN_TEST: usize = 30;
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -76,7 +73,6 @@ pub struct RecommendReport {
 }
 
 /// 总体标准分（population std）。长度<1 返回空；σ≈0 返回全 0（不除零）。
-#[allow(dead_code)]
 fn zscores(xs: &[f64]) -> Vec<f64> {
     let n = xs.len();
     if n == 0 { return Vec::new(); }
@@ -88,7 +84,6 @@ fn zscores(xs: &[f64]) -> Vec<f64> {
 }
 
 /// 按比例切训练/检验段；任一段不足最小阈值返回 None。
-#[allow(dead_code)]
 fn split_history(points: &[NavPoint], split_ratio: f64) -> Option<(&[NavPoint], &[NavPoint])> {
     let cut = (points.len() as f64 * split_ratio).floor() as usize;
     let (train, test) = points.split_at(cut);
@@ -96,7 +91,6 @@ fn split_history(points: &[NavPoint], split_ratio: f64) -> Option<(&[NavPoint], 
 }
 
 /// 5 个候选策略（kind, 中文名），顺序即展示顺序。
-#[allow(dead_code)]
 const CANDIDATES: &[(&str, &str)] = &[
     ("dca", "普通定投"),
     ("smart_dca", "智能定投"),
@@ -106,7 +100,6 @@ const CANDIDATES: &[(&str, &str)] = &[
 ];
 
 /// 各策略固定稳健默认参数（不逐基金寻优，降低过拟合）。
-#[allow(dead_code)]
 fn default_params(kind: &str) -> toml::Value {
     let mut t = toml::Table::new();
     let s = |x: &str| toml::Value::String(x.to_string());
@@ -140,7 +133,6 @@ fn default_params(kind: &str) -> toml::Value {
 }
 
 /// 评分用费率：买入 0、卖出标准阶梯。
-#[allow(dead_code)]
 fn rec_fee() -> FeeModel {
     FeeModel {
         buy_rate: 0.0,
@@ -153,13 +145,88 @@ fn rec_fee() -> FeeModel {
 }
 
 /// 在给定净值段上跑某策略，返回绩效摘要。固定默认参数保证 build 不失败。
-#[allow(dead_code)]
 fn run_metrics(kind: &str, points: &[NavPoint]) -> Summary {
     let strat = build_strategy_from(kind, &Some(default_params(kind)), &[])
         .expect("固定默认参数构建策略不应失败");
     let outcome = runner::run_one(
         kind.to_string(), String::new(), points.to_vec(), strat, rec_fee(), 0.0);
     outcome.summary
+}
+
+/// 形态+行动计划；数据不足/波动为零时降级为占位报告（不致命）。
+fn regime_or_fallback(points: &[NavPoint]) -> RegimeReport {
+    let rp = RegimeParams::default();
+    let pp = PlanParams::default();
+    if let Ok(r) = analyze::detect_regime_with_plan(points, &rp, &pp) { return r; }
+    if let Ok(r) = analyze::detect_regime(points, &rp) { return r; }
+    RegimeReport {
+        regime: "数据不足".into(), window: 0, window_return: 0.0, annualized_vol: 0.0,
+        ma_short: 0.0, ma_long: 0.0, ma_relation: "未知".into(),
+        rec_strategy: String::new(), rec_name: String::new(),
+        rationale: "数据不足，暂不给出形态与择时点".into(), plan: None,
+    }
+}
+
+/// 按形态给投资节奏建议。
+fn cadence_for(regime: &str) -> String {
+    match regime {
+        "上涨趋势" => "顺势持有 / 坚持定投，勿过早下车",
+        "下跌趋势" => "谨慎，仅 −2σ 小额试探或观望",
+        "震荡" => "按波动带分批：低吸线买、高抛线减",
+        _ => "数据不足，暂不给择时节奏",
+    }.to_string()
+}
+
+/// 对单只基金净值产出推荐（fund_score 留待 rank_top 跨基金标准化）。
+/// 数据不足返回 Err，调用方据此跳过。
+pub fn evaluate_fund(
+    code: &str, name: &str, points: &[NavPoint], p: &RecommendParams,
+) -> anyhow::Result<FundRecommendation> {
+    let (train, test) = split_history(points, p.split_ratio).ok_or_else(|| {
+        anyhow::anyhow!("数据不足: 需训练≥{} 检验≥{} 个净值点（当前 {}）", MIN_TRAIN, MIN_TEST, points.len())
+    })?;
+
+    // 每个候选在训练段与检验段各回测一次。
+    let mut evals: Vec<StrategyEval> = Vec::with_capacity(CANDIDATES.len());
+    for (kind, name_cn) in CANDIDATES {
+        let is_s = run_metrics(kind, train);
+        let oos_s = run_metrics(kind, test);
+        evals.push(StrategyEval {
+            kind: (*kind).to_string(), name: (*name_cn).to_string(),
+            is_return: is_s.total_return, is_sharpe: is_s.sharpe, is_mdd: is_s.max_drawdown,
+            oos_return: oos_s.total_return, oos_sharpe: oos_s.sharpe, oos_mdd: oos_s.max_drawdown,
+            score: 0.0,
+        });
+    }
+
+    // 训练段三项指标跨候选标准化 → 综合评分。
+    let z_ret = zscores(&evals.iter().map(|e| e.is_return).collect::<Vec<_>>());
+    let z_sh = zscores(&evals.iter().map(|e| e.is_sharpe).collect::<Vec<_>>());
+    let z_mdd = zscores(&evals.iter().map(|e| e.is_mdd).collect::<Vec<_>>());
+    let w = &p.weights;
+    for (i, e) in evals.iter_mut().enumerate() {
+        e.score = w.w_return * z_ret[i] + w.w_sharpe * z_sh[i] - w.w_mdd * z_mdd[i];
+    }
+
+    let best_idx = evals.iter().enumerate()
+        .max_by(|(_, a), (_, b)| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i).unwrap_or(0);
+    let best = evals[best_idx].clone();
+
+    let regime = regime_or_fallback(points);
+    let cadence_hint = cadence_for(&regime.regime);
+    let rationale = format!(
+        "训练段(前{:.0}%)在 5 个候选策略中『{}』综合评分最高（收益 {:.1}% · 夏普 {:.2} · 回撤 {:.1}%）；\
+         检验段(后{:.0}%)样本外实测 收益 {:.1}% · 夏普 {:.2} · 回撤 {:.1}%。当前形态：{}。",
+        p.split_ratio * 100.0, best.name, best.is_return * 100.0, best.is_sharpe, best.is_mdd * 100.0,
+        (1.0 - p.split_ratio) * 100.0, best.oos_return * 100.0, best.oos_sharpe, best.oos_mdd * 100.0,
+        regime.regime,
+    );
+
+    Ok(FundRecommendation {
+        code: code.to_string(), name: name.to_string(), fund_score: 0.0,
+        best_strategy: best, all_strategies: evals, regime, cadence_hint, rationale,
+    })
 }
 
 #[cfg(test)]
@@ -214,5 +281,27 @@ mod tests {
         let s = run_metrics("smart_dca", &series(&vals));
         assert!(s.total_return.is_finite() && s.sharpe.is_finite());
         assert!(s.max_drawdown >= 0.0);
+    }
+
+    #[test]
+    fn evaluate_fund_ok_on_uptrend() {
+        let vals: Vec<f64> = (0..300).map(|i| 1.0 + i as f64 * 0.004).collect();
+        let r = evaluate_fund("000001", "测试基金", &series(&vals), &RecommendParams::default())
+            .expect("300 点上涨应可评估");
+        assert_eq!(r.all_strategies.len(), 5, "应评估全部 5 候选");
+        assert!(!r.rationale.is_empty(), "应有依据文案");
+        assert!(!r.regime.regime.is_empty(), "应有形态标签");
+        // best_strategy 必在候选集合内
+        assert!(CANDIDATES.iter().any(|(k, _)| *k == r.best_strategy.kind));
+        // best 的 score 应为各候选最大
+        let max = r.all_strategies.iter().map(|e| e.score).fold(f64::MIN, f64::max);
+        assert!((r.best_strategy.score - max).abs() < 1e-9, "best 应为最高分");
+    }
+
+    #[test]
+    fn evaluate_fund_too_short_errors() {
+        let vals: Vec<f64> = (0..100).map(|i| 1.0 + i as f64 * 0.001).collect();
+        let err = evaluate_fund("000001", "x", &series(&vals), &RecommendParams::default()).unwrap_err();
+        assert!(err.to_string().contains("数据不足"), "应提示数据不足: {err}");
     }
 }
