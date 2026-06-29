@@ -261,6 +261,7 @@ pub fn router() -> Router {
         .route("/api/run", get(run_handler))
         .route("/api/funds", get(funds_handler))
         .route("/api/regime", get(regime_handler))
+        .route("/api/recommend", get(recommend_handler))
         .route("/api/compare", axum::routing::post(compare_handler))
         .route("/api/optimize", axum::routing::post(optimize_handler))
         .route("/api/sync", axum::routing::post(sync_handler))
@@ -451,6 +452,49 @@ fn regime_blocking(q: RegimeQuery) -> Result<crate::analyze::RegimeReport> {
         sell_pct: q.sell_pct.unwrap_or(default_plan.sell_pct),
     };
     crate::analyze::detect_regime_with_plan(&points, &params, &plan)
+}
+
+/// 预设精选基金池（宽基指数 / 行业 / 口碑主动，含现有缓存）。可增删。
+/// 中文名运行时从 fundlist.json 反查；净值缺失/不足则跳过。
+const PRESET_POOL: &[&str] = &[
+    "161725", "050002", "000834", "001427", "003095", "008888",
+    "110011", "005827", "110022", "161005", "163406", "260108",
+    "000961", "001593", "519674", "320007", "002001", "001714",
+    "000478", "270042", "040046", "519066", "005669", "001102",
+];
+
+#[derive(Debug, Deserialize)]
+pub struct RecommendQuery {
+    #[serde(default)]
+    pub top_n: Option<usize>,
+}
+
+async fn recommend_handler(
+    axum::extract::Query(q): axum::extract::Query<RecommendQuery>,
+) -> std::result::Result<axum::Json<crate::recommend::RecommendReport>, AppError> {
+    let report = tokio::task::spawn_blocking(move || recommend_blocking(q))
+        .await
+        .map_err(|e| anyhow!("任务执行失败: {e}"))??;
+    Ok(axum::Json(report))
+}
+
+fn recommend_blocking(q: RecommendQuery) -> Result<crate::recommend::RecommendReport> {
+    let params = crate::recommend::RecommendParams {
+        top_n: q.top_n.unwrap_or(5),
+        ..Default::default()
+    };
+    // code → 中文名 映射（清单加载失败则空映射，名字回退为代码）
+    let names: std::collections::HashMap<String, String> = funds_payload(std::path::Path::new(".cache"))
+        .into_iter()
+        .map(|f| (f.code, f.name))
+        .collect();
+    let end = chrono::Local::now().date_naive();
+    let start = end - chrono::Duration::days(8 * 365);
+    let report = crate::recommend::build_report(
+        PRESET_POOL, &names, &end.to_string(), &params,
+        |code| crate::data::cache::load_or_fetch(code, std::path::Path::new(".cache"), start, end),
+    );
+    Ok(report)
 }
 
 pub struct AppError(pub anyhow::Error);
@@ -833,6 +877,14 @@ mod tests {
         assert!(v.is_array(), "应返回 JSON 数组");
         assert_eq!(v.as_array().unwrap().len(), 1, "指定 code → 单元素");
         assert!(v[0]["error"].is_string(), "非法代码应带 error");
+    }
+
+    #[test]
+    fn preset_pool_nonempty_and_valid_codes() {
+        assert!(!super::PRESET_POOL.is_empty(), "精选池不应为空");
+        for c in super::PRESET_POOL {
+            assert!(super::validate_fund_code(c).is_ok(), "池内代码应合法: {c}");
+        }
     }
 
     #[test]
