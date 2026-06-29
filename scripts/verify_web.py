@@ -137,9 +137,28 @@ def main():
             assert "不构成" in body_text, "应有免责声明"
             page.screenshot(path=str(Path("output/web_diagnose.png").resolve()), full_page=True)
 
+            # ---- 推荐 tab ----
+            page.click('.tab[data-tab="recommend"]')
+            # 算法说明常驻
+            rec_panel = page.locator("#panel-recommend").inner_text(timeout=10000)
+            assert "综合评分" in rec_panel, "推荐页应有算法说明（综合评分）"
+            assert "不构成" in rec_panel, "推荐页应有免责声明"
+            page.click("#run-recommend")
+            # 首次需联网逐只抓取精选池，给足时间；等结果区出现卡片或「暂无」提示
+            page.wait_for_function(
+                "document.querySelector('#rec-result') && "
+                "(document.querySelector('#rec-result').querySelector('.card') "
+                "|| document.querySelector('#rec-result').innerText.indexOf('暂无') >= 0 "
+                "|| document.querySelector('#rec-result').innerText.indexOf('已分析') >= 0)",
+                timeout=180000)
+            rec_text = page.locator("#rec-result").inner_text(timeout=10000)
+            assert ("推荐策略" in rec_text) or ("暂无" in rec_text) or ("已分析" in rec_text), \
+                "推荐结果应出现卡片或概览/暂无提示"
+            page.screenshot(path=str(Path("output/web_recommend.png").resolve()), full_page=True)
+
             browser.close()
         assert not errors, f"页面有 console error: {errors}"
-        print("PASS: 三 tab + 基金搜索 + RSI 策略 + 数据同步 + 诊断 均正常")
+        print("PASS: 五 tab + 基金搜索 + RSI 策略 + 数据同步 + 诊断 + 推荐 均正常")
         return 0
     finally:
         srv.terminate()
