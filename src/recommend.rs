@@ -5,14 +5,10 @@ use serde::Serialize;
 
 #[allow(unused_imports)]
 use crate::analyze::{self, PlanParams, RegimeParams, RegimeReport};
-#[allow(unused_imports)]
 use crate::broker::{FeeModel, SellTier};
-#[allow(unused_imports)]
 use crate::config::build_strategy_from;
 use crate::data::NavPoint;
-#[allow(unused_imports)]
 use crate::metrics::Summary;
-#[allow(unused_imports)]
 use crate::runner;
 
 pub const DISCLAIMER: &str =
@@ -99,6 +95,73 @@ fn split_history(points: &[NavPoint], split_ratio: f64) -> Option<(&[NavPoint], 
     if train.len() >= MIN_TRAIN && test.len() >= MIN_TEST { Some((train, test)) } else { None }
 }
 
+/// 5 个候选策略（kind, 中文名），顺序即展示顺序。
+#[allow(dead_code)]
+const CANDIDATES: &[(&str, &str)] = &[
+    ("dca", "普通定投"),
+    ("smart_dca", "智能定投"),
+    ("trend", "均线择时"),
+    ("rsi", "RSI超买超卖"),
+    ("adaptive", "自适应"),
+];
+
+/// 各策略固定稳健默认参数（不逐基金寻优，降低过拟合）。
+#[allow(dead_code)]
+fn default_params(kind: &str) -> toml::Value {
+    let mut t = toml::Table::new();
+    let s = |x: &str| toml::Value::String(x.to_string());
+    match kind {
+        "dca" | "adaptive" => {
+            t.insert("period".into(), s("monthly"));
+            t.insert("day".into(), toml::Value::Integer(1));
+            t.insert("base_amount".into(), toml::Value::Float(1000.0));
+        }
+        "smart_dca" => {
+            t.insert("period".into(), s("monthly"));
+            t.insert("day".into(), toml::Value::Integer(1));
+            t.insert("base_amount".into(), toml::Value::Float(1000.0));
+            t.insert("ma_window".into(), toml::Value::Integer(250));
+            t.insert("k".into(), toml::Value::Float(1.0));
+        }
+        "trend" => {
+            t.insert("short_window".into(), toml::Value::Integer(20));
+            t.insert("long_window".into(), toml::Value::Integer(60));
+            t.insert("amount".into(), toml::Value::Float(1000.0));
+        }
+        "rsi" => {
+            t.insert("rsi_window".into(), toml::Value::Integer(14));
+            t.insert("oversold".into(), toml::Value::Float(30.0));
+            t.insert("overbought".into(), toml::Value::Float(70.0));
+            t.insert("amount".into(), toml::Value::Float(1000.0));
+        }
+        _ => {}
+    }
+    toml::Value::Table(t)
+}
+
+/// 评分用费率：买入 0、卖出标准阶梯。
+#[allow(dead_code)]
+fn rec_fee() -> FeeModel {
+    FeeModel {
+        buy_rate: 0.0,
+        sell_tiers: vec![
+            SellTier { max_days: 7, rate: 0.015 },
+            SellTier { max_days: 365, rate: 0.005 },
+            SellTier { max_days: 0, rate: 0.0 },
+        ],
+    }
+}
+
+/// 在给定净值段上跑某策略，返回绩效摘要。固定默认参数保证 build 不失败。
+#[allow(dead_code)]
+fn run_metrics(kind: &str, points: &[NavPoint]) -> Summary {
+    let strat = build_strategy_from(kind, &Some(default_params(kind)), &[])
+        .expect("固定默认参数构建策略不应失败");
+    let outcome = runner::run_one(
+        kind.to_string(), String::new(), points.to_vec(), strat, rec_fee(), 0.0);
+    outcome.summary
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +197,22 @@ mod tests {
         // 160 点 → cut=112 < MIN_TRAIN(120) → None
         let short = series(&(0..160).map(|i| 1.0 + i as f64 * 0.001).collect::<Vec<_>>());
         assert!(split_history(&short, 0.70).is_none());
+    }
+
+    #[test]
+    fn default_params_build_all_candidates() {
+        for (kind, _) in CANDIDATES {
+            let r = build_strategy_from(kind, &Some(default_params(kind)), &[]);
+            assert!(r.is_ok(), "{kind} 默认参数应能构建策略: {:?}", r.err());
+        }
+    }
+
+    #[test]
+    fn run_metrics_finite_on_uptrend() {
+        // 300 点温和上涨，足够各策略均线/RSI 窗口
+        let vals: Vec<f64> = (0..300).map(|i| 1.0 + i as f64 * 0.003).collect();
+        let s = run_metrics("smart_dca", &series(&vals));
+        assert!(s.total_return.is_finite() && s.sharpe.is_finite());
+        assert!(s.max_drawdown >= 0.0);
     }
 }

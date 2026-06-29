@@ -211,10 +211,8 @@ pub fn build_action_plan(
             "强力高抛" => action = sell_amt(pct), // 2× 减半为 1×
             _ => {}
         },
-        "下跌趋势" => {
-            if signal == "低吸" {
-                action = "趋势向下，暂不抄底（仅 -2σ 小额试探）".to_string();
-            }
+        "下跌趋势" if signal == "低吸" => {
+            action = "趋势向下，暂不抄底（仅 -2σ 小额试探）".to_string();
         }
         _ => {}
     }
