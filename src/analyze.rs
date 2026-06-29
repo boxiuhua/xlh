@@ -3,7 +3,7 @@ use crate::data::NavPoint;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Regime { Uptrend, Downtrend, Range }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RegimeReport {
     pub regime: String,
     pub window: usize,
