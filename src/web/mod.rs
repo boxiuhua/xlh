@@ -887,6 +887,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn index_has_recommend_tab() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let resp = super::router()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("data-tab=\"recommend\""), "应有推荐 tab");
+        assert!(body.contains("/api/recommend"), "应调用推荐接口");
+        assert!(body.contains("id=\"rec-result\""), "应有推荐结果区");
+        assert!(body.contains("综合评分"), "算法说明应含综合评分");
+        assert!(body.contains("样本外"), "算法说明应含样本外");
+        assert!(body.contains("不构成"), "应有免责声明");
+    }
+
     #[test]
     fn build_optimize_cfg_rsi_grid() {
         let mut grid = std::collections::BTreeMap::new();

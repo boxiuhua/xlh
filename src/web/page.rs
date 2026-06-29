@@ -55,6 +55,7 @@ button.del{color:#c0392b;border-color:#e8b9b3}
     <button class="tab" data-tab="compare">对比</button>
     <button class="tab" data-tab="optimize">寻优</button>
     <button class="tab" data-tab="diagnose">诊断</button>
+    <button class="tab" data-tab="recommend">推荐</button>
   </div>
 
   <!-- 单次 -->
@@ -164,6 +165,28 @@ button.del{color:#c0392b;border-color:#e8b9b3}
       </div>
       <div id="diag-result" style="margin-top:14px"></div>
       <div class="hint" style="margin-top:10px">说明：基于历史净值的统计描述与启发式规则，不预测未来走势，不构成任何投资建议。</div>
+    </div>
+  </div>
+
+  <!-- 推荐 -->
+  <div class="panel" id="panel-recommend">
+    <div class="card">
+      <details open style="margin-bottom:12px">
+        <summary style="cursor:pointer;font-weight:600;color:#1a252f">算法说明（点击展开/收起）</summary>
+        <div style="margin-top:10px;color:#34495e;font-size:.9rem;line-height:1.7">
+          <div>1) <strong>综合评分</strong>：score = 0.4·z(收益) + 0.4·z(夏普) − 0.2·z(最大回撤)，对池内各基金做标准化（z 分数），回撤为负向。</div>
+          <div>2) <strong>样本外验证</strong>：历史按 70/30 切分；训练段（前 70%）从 5 个策略里按综合评分选最优，检验段（后 30%）实测该策略表现；<strong>Top5 排名用检验段指标</strong>，抑制过拟合。</div>
+          <div>3) <strong>候选策略（固定参数）</strong>：普通定投 / 智能定投(MA250) / 均线择时(20·60) / RSI(14·30·70) / 自适应。</div>
+          <div>4) <strong>当前择时</strong>：用近段净值的均线 ±σ 波动带——低吸线≈中轴−σ、高抛线≈中轴+σ，结合形态（上涨红 / 下跌绿 / 震荡灰）给出当下信号。</div>
+          <div style="color:#c0392b;margin-top:6px">5) 免责声明：基于历史净值的统计回测与启发式规则，不预测未来走势，不构成任何投资建议。</div>
+        </div>
+      </details>
+      <div class="row">
+        <div class="field"><label>取 Top-N</label><input type="number" id="rec-topn" value="5"/></div>
+        <button class="run" id="run-recommend">生成推荐</button>
+      </div>
+      <div class="hint" style="margin-top:8px">首次需联网抓取精选池全部基金净值（数十只，约几十秒）；命中缓存后秒级。</div>
+      <div id="rec-result" style="margin-top:14px"></div>
     </div>
   </div>
 
@@ -478,6 +501,63 @@ document.getElementById('run-diagnose').addEventListener('click', function(){
     .finally(function(){ btn.disabled = false; btn.textContent = t; });
 });
 attachCombobox(document.getElementById('diag-fund'));
+function regimeColor(reg){ return reg === '上涨趋势' ? '#c0392b' : (reg === '下跌趋势' ? '#27ae60' : '#7f8c8d'); }
+function pct(x){ return (x*100).toFixed(1) + '%'; }
+function recCard(r, rank){
+  var reg = r.regime || {};
+  var plan = reg.plan;
+  var rc = regimeColor(reg.regime);
+  var b = r.best_strategy || {};
+  var timing = '';
+  if (plan && plan.current){
+    var c = plan.current;
+    timing = '<div style="margin-top:8px;color:#34495e">当前择时：'
+      + '<strong style="color:'+rc+'">'+esc(reg.regime)+'</strong>'
+      + ' · 低吸线 '+plan.buy.toFixed(4)+' · 高抛线 '+plan.sell.toFixed(4)
+      + ' · 当下 <strong>'+esc(c.signal)+'</strong>（'+esc(c.action)+'）</div>';
+  } else {
+    timing = '<div style="margin-top:8px;color:#7f8c8d">当前择时：'+esc(reg.regime||'数据不足')+'（暂无波动带）</div>';
+  }
+  return '<div class="card" style="border-left:4px solid '+rc+'">'
+    + '<div style="display:flex;align-items:baseline;gap:10px">'
+    + '<span style="font-size:1.3rem;font-weight:700;color:#c0392b">#'+rank+'</span>'
+    + '<span style="font-size:1.1rem;font-weight:600">'+esc(r.name)+'</span>'
+    + '<span style="color:#7f8c8d">'+esc(r.code)+'</span>'
+    + '<span style="margin-left:auto;color:#5a6a7a">综合评分 '+r.fund_score.toFixed(2)+'</span></div>'
+    + '<div style="margin-top:8px">推荐策略：<strong style="background:#fdecea;color:#c0392b;padding:2px 10px;border-radius:12px">'+esc(b.name)+'</strong></div>'
+    + '<div style="margin-top:6px;color:#34495e">样本外：收益 '+pct(b.oos_return)+' · 夏普 '+b.oos_sharpe.toFixed(2)+' · 回撤 '+pct(b.oos_mdd)
+    + '<span style="color:#95a5a6">（训练段 收益 '+pct(b.is_return)+' · 夏普 '+b.is_sharpe.toFixed(2)+'）</span></div>'
+    + timing
+    + '<div style="margin-top:8px;color:#5a6a7a">依据：'+esc(r.rationale)+'</div>'
+    + '<div style="margin-top:4px;color:#5a6a7a">节奏：'+esc(r.cadence_hint)+'</div>'
+    + '</div>';
+}
+function renderRec(rep){
+  var box = document.getElementById('rec-result');
+  if (!rep || !Array.isArray(rep.top)){ box.innerHTML = '<span style="color:#c0392b">推荐生成失败</span>'; return; }
+  if (!rep.top.length){
+    box.innerHTML = '<div style="color:#c0392b">暂无可分析数据（已分析 '+rep.analyzed+'/'+rep.pool_size+'）。请先在上方「数据同步」同步精选池，或检查网络。</div>';
+    return;
+  }
+  var head = '<div style="color:#5a6a7a;margin-bottom:10px">已分析 '+rep.analyzed+'/'+rep.pool_size
+    + ' · 跳过 '+(rep.skipped||[]).length+' 只 · 生成于 '+esc(rep.generated)+'</div>';
+  var cards = rep.top.map(function(r, i){ return recCard(r, i+1); }).join('');
+  var foot = '<div class="hint" style="margin-top:6px;color:#c0392b">'+esc(rep.disclaimer)+'</div>';
+  box.innerHTML = head + cards + foot;
+}
+document.getElementById('run-recommend').addEventListener('click', function(){
+  var btn = this;
+  var topn = document.getElementById('rec-topn').value.trim();
+  var qs = new URLSearchParams();
+  if (topn) qs.append('top_n', topn);
+  var t = btn.textContent; setBtn(btn, true, '生成推荐');
+  document.getElementById('rec-result').textContent = '分析中…（首次需联网抓取，请稍候）';
+  fetch('/api/recommend?' + qs.toString())
+    .then(function(res){ if(!res.ok) return res.text().then(function(t){ throw new Error(t); }); return res.json(); })
+    .then(renderRec)
+    .catch(function(e){ document.getElementById('rec-result').innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
+    .finally(function(){ setBtn(btn, false, '生成推荐'); });
+});
 </script>
 </body>
 </html>
