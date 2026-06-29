@@ -1,5 +1,4 @@
 //! 跨基金推荐：综合多因子评分 + 样本外验证 + 形态择时。纯逻辑，IO 由调用方注入。
-#[allow(unused_imports)]
 use std::collections::HashMap;
 use serde::Serialize;
 
@@ -229,6 +228,57 @@ pub fn evaluate_fund(
     })
 }
 
+/// 用各基金「最优策略的样本外三项指标」跨基金 z-score 综合评分，降序取 top_n。
+pub fn rank_top(mut recs: Vec<FundRecommendation>, p: &RecommendParams) -> Vec<FundRecommendation> {
+    if recs.is_empty() { return recs; }
+    let zr = zscores(&recs.iter().map(|r| r.best_strategy.oos_return).collect::<Vec<_>>());
+    let zs = zscores(&recs.iter().map(|r| r.best_strategy.oos_sharpe).collect::<Vec<_>>());
+    let zm = zscores(&recs.iter().map(|r| r.best_strategy.oos_mdd).collect::<Vec<_>>());
+    let w = &p.weights;
+    for (i, r) in recs.iter_mut().enumerate() {
+        r.fund_score = w.w_return * zr[i] + w.w_sharpe * zs[i] - w.w_mdd * zm[i];
+    }
+    recs.sort_by(|a, b| b.fund_score.partial_cmp(&a.fund_score).unwrap_or(std::cmp::Ordering::Equal));
+    recs.truncate(p.top_n);
+    recs
+}
+
+/// 遍历基金池：用注入的 `load` 取净值 → `evaluate_fund` → `rank_top`，装配整页报告。
+/// IO（联网/读盘）经闭包注入，便于离线单测。
+pub fn build_report<F>(
+    pool: &[&str], names: &HashMap<String, String>, today: &str, p: &RecommendParams, mut load: F,
+) -> RecommendReport
+where
+    F: FnMut(&str) -> anyhow::Result<Vec<NavPoint>>,
+{
+    let mut recs = Vec::new();
+    let mut skipped = Vec::new();
+    for &code in pool {
+        match load(code) {
+            Ok(points) => {
+                let name = names.get(code).cloned().unwrap_or_else(|| code.to_string());
+                match evaluate_fund(code, &name, &points, p) {
+                    Ok(r) => recs.push(r),
+                    Err(_) => skipped.push(code.to_string()),
+                }
+            }
+            Err(_) => skipped.push(code.to_string()),
+        }
+    }
+    let analyzed = recs.len();
+    let top = rank_top(recs, p);
+    RecommendReport {
+        generated: today.to_string(),
+        pool_size: pool.len(),
+        analyzed,
+        skipped,
+        top,
+        weights: p.weights,
+        split_ratio: p.split_ratio,
+        disclaimer: DISCLAIMER.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +353,52 @@ mod tests {
         let vals: Vec<f64> = (0..100).map(|i| 1.0 + i as f64 * 0.001).collect();
         let err = evaluate_fund("000001", "x", &series(&vals), &RecommendParams::default()).unwrap_err();
         assert!(err.to_string().contains("数据不足"), "应提示数据不足: {err}");
+    }
+
+    #[test]
+    fn build_report_ranks_and_skips() {
+        // 池：两只可分析（不同斜率）+ 一只加载失败
+        let names: HashMap<String, String> = [("000001".to_string(), "甲".to_string())].into_iter().collect();
+        let p = RecommendParams::default();
+        let rep = build_report(&["000001", "000002", "BADX"], &names, "2026-06-29", &p, |code| {
+            match code {
+                "000001" => Ok(series(&(0..300).map(|i| 1.0 + i as f64 * 0.005).collect::<Vec<_>>())),
+                "000002" => Ok(series(&(0..300).map(|i| 1.0 + i as f64 * 0.002).collect::<Vec<_>>())),
+                _ => Err(anyhow::anyhow!("加载失败")),
+            }
+        });
+        assert_eq!(rep.pool_size, 3);
+        assert_eq!(rep.analyzed, 2, "两只成功");
+        assert_eq!(rep.skipped, vec!["BADX".to_string()]);
+        assert_eq!(rep.top.len(), 2);
+        // 按 fund_score 降序
+        assert!(rep.top[0].fund_score >= rep.top[1].fund_score);
+        assert_eq!(rep.generated, "2026-06-29");
+        assert!(!rep.top[0].name.is_empty());
+    }
+
+    #[test]
+    fn report_serializes_frontend_keys() {
+        let names = HashMap::new();
+        let p = RecommendParams::default();
+        let rep = build_report(&["000001"], &names, "2026-06-29", &p, |_| {
+            Ok(series(&(0..300).map(|i| 1.0 + i as f64 * 0.004).collect::<Vec<_>>()))
+        });
+        let j = serde_json::to_string(&rep).unwrap();
+        for key in ["\"top\"", "\"best_strategy\"", "\"all_strategies\"", "\"regime\"",
+                    "\"rationale\"", "\"cadence_hint\"", "\"weights\"", "\"split_ratio\"",
+                    "\"disclaimer\"", "\"fund_score\"", "\"skipped\""] {
+            assert!(j.contains(key), "JSON 应含 {key}");
+        }
+    }
+
+    #[test]
+    fn build_report_empty_pool_is_valid() {
+        let names = HashMap::new();
+        let rep = build_report(&[], &names, "2026-06-29", &RecommendParams::default(), |_| {
+            Ok(Vec::new())
+        });
+        assert_eq!(rep.analyzed, 0);
+        assert!(rep.top.is_empty());
     }
 }
