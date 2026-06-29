@@ -9,8 +9,11 @@ use crate::event::MarketEvent;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NavPoint { pub date: NaiveDate, pub nav: f64, pub acc_nav: f64 }
 
-/// 由单位净值+累计净值推导复权净值（隐含红利再投）。
-/// 当日分红 = 累计净值增量 - 单位净值增量（截断为非负）。
+/// 由累计净值推导复权净值（隐含红利再投）。
+/// 累计净值（累计单位净值）本身即已包含分红再投，故每日复权因子 = 累计净值之比。
+/// 注意：不能用 `(单位净值增量 与 累计净值增量 之差)` 估算分红——一旦基金发生过
+/// 份额折算（单位净值被重置而累计净值不重置），两者将处于不同量纲，该差值会在每个
+/// 上涨日制造虚假"分红"并逐日复利放大，导致复权净值爆炸性失真。
 pub fn compute_adjusted(points: &[NavPoint]) -> Vec<f64> {
     let mut adj = Vec::with_capacity(points.len());
     if points.is_empty() { return adj; }
@@ -18,8 +21,7 @@ pub fn compute_adjusted(points: &[NavPoint]) -> Vec<f64> {
     for i in 1..points.len() {
         let prev = &points[i - 1];
         let cur = &points[i];
-        let dividend = ((cur.acc_nav - prev.acc_nav) - (cur.nav - prev.nav)).max(0.0);
-        let factor = if prev.nav > 0.0 { (cur.nav + dividend) / prev.nav } else { 1.0 };
+        let factor = if prev.acc_nav > 0.0 { cur.acc_nav / prev.acc_nav } else { 1.0 };
         adj.push(adj[i - 1] * factor);
     }
     adj
@@ -89,6 +91,21 @@ mod tests {
         ];
         let adj = compute_adjusted(&pts);
         assert!((adj[1] - 1.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn adjusted_handles_acc_nav_scale_gap() {
+        // 份额折算后：单位净值被重置(从~2.6→1.0)，但累计净值不重置，二者从此处于不同量纲。
+        // 之后某日纯价格上涨 10%（无分红），nav 与 acc 同步 +10%。
+        // 复权因子应为真实涨幅 1.10，而非旧公式因量纲差制造的虚假"分红"导致的 1.40。
+        let pts = vec![
+            NavPoint { date: d(2024, 1, 1), nav: 1.0, acc_nav: 4.0 },
+            NavPoint { date: d(2024, 1, 2), nav: 1.1, acc_nav: 4.4 },
+        ];
+        let adj = compute_adjusted(&pts);
+        let factor = adj[1] / adj[0];
+        assert!((factor - 1.10).abs() < 1e-9,
+            "量纲不一致时复权因子应等于真实涨幅 1.10，实际 {factor:.4}");
     }
 
     #[test]
