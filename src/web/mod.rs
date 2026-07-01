@@ -911,6 +911,23 @@ mod tests {
         assert!(body.contains("不构成"), "应有免责声明");
     }
 
+    #[tokio::test]
+    async fn index_has_stock_tabs() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let resp = super::router()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for m in ["data-tab=\"s-diagnose\"", "data-tab=\"s-backtest\"", "data-tab=\"s-screen\"",
+                  "/api/stock/diagnose", "/api/stock/run", "/api/stock/recommend", "/api/stock/search",
+                  "id=\"sd-result\"", "id=\"sb-result\"", "id=\"ss-result\"", "attachStockCombobox"] {
+            assert!(body.contains(m), "首页应含 {m}");
+        }
+    }
+
     #[test]
     fn build_optimize_cfg_rsi_grid() {
         let mut grid = std::collections::BTreeMap::new();

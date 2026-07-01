@@ -56,6 +56,9 @@ button.del{color:#c0392b;border-color:#e8b9b3}
     <button class="tab" data-tab="optimize">寻优</button>
     <button class="tab" data-tab="diagnose">诊断</button>
     <button class="tab" data-tab="recommend">推荐</button>
+    <button class="tab" data-tab="s-diagnose">股诊断</button>
+    <button class="tab" data-tab="s-backtest">股回测</button>
+    <button class="tab" data-tab="s-screen">股选股</button>
   </div>
 
   <!-- 单次 -->
@@ -187,6 +190,55 @@ button.del{color:#c0392b;border-color:#e8b9b3}
       </div>
       <div class="hint" style="margin-top:8px">首次需联网抓取精选池全部基金净值（数十只，约几十秒）；命中缓存后秒级。</div>
       <div id="rec-result" style="margin-top:14px"></div>
+    </div>
+  </div>
+
+  <!-- 股诊断 -->
+  <div class="panel" id="panel-s-diagnose">
+    <div class="card">
+      <div class="row">
+        <div class="field combo"><label>股票代码</label><input id="sd-code" placeholder="如 600519 / 00700 / AAPL"/></div>
+        <button class="run" id="run-s-diagnose">诊断</button>
+      </div>
+      <div id="sd-result" style="margin-top:14px"></div>
+      <div class="hint" style="margin-top:10px">基于后复权价的技术指标(MA/MACD/布林/RSI)启发式，不构成任何投资建议。</div>
+    </div>
+  </div>
+
+  <!-- 股回测 -->
+  <div class="panel" id="panel-s-backtest">
+    <div class="card">
+      <div class="row">
+        <div class="field combo"><label>股票代码</label><input id="sb-code" placeholder="如 600519"/></div>
+        <div class="field"><label>起始日</label><input type="date" id="sb-start" value="2020-01-01"/></div>
+        <div class="field"><label>结束日</label><input type="date" id="sb-end" value="2024-12-31"/></div>
+        <div class="field"><label>策略</label>
+          <select id="sb-strat">
+            <option value="dca">普通定投</option>
+            <option value="smart_dca" selected>智能定投</option>
+            <option value="trend">均线择时</option>
+            <option value="rsi">RSI超买超卖</option>
+            <option value="adaptive">自适应</option>
+          </select>
+        </div>
+        <div class="field"><label>初始现金</label><input type="number" id="sb-cash" value="0"/></div>
+      </div>
+      <div class="row" id="sb-params" style="margin-top:12px"></div>
+      <button class="run" id="run-s-backtest">回测</button>
+      <div id="sb-result" style="margin-top:14px"></div>
+      <div class="hint" style="margin-top:8px">费率按市场自动选择（A股/港股/美股）；撮合走后复权价。不构成任何投资建议。</div>
+    </div>
+  </div>
+
+  <!-- 股选股 -->
+  <div class="panel" id="panel-s-screen">
+    <div class="card">
+      <div class="row">
+        <div class="field"><label>取 Top-N</label><input type="number" id="ss-topn" value="5"/></div>
+        <button class="run" id="run-s-screen">选股</button>
+      </div>
+      <div class="hint" style="margin-top:8px">对预设股票池逐只多策略样本外评分 + 技术诊断后排名；首次联网抓取较慢，命中缓存后秒级。不构成任何投资建议。</div>
+      <div id="ss-result" style="margin-top:14px"></div>
     </div>
   </div>
 
@@ -557,6 +609,131 @@ document.getElementById('run-recommend').addEventListener('click', function(){
     .then(renderRec)
     .catch(function(e){ document.getElementById('rec-result').innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
     .finally(function(){ setBtn(btn, false, '生成推荐'); });
+});
+
+// ===== 股票 Tab =====
+// 股票代码服务端搜索补全（无全量清单，按 q 查 /api/stock/search）
+function attachStockCombobox(input){
+  if (input.dataset.combo) return;
+  input.dataset.combo = '1';
+  input.setAttribute('autocomplete','off');
+  var box = document.createElement('div'); box.className = 'fund-dropdown';
+  var wrap = document.createElement('span'); wrap.className = 'combo';
+  input.parentNode.insertBefore(wrap, input); wrap.appendChild(input); wrap.appendChild(box);
+  var timer = null;
+  function hide(){ box.classList.remove('show'); box.innerHTML=''; }
+  function query(q){
+    if(!q){ hide(); return; }
+    fetch('/api/stock/search?q=' + encodeURIComponent(q))
+      .then(function(r){ return r.json(); })
+      .then(function(list){
+        if(!Array.isArray(list) || !list.length){ hide(); return; }
+        box.innerHTML = list.slice(0,20).map(function(s){
+          return '<div class="fund-item" data-code="'+esc(s.code)+'"><span class="code">'+esc(s.code)+'</span>'+esc(s.name)+' <span style="color:#95a5a6">'+esc(s.market_name||'')+'</span></div>';
+        }).join('');
+        box.classList.add('show');
+      }).catch(function(){ hide(); });
+  }
+  input.addEventListener('input', function(){ var v=input.value.trim(); clearTimeout(timer); timer=setTimeout(function(){ query(v); }, 200); });
+  input.addEventListener('blur', function(){ setTimeout(hide, 150); });
+  box.addEventListener('mousedown', function(e){
+    var it = e.target.closest('.fund-item'); if(!it) return;
+    e.preventDefault(); input.value = it.getAttribute('data-code'); hide(); input.dispatchEvent(new Event('change'));
+  });
+}
+
+function sSignalColor(sig){ if(sig&&sig.indexOf('买入')>=0) return '#c0392b'; if(sig&&sig.indexOf('卖出')>=0) return '#27ae60'; return '#7f8c8d'; }
+function trendColor(tr){ return tr==='上涨' ? '#c0392b' : (tr==='下跌' ? '#27ae60' : '#7f8c8d'); }
+function pf(x){ return (x==null || !isFinite(x)) ? '∞' : Number(x).toFixed(2); }
+
+function renderStockDiag(d){
+  var box = document.getElementById('sd-result');
+  if(!d || !d.signal){ box.innerHTML = '<span style="color:#c0392b">诊断失败</span>'; return; }
+  var tc = trendColor(d.trend), sc = sSignalColor(d.signal);
+  box.innerHTML =
+    '<div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap"><span style="font-size:1.3rem;font-weight:700;color:'+tc+'">'+esc(d.trend)+'</span>'
+    + '<span style="font-size:1.2rem;font-weight:700;color:'+sc+'">'+esc(d.signal)+'</span>'
+    + '<span style="color:#7f8c8d">'+esc(d.code)+' · '+esc(d.date)+'</span></div>'
+    + '<div style="margin-top:8px;color:#34495e">价 '+d.price.toFixed(3)+'（后复权 '+d.adj_price.toFixed(3)+'）· '+esc(d.ma_relation)+' · MA短 '+d.ma_short.toFixed(2)+' / 长 '+d.ma_long.toFixed(2)+'</div>'
+    + '<div style="margin-top:6px;color:#34495e">布林 z '+d.boll_z.toFixed(2)+'（下 '+d.boll_lower.toFixed(2)+' / 中 '+d.boll_mid.toFixed(2)+' / 上 '+d.boll_upper.toFixed(2)+'）· RSI '+d.rsi.toFixed(1)+' · MACD柱 '+d.macd_hist.toFixed(3)+'</div>'
+    + '<div style="margin-top:8px;color:#5a6a7a">'+esc(d.rationale)+'</div>'
+    + '<div style="margin-top:8px;padding:8px 10px;background:#f3f7ff;border-radius:6px;color:#34495e">'+esc(d.caveat)+'</div>';
+}
+function renderStockRun(o){
+  var box = document.getElementById('sb-result');
+  if(!o || !o.summary){ box.innerHTML = '<span style="color:#c0392b">回测失败</span>'; return; }
+  var s = o.summary, ts = o.trade_stats || {};
+  box.innerHTML = '<div class="card" style="margin-top:0">'
+    + '<div style="font-size:1.1rem;font-weight:600">'+esc(o.code)+' · '+esc(o.name)+'</div>'
+    + '<div style="margin-top:8px;color:#34495e">总收益 '+pct(s.total_return)+' · 年化 '+pct(s.annualized)+' · 夏普 '+s.sharpe.toFixed(2)+' · 最大回撤 '+pct(s.max_drawdown)+'</div>'
+    + '<div style="margin-top:6px;color:#34495e">投入 '+s.total_contributed.toFixed(0)+' · 期末 '+s.final_equity.toFixed(0)+' · 成交 '+s.trade_count+' 笔</div>'
+    + '<div style="margin-top:6px;color:#5a6a7a">交易统计：卖出 '+(ts.round_trips||0)+' 次 · 胜率 '+pct(ts.win_rate||0)+' · 盈亏比 '+pf(ts.profit_factor)+' · 实现盈亏 '+(ts.realized_pnl||0).toFixed(0)+'</div>'
+    + '</div>';
+}
+function sCard(r, rank){
+  var d = r.diagnosis || {}, b = r.best_strategy || {}, tc = trendColor(d.trend);
+  return '<div class="card" style="border-left:4px solid '+tc+'">'
+    + '<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"><span style="font-size:1.3rem;font-weight:700;color:#c0392b">#'+rank+'</span>'
+    + '<span style="font-size:1.1rem;font-weight:600">'+esc(r.name)+'</span><span style="color:#7f8c8d">'+esc(r.code)+'</span>'
+    + '<span style="margin-left:auto;color:#5a6a7a">综合评分 '+r.stock_score.toFixed(2)+'</span></div>'
+    + '<div style="margin-top:8px">最优策略：<strong style="background:#fdecea;color:#c0392b;padding:2px 10px;border-radius:12px">'+esc(b.name)+'</strong></div>'
+    + '<div style="margin-top:6px;color:#34495e">样本外：收益 '+pct(b.oos_return)+' · 夏普 '+b.oos_sharpe.toFixed(2)+' · 回撤 '+pct(b.oos_mdd)+'</div>'
+    + '<div style="margin-top:6px;color:#34495e">技术面：<strong style="color:'+tc+'">'+esc(d.trend||'-')+'</strong> · '+esc(d.signal||'-')+'</div>'
+    + '<div style="margin-top:6px;color:#5a6a7a">'+esc(r.rationale)+'</div></div>';
+}
+function renderStockScreen(rep){
+  var box = document.getElementById('ss-result');
+  if(!rep || !Array.isArray(rep.top)){ box.innerHTML = '<span style="color:#c0392b">选股失败</span>'; return; }
+  if(!rep.top.length){ box.innerHTML = '<div style="color:#c0392b">暂无可分析数据（已分析 '+rep.analyzed+'/'+rep.pool_size+'）。</div>'; return; }
+  var head = '<div style="color:#5a6a7a;margin-bottom:10px">已分析 '+rep.analyzed+'/'+rep.pool_size+' · 跳过 '+(rep.skipped||[]).length+' · 生成于 '+esc(rep.generated)+'</div>';
+  var cards = rep.top.map(function(r,i){ return sCard(r,i+1); }).join('');
+  var foot = '<div class="hint" style="margin-top:6px;color:#c0392b">'+esc(rep.disclaimer)+'</div>';
+  box.innerHTML = head + cards + foot;
+}
+
+// 股回测参数组（复用 ROW_FIELDS）
+var sbStrat = document.getElementById('sb-strat');
+function buildSbParams(){
+  var holder = document.getElementById('sb-params'); holder.innerHTML='';
+  ROW_FIELDS[sbStrat.value].forEach(function(f){
+    holder.insertAdjacentHTML('beforeend', '<div class="field"><label>'+f[1]+'</label><input data-k="'+f[0]+'" value="'+f[2]+'"/></div>');
+  });
+}
+sbStrat.addEventListener('change', buildSbParams); buildSbParams();
+attachStockCombobox(document.getElementById('sd-code'));
+attachStockCombobox(document.getElementById('sb-code'));
+
+document.getElementById('run-s-diagnose').addEventListener('click', function(){
+  var btn = this, code = document.getElementById('sd-code').value.trim();
+  if(!code){ document.getElementById('sd-result').innerHTML = '<span style="color:#c0392b">请先填股票代码</span>'; return; }
+  setBtn(btn, true, '诊断'); document.getElementById('sd-result').textContent = '诊断中…';
+  fetch('/api/stock/diagnose?code=' + encodeURIComponent(code))
+    .then(function(res){ if(!res.ok) return res.text().then(function(x){ throw new Error(x); }); return res.json(); })
+    .then(renderStockDiag)
+    .catch(function(e){ document.getElementById('sd-result').innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
+    .finally(function(){ setBtn(btn, false, '诊断'); });
+});
+document.getElementById('run-s-backtest').addEventListener('click', function(){
+  var btn = this, code = document.getElementById('sb-code').value.trim();
+  if(!code){ document.getElementById('sb-result').innerHTML = '<span style="color:#c0392b">请先填股票代码</span>'; return; }
+  var qs = new URLSearchParams({ code: code, start: document.getElementById('sb-start').value, end: document.getElementById('sb-end').value, strategy: sbStrat.value, initial_cash: document.getElementById('sb-cash').value || '0' });
+  document.querySelectorAll('#sb-params input').forEach(function(inp){ var v = inp.value.trim(); if(v!=='') qs.append(inp.getAttribute('data-k'), v); });
+  setBtn(btn, true, '回测'); document.getElementById('sb-result').textContent = '回测中…';
+  fetch('/api/stock/run?' + qs.toString())
+    .then(function(res){ if(!res.ok) return res.text().then(function(x){ throw new Error(x); }); return res.json(); })
+    .then(renderStockRun)
+    .catch(function(e){ document.getElementById('sb-result').innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
+    .finally(function(){ setBtn(btn, false, '回测'); });
+});
+document.getElementById('run-s-screen').addEventListener('click', function(){
+  var btn = this, topn = document.getElementById('ss-topn').value.trim();
+  var qs = new URLSearchParams(); if(topn) qs.append('top_n', topn);
+  setBtn(btn, true, '选股'); document.getElementById('ss-result').textContent = '分析中…（首次联网抓取，请稍候）';
+  fetch('/api/stock/recommend?' + qs.toString())
+    .then(function(res){ if(!res.ok) return res.text().then(function(x){ throw new Error(x); }); return res.json(); })
+    .then(renderStockScreen)
+    .catch(function(e){ document.getElementById('ss-result').innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
+    .finally(function(){ setBtn(btn, false, '选股'); });
 });
 </script>
 </body>
