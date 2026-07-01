@@ -1,4 +1,5 @@
 pub mod page;
+pub mod stock;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
@@ -265,6 +266,11 @@ pub fn router() -> Router {
         .route("/api/compare", axum::routing::post(compare_handler))
         .route("/api/optimize", axum::routing::post(optimize_handler))
         .route("/api/sync", axum::routing::post(sync_handler))
+        .route("/api/stock/search", get(stock::search_handler))
+        .route("/api/stock/diagnose", get(stock::diagnose_handler))
+        .route("/api/stock/run", get(stock::run_handler))
+        .route("/api/stock/recommend", get(stock::recommend_handler))
+        .route("/api/stock/sync", axum::routing::post(stock::sync_handler))
 }
 
 #[derive(Debug, Deserialize)]
