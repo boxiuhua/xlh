@@ -3,6 +3,7 @@ use crate::event::MarketEvent;
 use crate::data::DataHandler;
 
 pub mod secid;
+pub mod kline;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StockBar {
