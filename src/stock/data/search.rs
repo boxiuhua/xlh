@@ -51,7 +51,13 @@ pub fn search(query: &str) -> Result<Vec<StockInfo>> {
     let url = format!(
         "https://searchapi.eastmoney.com/api/suggest/get?input={}&type=14&count=20",
         urlencoding_min(query));
-    let body = reqwest::blocking::Client::new()
+    // 与 kline 一致：强制 IPv4 + 超时，规避东财 dual-stack 域名的 IPv6 CDN 故障。
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        .build()
+        .map_err(|e| anyhow!("构建HTTP客户端失败: {e}"))?;
+    let body = client
         .get(&url)
         .header("Referer", "https://www.eastmoney.com/")
         .header("User-Agent", "Mozilla/5.0")

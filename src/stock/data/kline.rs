@@ -52,8 +52,11 @@ fn fetch_body(secid: &Secid, fqt: u8) -> Result<String> {
     let url = format!(
         "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57&klt=101&fqt={}&beg=0&end=20500101",
         secid.param(), fqt);
+    // 强制走 IPv4：push2his 的 IPv6 CDN 节点（trafficmanager.cn）在部分网络返回空/握手失败，
+    // 而 IPv4 端点稳定。绑定本地 IPv4(0.0.0.0) 即令连接只用 IPv4。
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
         .build()
         .map_err(|e| anyhow!("构建HTTP客户端失败: {e}"))?;
     // K线响应体较大（数千日 300KB+），弱网下偶发 body 读取中断，重试至多 3 次。
