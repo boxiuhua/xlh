@@ -2,6 +2,7 @@ pub mod event;
 // 后续任务逐个取消注释：
 pub mod analyze;
 pub mod data;
+pub mod stock;
 pub mod broker;
 pub mod portfolio;
 pub mod metrics;
