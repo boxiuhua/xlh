@@ -52,12 +52,24 @@ fn fetch_body(secid: &Secid, fqt: u8) -> Result<String> {
     let url = format!(
         "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57&klt=101&fqt={}&beg=0&end=20500101",
         secid.param(), fqt);
-    reqwest::blocking::Client::new()
-        .get(&url)
-        .header("Referer", "https://www.eastmoney.com/")
-        .header("User-Agent", "Mozilla/5.0")
-        .send().map_err(|e| anyhow!("请求K线失败: {e}"))?
-        .text().map_err(|e| anyhow!("读取K线响应失败: {e}"))
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow!("构建HTTP客户端失败: {e}"))?;
+    // K线响应体较大（数千日 300KB+），弱网下偶发 body 读取中断，重试至多 3 次。
+    let mut last_err = None;
+    for _ in 0..3 {
+        let attempt = client.get(&url)
+            .header("Referer", "https://www.eastmoney.com/")
+            .header("User-Agent", "Mozilla/5.0")
+            .send()
+            .and_then(|r| r.text());
+        match attempt {
+            Ok(body) => return Ok(body),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(anyhow!("抓取K线失败(重试3次): {}", last_err.unwrap()))
 }
 
 /// 抓不复权 OHLCV + 后复权收盘，merge 成 StockBar。
