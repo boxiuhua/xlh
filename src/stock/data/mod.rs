@@ -5,6 +5,7 @@ use crate::data::DataHandler;
 pub mod secid;
 pub mod kline;
 pub mod search;
+pub mod cache;
 
 /// 组合入口：A股/港股离线解析；美股经 suggest 搜索解析 secid。
 pub fn resolve_secid(input: &str) -> anyhow::Result<secid::Secid> {
