@@ -4,6 +4,15 @@ use crate::data::DataHandler;
 
 pub mod secid;
 pub mod kline;
+pub mod search;
+
+/// 组合入口：A股/港股离线解析；美股经 suggest 搜索解析 secid。
+pub fn resolve_secid(input: &str) -> anyhow::Result<secid::Secid> {
+    match secid::resolve_offline(input)? {
+        secid::Resolved::Ready(s) => Ok(s),
+        secid::Resolved::NeedSearch(t) => search::resolve_us(&t),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StockBar {
