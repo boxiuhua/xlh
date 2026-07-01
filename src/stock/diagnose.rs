@@ -25,7 +25,7 @@ impl Default for DiagnoseParams {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct StockDiagnosis {
     pub code: String, pub name: String, pub date: String,
     pub price: f64, pub adj_price: f64,

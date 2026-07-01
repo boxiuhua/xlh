@@ -4,3 +4,4 @@ pub mod trade_stats;
 pub mod backtest;
 pub mod indicators;
 pub mod diagnose;
+pub mod recommend;
