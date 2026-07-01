@@ -2,6 +2,8 @@ use chrono::NaiveDate;
 use crate::event::MarketEvent;
 use crate::data::DataHandler;
 
+pub mod secid;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StockBar {
     pub date: NaiveDate,
