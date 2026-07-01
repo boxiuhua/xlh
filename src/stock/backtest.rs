@@ -8,6 +8,7 @@ use crate::stock::data::{StockData, StockBar};
 use crate::stock::fee::StockFee;
 use crate::stock::trade_stats::{self, TradeStats};
 
+#[derive(serde::Serialize)]
 pub struct StockRunOutcome {
     pub name: String,
     pub code: String,
@@ -61,6 +62,17 @@ mod tests {
         assert!((out.summary.total_contributed - 2000.0).abs() < 1e-6);
         assert_eq!(out.summary.trade_count, 2);
         assert_eq!(out.trade_stats.round_trips, 0, "无卖出");
+    }
+
+    #[test]
+    fn outcome_serializes_to_json() {
+        let bars = vec![bar(d(2024,1,1),1.0), bar(d(2024,2,1),1.0), bar(d(2024,2,15),2.0)];
+        let out = run_one("t".into(), "600519".into(), bars,
+            Box::new(Dca::new(Period::Monthly,1,1000.0)), StockFee::us(), 0.0);
+        let j = serde_json::to_string(&out).unwrap();
+        for k in ["\"summary\"", "\"trade_stats\"", "\"daily\"", "\"trades\"", "\"round_trips\""] {
+            assert!(j.contains(k), "JSON 应含 {k}");
+        }
     }
 
     #[test]

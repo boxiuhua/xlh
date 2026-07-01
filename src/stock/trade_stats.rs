@@ -1,7 +1,7 @@
 use crate::result::TradeRecord;
 use crate::event::Direction;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TradeStats {
     pub round_trips: usize,
     pub wins: usize,
