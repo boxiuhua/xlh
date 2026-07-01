@@ -8,12 +8,28 @@ pub struct SellTier { pub max_days: i64, pub rate: f64 }
 pub struct FeeModel { pub buy_rate: f64, pub sell_tiers: Vec<SellTier> }
 
 impl FeeModel {
-    /// 按持有天数选择赎回费率；max_days==0 表示"更长期限"的兜底档。
+    /// 按持有天数选择赎回费率；与档位在 Vec 中的顺序无关。
+    /// 在满足 (max_days==0 兜底) 或 (holding_days <= max_days) 的档中，取 max_days 最小者；
+    /// max_days==0 视作最大（最长期限兜底档）。
     pub fn sell_rate(&self, holding_days: i64) -> f64 {
-        for t in &self.sell_tiers {
-            if t.max_days == 0 || holding_days <= t.max_days { return t.rate; }
-        }
-        0.0
+        self.sell_tiers.iter()
+            .filter(|t| t.max_days == 0 || holding_days <= t.max_days)
+            .min_by_key(|t| if t.max_days == 0 { i64::MAX } else { t.max_days })
+            .map(|t| t.rate)
+            .unwrap_or(0.0)
+    }
+}
+
+/// 资产无关的费用抽象：基金用 FeeModel，股票用 StockFee。
+pub trait Fee {
+    fn buy_fee(&self, cash: f64) -> f64;
+    fn sell_fee(&self, shares: f64, price: f64, holding_days: i64) -> f64;
+}
+
+impl Fee for FeeModel {
+    fn buy_fee(&self, cash: f64) -> f64 { cash * self.buy_rate }
+    fn sell_fee(&self, shares: f64, price: f64, holding_days: i64) -> f64 {
+        shares * price * self.sell_rate(holding_days)
     }
 }
 
@@ -23,15 +39,12 @@ struct Lot { date: NaiveDate, shares: f64, cost: f64 }
 pub struct Position { pub shares: f64, pub avg_cost: f64 }
 
 /// 兼托管(持有份额lots)与执行(撮合扣费)。
-pub struct Broker { fee: FeeModel, lots: Vec<Lot> }
+pub struct Broker { fee: Box<dyn Fee>, lots: Vec<Lot> }
 
 impl Broker {
-    pub fn new(mut fee: FeeModel) -> Self {
-        // Sort sell tiers ascending by max_days so first-hit matching is always correct,
-        // regardless of the order they appear in the config. Treat max_days == 0
-        // (the catch-all "longer than everything" tier) as the largest possible value.
-        fee.sell_tiers.sort_by_key(|t| if t.max_days == 0 { i64::MAX } else { t.max_days });
-        Self { fee, lots: Vec::new() }
+    pub fn new(fee: impl Fee + 'static) -> Self {
+        // 费率档位顺序无关由 FeeModel::sell_rate 保证，故此处无需再排序。
+        Self { fee: Box::new(fee), lots: Vec::new() }
     }
 
     pub fn total_shares(&self) -> f64 { self.lots.iter().map(|l| l.shares).sum() }
@@ -49,7 +62,7 @@ impl Broker {
         match order.direction {
             Direction::Buy => {
                 let cash = match order.qty { OrderQty::Cash(c) => c, _ => 0.0 };
-                let fee = cash * self.fee.buy_rate;
+                let fee = self.fee.buy_fee(cash);
                 let shares = if price > 0.0 { (cash - fee) / price } else { 0.0 };
                 if shares > 0.0 {
                     self.lots.push(Lot { date: order.date, shares, cost: price });
@@ -69,7 +82,7 @@ impl Broker {
                 while remaining > 1e-9 && i < self.lots.len() {
                     let take = remaining.min(self.lots[i].shares);
                     let days = (order.date - self.lots[i].date).num_days();
-                    fee += take * price * self.fee.sell_rate(days);
+                    fee += self.fee.sell_fee(take, price, days);
                     self.lots[i].shares -= take;
                     sold += take;
                     remaining -= take;
@@ -132,17 +145,16 @@ mod tests {
 
     #[test]
     fn sell_rate_robust_to_tier_order() {
-        // Tiers deliberately in scrambled order: catch-all first, then long, then short.
+        // 档位故意乱序：兜底档在前、长档居中、短档在后。
         let scrambled = FeeModel { buy_rate: 0.0015, sell_tiers: vec![
-            SellTier{max_days:0,   rate:0.0},   // catch-all (longest) — listed first
-            SellTier{max_days:365, rate:0.005},  // ≤365 days
-            SellTier{max_days:7,   rate:0.015},  // ≤7 days — listed last
+            SellTier{max_days:0,   rate:0.0},
+            SellTier{max_days:365, rate:0.005},
+            SellTier{max_days:7,   rate:0.015},
         ]};
-        // Broker::new must sort the tiers so first-hit matching still works.
-        let b = Broker::new(scrambled);
-        assert!((b.fee.sell_rate(3)   - 0.015).abs() < 1e-9, "3 days should hit 1.5% tier");
-        assert!((b.fee.sell_rate(100) - 0.005).abs() < 1e-9, "100 days should hit 0.5% tier");
-        assert!((b.fee.sell_rate(400) - 0.0  ).abs() < 1e-9, "400 days should hit 0% catch-all");
+        // FeeModel::sell_rate 顺序无关，无需 Broker 预排序即正确命中。
+        assert!((scrambled.sell_rate(3)   - 0.015).abs() < 1e-9, "3天应命中1.5%档");
+        assert!((scrambled.sell_rate(100) - 0.005).abs() < 1e-9, "100天应命中0.5%档");
+        assert!((scrambled.sell_rate(400) - 0.0  ).abs() < 1e-9, "400天应命中0%兜底");
     }
 
     #[test]
