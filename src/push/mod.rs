@@ -3,10 +3,12 @@
 pub mod config;
 pub mod message;
 pub mod channels;
+pub mod stock_advice;
 pub mod schedule;
 pub mod job;
 
 pub use config::{load, PushConfig};
+pub use job::build_message;
 
 /// 立即跑一次任务（同步+建议+诊断+推送）。
 pub fn run_once(cfg: &PushConfig) -> anyhow::Result<()> {

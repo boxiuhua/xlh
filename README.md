@@ -20,12 +20,14 @@ cargo run --release -- push --once    # 立即推送一次（测试用）
 
 ### 定时推送（钉钉 / 飞书 / 企业微信 / Server酱）
 
-`xlh push` 按 `push.toml` 的 **cron 表达式**常驻：到点先**同步**配置的基金最新净值，再生成**持仓建议 + 基金诊断**，推送到群机器人或个人微信。复制 `push.toml.example` 为 `push.toml` 填好即可（`push.toml` 已在 `.gitignore`，避免密钥入库）。
+`xlh push` 按 `push.toml` 的 **cron 表达式**常驻：到点先**同步**配置的基金/股票最新数据，再生成**持仓建议（基金+股票）+ 诊断**，推送到群机器人或个人微信。复制 `push.toml.example` 为 `push.toml` 填好即可，**或直接在 Web 页面「基金 → 推送」Tab 图形化配置**（`push.toml` 已在 `.gitignore`，避免密钥入库）。
 
-- **渠道**：`kind = dingtalk | feishu | wework | serverchan`。前三者为群机器人 webhook（POST JSON，免费无审核）；`serverchan` 走 Server酱推个人微信（`webhook` 填 sendkey）。钉钉/飞书填 `secret` 即启用 HMAC-SHA256 加签，留空则用「关键词/IP 白名单」安全模式。
-- **cron**：6 段含秒（秒 分 时 日 月 周），如 `0 30 8 * * *` = 每天 08:30:00。
+- **渠道**：`kind = dingtalk | feishu | wework | serverchan`。前三者为群机器人 webhook（POST JSON，免费无审核）；`serverchan` 走 Server酱推个人微信（`webhook` 填 sendkey）。钉钉/飞书填 `secret` 即启用 HMAC-SHA256 加签，留空则用「关键词/IP 白名单」安全模式。发送失败自动重试 3 次。
+- **内容**：基金持仓 `[[holdings]]` + 股票持仓 `[[stocks]]`（含加仓/持有/减仓/止盈/观望及建议金额）+ 额外诊断 `diagnose` / `diagnose_stocks`。
+- **cron**：6 段含秒（秒 分 时 日 月 周），如 `0 30 8 * * *` = 每天 08:30:00。`only_on_new_data`（默认 true）在无新数据时跳过，天然规避周末/节假日空推。
+- **Web 配置 Tab**：「基金 → 推送」可编辑渠道/持仓、**预览消息**、**立即推送**；保存写入 `push.toml`，后台 `xlh push` 守护进程**重启后生效**（不热重载）。
 - **调度进程**：`push` 为独立阻塞守护（非 `serve` 内）；`--once` 跑一次即退出，便于测试或交给系统计划任务。
-- **TOML 提醒**：根级键 `diagnose` 须写在 `[[holdings]]` 之前，否则会被并入 holdings 表。
+- **TOML 提醒**：根级键 `diagnose` / `diagnose_stocks` 须写在 `[[holdings]]` / `[[stocks]]` 之前，否则会被并入数组表（用 Web Tab 配置则无此坑）。
 
 ### 部署（脱离 cargo）
 

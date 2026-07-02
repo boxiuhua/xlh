@@ -2,15 +2,18 @@
 #   xlh push              # 按 cron 常驻守护
 #   xlh push --once       # 立即跑一次（测试用）
 #
-# 注意 TOML 语法：根级键 diagnose 必须写在 [[holdings]] 之前，
-# 否则会被并入最后一个 holdings 表。
+# 注意 TOML 语法：根级键 diagnose/diagnose_stocks 必须写在 [[holdings]]/[[stocks]]
+# 之前，否则会被并入最后一个数组表。（也可直接用 Web「基金 → 推送」Tab 图形化配置）
 
-# 额外只诊断、不持有的基金（选填）
+# 额外只诊断、不持有的基金 / 股票（选填）
 diagnose = ["110022"]
+diagnose_stocks = ["000001"]
 
 [schedule]
 # 6 段 cron（含秒）：秒 分 时 日 月 周。示例：每个交易日 08:30:00
 cron = "0 30 8 * * *"
+# 仅在有新净值/行情时才推送（默认 true，天然规避周末/节假日空推）
+only_on_new_data = true
 
 [channel]
 # 渠道：dingtalk | feishu | wework | serverchan
@@ -28,7 +31,7 @@ total_amount = 30000
 total_profit = 1800
 cumulative_profit = 4200
 
-# 持仓明细（可多条）
+# 基金持仓明细（可多条）
 [[holdings]]
 code = "161725"
 amount = 12000
@@ -38,3 +41,9 @@ profit = 900
 code = "005827"
 amount = 10000
 profit = 1200
+
+# 股票持仓明细（可多条；A股/港股/美股代码）
+[[stocks]]
+code = "600519"
+amount = 20000
+profit = 1500

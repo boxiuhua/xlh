@@ -264,6 +264,9 @@ pub fn router() -> Router {
         .route("/api/regime", get(regime_handler))
         .route("/api/recommend", get(recommend_handler))
         .route("/api/holdings", axum::routing::post(holdings_handler))
+        .route("/api/push/config", get(push_config_get).post(push_config_save))
+        .route("/api/push/preview", axum::routing::post(push_preview))
+        .route("/api/push/test", axum::routing::post(push_test))
         .route("/api/compare", axum::routing::post(compare_handler))
         .route("/api/optimize", axum::routing::post(optimize_handler))
         .route("/api/sync", axum::routing::post(sync_handler))
@@ -529,6 +532,46 @@ fn holdings_blocking(input: crate::holdings::HoldingsInput) -> crate::holdings::
         &params,
         |code| crate::data::cache::load_or_fetch(code, std::path::Path::new(".cache"), start, end),
     )
+}
+
+// ===== 推送配置 Tab 后端 =====
+const PUSH_TOML: &str = "push.toml";
+
+async fn push_config_get() -> axum::Json<crate::push::PushConfig> {
+    let cfg = std::fs::read_to_string(PUSH_TOML).ok()
+        .and_then(|t| toml::from_str::<crate::push::PushConfig>(&t).ok())
+        .unwrap_or_else(crate::push::config::default_config);
+    axum::Json(cfg)
+}
+
+async fn push_config_save(
+    axum::Json(cfg): axum::Json<crate::push::PushConfig>,
+) -> std::result::Result<axum::Json<serde_json::Value>, AppError> {
+    crate::push::config::validate(&cfg)?;
+    let text = toml::to_string(&cfg).map_err(|e| anyhow!("序列化 push.toml 失败: {e}"))?;
+    std::fs::write(PUSH_TOML, text).map_err(|e| anyhow!("写入 {PUSH_TOML} 失败: {e}"))?;
+    Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
+async fn push_preview(
+    axum::Json(cfg): axum::Json<crate::push::PushConfig>,
+) -> std::result::Result<axum::Json<serde_json::Value>, AppError> {
+    // 预览不发送，故不校验 webhook；只组装消息。
+    let (md, has_new) = tokio::task::spawn_blocking(move || crate::push::build_message(&cfg))
+        .await.map_err(|e| anyhow!("任务执行失败: {e}"))??;
+    Ok(axum::Json(serde_json::json!({"markdown": md, "has_new": has_new})))
+}
+
+async fn push_test(
+    axum::Json(cfg): axum::Json<crate::push::PushConfig>,
+) -> std::result::Result<axum::Json<serde_json::Value>, AppError> {
+    crate::push::config::validate(&cfg)?;
+    let res = tokio::task::spawn_blocking(move || crate::push::run_once(&cfg))
+        .await.map_err(|e| anyhow!("任务执行失败: {e}"))?;
+    Ok(axum::Json(match res {
+        Ok(()) => serde_json::json!({"ok": true}),
+        Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+    }))
 }
 
 pub struct AppError(pub anyhow::Error);
@@ -970,6 +1013,48 @@ mod tests {
                   "/api/holdings", "renderHoldings"] {
             assert!(body.contains(m), "首页应含 {m}");
         }
+    }
+
+    #[tokio::test]
+    async fn index_has_push_tab() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let resp = super::router()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for m in ["data-tab=\"push\"", "id=\"panel-push\"", "id=\"pu-test\"", "/api/push/config",
+                  "collectPushConfig", "股票持仓"] {
+            assert!(body.contains(m), "首页应含 {m}");
+        }
+    }
+
+    #[tokio::test]
+    async fn push_config_get_returns_json() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let resp = super::router()
+            .oneshot(Request::builder().uri("/api/push/config").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["schedule"]["cron"].is_string());
+        assert!(v["channel"]["kind"].is_string());
+    }
+
+    #[tokio::test]
+    async fn push_config_save_empty_webhook_is_400() {
+        // webhook 为空 → validate 失败，且校验在写盘前，无副作用
+        let body = serde_json::json!({
+            "schedule": {"cron": "0 30 8 * * *"},
+            "channel": {"kind": "feishu", "webhook": ""},
+            "holdings": [{"code": "161725", "amount": 1000.0, "profit": 0.0}]
+        });
+        assert_eq!(post_json("/api/push/config", body).await, axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -73,6 +73,7 @@ button.del{color:#c0392b;border-color:#e8b9b3}
     <button class="tab" data-tab="diagnose">诊断</button>
     <button class="tab" data-tab="recommend">推荐</button>
     <button class="tab" data-tab="holdings">持仓建议</button>
+    <button class="tab" data-tab="push">推送</button>
   </div>
   <div class="tabs" id="tabs-stock" style="display:none">
     <button class="tab" data-tab="s-diagnose">股诊断</button>
@@ -225,6 +226,54 @@ button.del{color:#c0392b;border-color:#e8b9b3}
       <button class="run" id="run-holdings">生成建议</button>
       <div class="hint" style="margin-top:8px">按你的实际持仓，逐只多策略样本外评估 + 当下择时，给出加仓/持有/减仓/止盈/观望及建议金额。首次联网抓取净值较慢，命中缓存后秒级。</div>
       <div id="hd-result" style="margin-top:14px"></div>
+    </div>
+  </div>
+
+  <!-- 推送 -->
+  <div class="panel" id="panel-push">
+    <div class="card">
+      <div class="row">
+        <div class="field"><label>渠道</label>
+          <select id="pu-kind">
+            <option value="feishu">飞书</option>
+            <option value="dingtalk">钉钉</option>
+            <option value="wework">企业微信</option>
+            <option value="serverchan">Server酱(微信)</option>
+          </select>
+        </div>
+        <div class="field" style="flex:1;min-width:280px"><label>webhook / sendkey</label><input id="pu-webhook" placeholder="群机器人地址；Server酱填 sendkey"/></div>
+        <div class="field"><label>加签密钥(可选)</label><input id="pu-secret" placeholder="钉钉/飞书 secret"/></div>
+        <div class="field"><label>cron(6段含秒)</label><input id="pu-cron" value="0 30 8 * * *"/></div>
+        <div class="field"><label>仅有新数据时推</label><select id="pu-onlynew"><option value="true">是</option><option value="false">否</option></select></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div class="field"><label>总持仓金额</label><input type="number" id="pu-total" placeholder="选填"/></div>
+        <div class="field"><label>持有收益</label><input type="number" id="pu-profit" placeholder="选填"/></div>
+        <div class="field"><label>累计收益</label><input type="number" id="pu-cum" placeholder="选填"/></div>
+      </div>
+
+      <div style="margin-top:14px;font-weight:600;color:#1a252f">基金持仓</div>
+      <div id="pu-fund-rows"></div>
+      <button class="small" id="pu-add-fund">+ 基金</button>
+
+      <div style="margin-top:14px;font-weight:600;color:#1a252f">股票持仓</div>
+      <div id="pu-stock-rows"></div>
+      <button class="small" id="pu-add-stock">+ 股票</button>
+
+      <div class="row" style="margin-top:14px">
+        <div class="field" style="flex:1;min-width:240px"><label>额外诊断·基金(逗号分隔)</label><input id="pu-diag-fund" placeholder="如 110022,161725"/></div>
+        <div class="field" style="flex:1;min-width:240px"><label>额外诊断·股票(逗号分隔)</label><input id="pu-diag-stock" placeholder="如 600519,000001"/></div>
+      </div>
+
+      <div style="margin-top:14px">
+        <button class="small" id="pu-load">读取当前配置</button>
+        <button class="small" id="pu-save">保存</button>
+        <button class="small" id="pu-preview">预览消息</button>
+        <button class="run" id="pu-test">立即推送</button>
+      </div>
+      <div id="pu-msg" class="hint" style="margin-top:8px"></div>
+      <pre id="pu-preview-box" style="margin-top:10px;white-space:pre-wrap;background:#fafbfc;border:1px solid #eaecef;border-radius:8px;padding:12px;display:none"></pre>
+      <div class="hint" style="margin-top:8px">保存写入项目根 <code>push.toml</code>；后台 <code>xlh push</code> 守护进程需<strong>重启后生效</strong>（不热重载）。仅本机监听，secret 原样读写。</div>
     </div>
   </div>
 
@@ -880,6 +929,102 @@ document.getElementById('run-s-screen').addEventListener('click', function(){
     .catch(function(e){ document.getElementById('ss-result').innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
     .finally(function(){ setBtn(btn, false, '选股'); });
 });
+
+// ===== 推送配置 =====
+function puNum(id){ var v=document.getElementById(id).value.trim(); return v===''?null:Number(v); }
+function puCsv(id){ return document.getElementById(id).value.split(',').map(function(s){return s.trim();}).filter(function(s){return s;}); }
+function puRowVal(d, sel){ var v=d.querySelector(sel).value.trim(); return v===''?0:Number(v); }
+
+function puRow(container, comboFn, code, amount, profit){
+  var d=document.createElement('div'); d.className='crow';
+  d.innerHTML='<div class="row">'
+    +'<div class="field"><label>代码</label><input class="pu-code" placeholder="如 161725 / 600519"/></div>'
+    +'<div class="field"><label>持有金额</label><input type="number" class="pu-amt" placeholder="选填"/></div>'
+    +'<div class="field"><label>持有收益</label><input type="number" class="pu-pft" placeholder="选填"/></div>'
+    +'<button class="small del">删除</button></div>';
+  container.appendChild(d);
+  d.querySelector('.pu-code').value = code||'';
+  if(amount) d.querySelector('.pu-amt').value = amount;
+  if(profit) d.querySelector('.pu-pft').value = profit;
+  d.querySelector('.del').addEventListener('click', function(){ d.remove(); });
+  comboFn(d.querySelector('.pu-code'));
+}
+function puFundRow(code,amount,profit){ puRow(document.getElementById('pu-fund-rows'), attachCombobox, code,amount,profit); }
+function puStockRow(code,amount,profit){ puRow(document.getElementById('pu-stock-rows'), attachStockCombobox, code,amount,profit); }
+
+function collectPushConfig(){
+  var holdings=[], stocks=[];
+  document.querySelectorAll('#pu-fund-rows .crow').forEach(function(d){
+    var c=d.querySelector('.pu-code').value.trim(); if(!c) return;
+    holdings.push({code:c, amount:puRowVal(d,'.pu-amt'), profit:puRowVal(d,'.pu-pft')});
+  });
+  document.querySelectorAll('#pu-stock-rows .crow').forEach(function(d){
+    var c=d.querySelector('.pu-code').value.trim(); if(!c) return;
+    stocks.push({code:c, amount:puRowVal(d,'.pu-amt'), profit:puRowVal(d,'.pu-pft')});
+  });
+  var portfolio={};
+  var t=puNum('pu-total'); if(t!=null) portfolio.total_amount=t;
+  var pf2=puNum('pu-profit'); if(pf2!=null) portfolio.total_profit=pf2;
+  var cu=puNum('pu-cum'); if(cu!=null) portfolio.cumulative_profit=cu;
+  return {
+    schedule:{ cron:document.getElementById('pu-cron').value.trim(), only_on_new_data: document.getElementById('pu-onlynew').value==='true' },
+    channel:{ kind:document.getElementById('pu-kind').value, webhook:document.getElementById('pu-webhook').value.trim(), secret:document.getElementById('pu-secret').value.trim(), cache_dir:'.cache' },
+    portfolio: portfolio,
+    holdings: holdings,
+    diagnose: puCsv('pu-diag-fund'),
+    stocks: stocks,
+    diagnose_stocks: puCsv('pu-diag-stock')
+  };
+}
+function loadPushConfig(){
+  fetch('/api/push/config').then(function(r){return r.json();}).then(function(c){
+    document.getElementById('pu-kind').value = (c.channel&&c.channel.kind)||'feishu';
+    document.getElementById('pu-webhook').value = (c.channel&&c.channel.webhook)||'';
+    document.getElementById('pu-secret').value = (c.channel&&c.channel.secret)||'';
+    document.getElementById('pu-cron').value = (c.schedule&&c.schedule.cron)||'0 30 8 * * *';
+    document.getElementById('pu-onlynew').value = (c.schedule&&c.schedule.only_on_new_data===false)?'false':'true';
+    var p=c.portfolio||{};
+    document.getElementById('pu-total').value = p.total_amount!=null?p.total_amount:'';
+    document.getElementById('pu-profit').value = p.total_profit!=null?p.total_profit:'';
+    document.getElementById('pu-cum').value = p.cumulative_profit!=null?p.cumulative_profit:'';
+    document.getElementById('pu-fund-rows').innerHTML='';
+    (c.holdings||[]).forEach(function(h){ puFundRow(h.code,h.amount,h.profit); });
+    if(!(c.holdings||[]).length) puFundRow();
+    document.getElementById('pu-stock-rows').innerHTML='';
+    (c.stocks||[]).forEach(function(h){ puStockRow(h.code,h.amount,h.profit); });
+    if(!(c.stocks||[]).length) puStockRow();
+    document.getElementById('pu-diag-fund').value = (c.diagnose||[]).join(',');
+    document.getElementById('pu-diag-stock').value = (c.diagnose_stocks||[]).join(',');
+  }).catch(function(){ puFundRow(); puStockRow(); });
+}
+function puPost(url, okMsg, btn, onOk){
+  var msg=document.getElementById('pu-msg'); var t=btn.textContent; btn.disabled=true; msg.textContent='处理中…';
+  fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collectPushConfig())})
+    .then(function(res){ if(!res.ok) return res.text().then(function(x){ throw new Error(x); }); return res.json(); })
+    .then(function(d){ if(onOk) onOk(d); else msg.innerHTML='<span style="color:#1a7f37">'+esc(okMsg)+'</span>'; })
+    .catch(function(e){ msg.innerHTML='<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
+    .finally(function(){ btn.disabled=false; btn.textContent=t; });
+}
+document.getElementById('pu-add-fund').addEventListener('click', function(){ puFundRow(); });
+document.getElementById('pu-add-stock').addEventListener('click', function(){ puStockRow(); });
+document.getElementById('pu-load').addEventListener('click', loadPushConfig);
+document.getElementById('pu-save').addEventListener('click', function(){ puPost('/api/push/config', '已保存到 push.toml', this); });
+document.getElementById('pu-preview').addEventListener('click', function(){
+  var box=document.getElementById('pu-preview-box'), msg=document.getElementById('pu-msg');
+  msg.textContent='组装预览中…（首次联网抓取，请稍候）';
+  puPost('/api/push/preview', '', this, function(d){
+    box.style.display='block'; box.textContent=d.markdown||'(空)';
+    msg.innerHTML = d.has_new ? '<span style="color:#1a7f37">检测到新数据</span>' : '<span style="color:#7f8c8d">无新数据（定时任务默认会跳过本次）</span>';
+  });
+});
+document.getElementById('pu-test').addEventListener('click', function(){
+  var msg=document.getElementById('pu-msg');
+  msg.textContent='推送中…';
+  puPost('/api/push/test', '', this, function(d){
+    msg.innerHTML = d.ok ? '<span style="color:#1a7f37">推送成功</span>' : '<span style="color:#c0392b">推送失败：'+esc(d.error||'')+'</span>';
+  });
+});
+loadPushConfig();
 </script>
 </body>
 </html>

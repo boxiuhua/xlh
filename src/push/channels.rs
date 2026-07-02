@@ -75,16 +75,18 @@ pub fn build_request(cfg: &ChannelCfg, title: &str, md: &str, ts_ms: i64) -> Htt
     }
 }
 
-/// 发送。校验 HTTP 2xx，且（能解析 JSON 时）业务码为 0。
-pub fn send(cfg: &ChannelCfg, title: &str, md: &str) -> Result<()> {
-    let ts_ms = chrono::Utc::now().timestamp_millis();
-    let req = build_request(cfg, title, md, ts_ms);
+/// 发送失败重试次数与间隔。
+const SEND_RETRIES: usize = 3;
+const RETRY_GAP_SECS: u64 = 5;
+
+/// 单次发送尝试：校验 HTTP 2xx，且（能解析 JSON 时）业务码为 0。
+fn send_once(req: &HttpReq) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| anyhow!("构建HTTP客户端失败: {e}"))?;
     let ct = if req.form { "application/x-www-form-urlencoded" } else { "application/json" };
-    let resp = client.post(&req.url).header("Content-Type", ct).body(req.body)
+    let resp = client.post(&req.url).header("Content-Type", ct).body(req.body.clone())
         .send().map_err(|e| anyhow!("推送请求失败: {e}"))?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
@@ -99,6 +101,26 @@ pub fn send(cfg: &ChannelCfg, title: &str, md: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 发送，失败重试至多 SEND_RETRIES 次、间隔 RETRY_GAP_SECS 秒。
+pub fn send(cfg: &ChannelCfg, title: &str, md: &str) -> Result<()> {
+    let ts_ms = chrono::Utc::now().timestamp_millis();
+    let req = build_request(cfg, title, md, ts_ms);
+    let mut last = None;
+    for attempt in 1..=SEND_RETRIES {
+        match send_once(&req) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("推送第 {attempt}/{SEND_RETRIES} 次失败：{e}");
+                last = Some(e);
+                if attempt < SEND_RETRIES {
+                    std::thread::sleep(std::time::Duration::from_secs(RETRY_GAP_SECS));
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("推送失败")))
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use crate::recommend::{self, RecommendParams, StrategyEval, DISCLAIMER};
 const CONCENTRATION_LIMIT: f64 = 0.40;
 
 /// 单只持仓输入。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Holding {
     pub code: String,
     #[serde(default)]
@@ -71,12 +71,13 @@ pub struct HoldingsReport {
     pub disclaimer: String,
 }
 
-/// 加仓/减仓比例：随信号强度 |z| 放大，clamp 到 [10%, 30%]。
-fn size_pct(z_abs: f64) -> f64 {
+/// 加仓/减仓比例：随信号强度 |z| 放大，clamp 到 [10%, 30%]。持仓建议与股票推送共用。
+pub fn size_pct(z_abs: f64) -> f64 {
     (0.10 + 0.10 * z_abs.min(2.0)).clamp(0.10, 0.30)
 }
 
-fn round_yuan(x: f64) -> f64 { x.round() }
+/// 金额四舍五入到整数元。持仓建议与股票推送共用。
+pub fn round_yuan(x: f64) -> f64 { x.round() }
 
 /// 由形态/信号/持仓推导动作与建议金额。返回 (action, suggest_amount, 动作依据补充)。
 fn decide(regime: &str, signal: &str, z: f64, amount: f64, profit: f64) -> (String, f64, String) {
