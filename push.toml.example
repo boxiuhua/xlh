@@ -1,0 +1,40 @@
+# 定时推送配置示例：复制为 push.toml 并填好后运行
+#   xlh push              # 按 cron 常驻守护
+#   xlh push --once       # 立即跑一次（测试用）
+#
+# 注意 TOML 语法：根级键 diagnose 必须写在 [[holdings]] 之前，
+# 否则会被并入最后一个 holdings 表。
+
+# 额外只诊断、不持有的基金（选填）
+diagnose = ["110022"]
+
+[schedule]
+# 6 段 cron（含秒）：秒 分 时 日 月 周。示例：每个交易日 08:30:00
+cron = "0 30 8 * * *"
+
+[channel]
+# 渠道：dingtalk | feishu | wework | serverchan
+kind = "feishu"
+# 群机器人 webhook 完整地址；serverchan 时填 sendkey（如 SCTxxxx）
+webhook = "https://open.feishu.cn/open-apis/bot/v2/hook/换成你的"
+# 钉钉/飞书「加签」密钥，留空则不加签（改用关键词/IP 白名单）
+secret = ""
+# 净值缓存目录（与回测共用）
+cache_dir = ".cache"
+
+# 组合总览（均选填，仅回显）
+[portfolio]
+total_amount = 30000
+total_profit = 1800
+cumulative_profit = 4200
+
+# 持仓明细（可多条）
+[[holdings]]
+code = "161725"
+amount = 12000
+profit = 900
+
+[[holdings]]
+code = "005827"
+amount = 10000
+profit = 1200

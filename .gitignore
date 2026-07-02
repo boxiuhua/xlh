@@ -2,3 +2,4 @@
 /.cache
 /output
 Cargo.lock
+/push.toml

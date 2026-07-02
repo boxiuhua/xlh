@@ -27,6 +27,15 @@ enum Commands {
         #[arg(long, default_value_t = 8080)]
         port: u16,
     },
+    /// 定时推送持仓建议 + 基金诊断（钉钉/飞书/企业微信/Server酱）
+    Push {
+        /// 推送配置文件
+        #[arg(long, default_value = "push.toml")]
+        file: PathBuf,
+        /// 立即跑一次即退出（否则按 cron 常驻守护）
+        #[arg(long)]
+        once: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -36,6 +45,10 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(xlh::web::serve(port))?;
             Ok(())
+        }
+        Some(Commands::Push { file, once }) => {
+            let cfg = xlh::push::load(&file)?;
+            if once { xlh::push::run_once(&cfg) } else { xlh::push::run_daemon(&cfg) }
         }
         None => run_cli(&cli.config),
     }

@@ -12,9 +12,20 @@
 cargo run --release -- serve          # 启动本地 Web 界面（默认 http://127.0.0.1:8080）
 cargo run --release -- serve --port 9000
 cargo run --release -- -c config.toml # 无子命令时按配置文件跑 CLI 回测/对比/寻优
+cargo run --release -- push           # 按 push.toml 的 cron 定时推送持仓建议+诊断
+cargo run --release -- push --once    # 立即推送一次（测试用）
 ```
 
 `serve` 启动后浏览器打开 `http://127.0.0.1:8080`，即「基金 / 股票」两级 Tab 界面。
+
+### 定时推送（钉钉 / 飞书 / 企业微信 / Server酱）
+
+`xlh push` 按 `push.toml` 的 **cron 表达式**常驻：到点先**同步**配置的基金最新净值，再生成**持仓建议 + 基金诊断**，推送到群机器人或个人微信。复制 `push.toml.example` 为 `push.toml` 填好即可（`push.toml` 已在 `.gitignore`，避免密钥入库）。
+
+- **渠道**：`kind = dingtalk | feishu | wework | serverchan`。前三者为群机器人 webhook（POST JSON，免费无审核）；`serverchan` 走 Server酱推个人微信（`webhook` 填 sendkey）。钉钉/飞书填 `secret` 即启用 HMAC-SHA256 加签，留空则用「关键词/IP 白名单」安全模式。
+- **cron**：6 段含秒（秒 分 时 日 月 周），如 `0 30 8 * * *` = 每天 08:30:00。
+- **调度进程**：`push` 为独立阻塞守护（非 `serve` 内）；`--once` 跑一次即退出，便于测试或交给系统计划任务。
+- **TOML 提醒**：根级键 `diagnose` 须写在 `[[holdings]]` 之前，否则会被并入 holdings 表。
 
 ### 部署（脱离 cargo）
 
