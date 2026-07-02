@@ -263,6 +263,7 @@ pub fn router() -> Router {
         .route("/api/funds", get(funds_handler))
         .route("/api/regime", get(regime_handler))
         .route("/api/recommend", get(recommend_handler))
+        .route("/api/holdings", axum::routing::post(holdings_handler))
         .route("/api/compare", axum::routing::post(compare_handler))
         .route("/api/optimize", axum::routing::post(optimize_handler))
         .route("/api/sync", axum::routing::post(sync_handler))
@@ -501,6 +502,33 @@ fn recommend_blocking(q: RecommendQuery) -> Result<crate::recommend::RecommendRe
         |code| crate::data::cache::load_or_fetch(code, std::path::Path::new(".cache"), start, end),
     );
     Ok(report)
+}
+
+async fn holdings_handler(
+    axum::Json(input): axum::Json<crate::holdings::HoldingsInput>,
+) -> std::result::Result<axum::Json<crate::holdings::HoldingsReport>, AppError> {
+    let report = tokio::task::spawn_blocking(move || holdings_blocking(input))
+        .await
+        .map_err(|e| anyhow!("任务执行失败: {e}"))?;
+    Ok(axum::Json(report))
+}
+
+fn holdings_blocking(input: crate::holdings::HoldingsInput) -> crate::holdings::HoldingsReport {
+    let params = crate::recommend::RecommendParams::default();
+    // code → 中文名 映射（清单加载失败则回退代码）
+    let names: std::collections::HashMap<String, String> = funds_payload(std::path::Path::new(".cache"))
+        .into_iter()
+        .map(|f| (f.code, f.name))
+        .collect();
+    let end = chrono::Local::now().date_naive();
+    let start = end - chrono::Duration::days(8 * 365);
+    crate::holdings::build_report(
+        &input,
+        |code| names.get(code).cloned().unwrap_or_else(|| code.to_string()),
+        &end.to_string(),
+        &params,
+        |code| crate::data::cache::load_or_fetch(code, std::path::Path::new(".cache"), start, end),
+    )
 }
 
 pub struct AppError(pub anyhow::Error);
@@ -926,6 +954,41 @@ mod tests {
                   "id=\"sd-result\"", "id=\"sb-result\"", "id=\"ss-result\"", "attachStockCombobox"] {
             assert!(body.contains(m), "首页应含 {m}");
         }
+    }
+
+    #[tokio::test]
+    async fn index_has_holdings_tab() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let resp = super::router()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for m in ["data-tab=\"holdings\"", "持仓建议", "id=\"panel-holdings\"", "id=\"run-holdings\"",
+                  "/api/holdings", "renderHoldings"] {
+            assert!(body.contains(m), "首页应含 {m}");
+        }
+    }
+
+    #[tokio::test]
+    async fn holdings_empty_returns_valid_report() {
+        // 空持仓不触发任何加载 → 离线安全，返回合法空报告
+        use axum::body::Body;
+        use axum::http::{Request, header};
+        use tower::ServiceExt;
+        let body = serde_json::json!({"holdings": []}).to_string();
+        let resp = super::router()
+            .oneshot(Request::builder().method("POST").uri("/api/holdings")
+                .header(header::CONTENT_TYPE, "application/json").body(Body::from(body)).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["summary"].is_object(), "应含 summary");
+        assert!(v["advices"].as_array().unwrap().is_empty(), "空持仓 advices 为空");
+        assert_eq!(v["summary"]["holding_count"], 0);
     }
 
     #[test]

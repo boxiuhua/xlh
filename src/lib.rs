@@ -14,4 +14,5 @@ pub mod result;
 pub mod runner;
 pub mod optimize;
 pub mod recommend;
+pub mod holdings;
 pub mod web;

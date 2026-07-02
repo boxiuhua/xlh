@@ -10,6 +10,9 @@ pub const INDEX_HTML: &str = r##"<!DOCTYPE html>
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#f5f6fa;color:#2c3e50}
 .wrap{max-width:1200px;margin:0 auto;padding:20px 16px}
 h1{font-size:1.5rem;color:#1a252f;margin-bottom:14px}
+.groups{display:flex;gap:8px;margin-bottom:14px}
+.group{padding:8px 24px;cursor:pointer;border:1px solid #d0d7e2;background:#fff;border-radius:8px;font-size:1rem;color:#5a6a7a;font-weight:600}
+.group.active{background:#c0392b;color:#fff;border-color:#c0392b}
 .tabs{display:flex;gap:6px;margin-bottom:14px;border-bottom:2px solid #e0e4ea}
 .tab{padding:9px 18px;cursor:pointer;border:none;background:none;font-size:.95rem;color:#7f8c8d;border-bottom:2px solid transparent;margin-bottom:-2px}
 .tab.active{color:#c0392b;border-bottom-color:#c0392b;font-weight:600}
@@ -40,7 +43,11 @@ button.del{color:#c0392b;border-color:#e8b9b3}
 </head>
 <body>
 <div class="wrap">
-  <h1>xlh 基金回测</h1>
+  <h1>xlh 回测</h1>
+  <div class="groups">
+    <button class="group active" data-group="fund">基金</button>
+    <button class="group" data-group="stock">股票</button>
+  </div>
   <div class="card" id="sync-card">
     <div class="row" style="align-items:flex-end">
       <strong style="margin-right:8px">数据同步</strong>
@@ -59,12 +66,15 @@ button.del{color:#c0392b;border-color:#e8b9b3}
     </div>
     <div id="s-sync-result" class="hint" style="margin-top:8px"></div>
   </div>
-  <div class="tabs">
+  <div class="tabs" id="tabs-fund">
     <button class="tab active" data-tab="single">单次</button>
     <button class="tab" data-tab="compare">对比</button>
     <button class="tab" data-tab="optimize">寻优</button>
     <button class="tab" data-tab="diagnose">诊断</button>
     <button class="tab" data-tab="recommend">推荐</button>
+    <button class="tab" data-tab="holdings">持仓建议</button>
+  </div>
+  <div class="tabs" id="tabs-stock" style="display:none">
     <button class="tab" data-tab="s-diagnose">股诊断</button>
     <button class="tab" data-tab="s-backtest">股回测</button>
     <button class="tab" data-tab="s-screen">股选股</button>
@@ -199,6 +209,22 @@ button.del{color:#c0392b;border-color:#e8b9b3}
       </div>
       <div class="hint" style="margin-top:8px">首次需联网抓取精选池全部基金净值（数十只，约几十秒）；命中缓存后秒级。</div>
       <div id="rec-result" style="margin-top:14px"></div>
+    </div>
+  </div>
+
+  <!-- 持仓建议 -->
+  <div class="panel" id="panel-holdings">
+    <div class="card">
+      <div class="row">
+        <div class="field"><label>总持仓金额(元)</label><input type="number" id="hd-total" placeholder="选填"/></div>
+        <div class="field"><label>持有收益(元)</label><input type="number" id="hd-profit" placeholder="选填"/></div>
+        <div class="field"><label>累计收益(元)</label><input type="number" id="hd-cum" placeholder="选填"/></div>
+      </div>
+      <div id="hd-rows" style="margin-top:14px"></div>
+      <button class="small" id="hd-add">+ 添加持仓</button>
+      <button class="run" id="run-holdings">生成建议</button>
+      <div class="hint" style="margin-top:8px">按你的实际持仓，逐只多策略样本外评估 + 当下择时，给出加仓/持有/减仓/止盈/观望及建议金额。首次联网抓取净值较慢，命中缓存后秒级。</div>
+      <div id="hd-result" style="margin-top:14px"></div>
     </div>
   </div>
 
@@ -337,21 +363,31 @@ var ROW_FIELDS = {
 };
 var iframe = document.getElementById('result');
 
-// Tab 切换（股票 Tab 显示股票同步卡片，基金 Tab 显示基金同步卡片）
-var STOCK_TABS = { 's-diagnose':1, 's-backtest':1, 's-screen':1 };
-function syncCardFor(tab){
-  var isStock = !!STOCK_TABS[tab];
-  document.getElementById('sync-card').style.display = isStock ? 'none' : '';
-  document.getElementById('s-sync-card').style.display = isStock ? '' : 'none';
+// 两级 Tab：先选大类（基金/股票），再选子功能
+function activateTab(tab){
+  document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active');});
+  document.querySelectorAll('.panel').forEach(function(x){x.classList.remove('active');});
+  var btn = document.querySelector('.tab[data-tab="'+tab+'"]');
+  if(btn) btn.classList.add('active');
+  var panel = document.getElementById('panel-' + tab);
+  if(panel) panel.classList.add('active');
 }
 document.querySelectorAll('.tab').forEach(function(t){
-  t.addEventListener('click', function(){
-    document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active');});
-    document.querySelectorAll('.panel').forEach(function(x){x.classList.remove('active');});
-    t.classList.add('active');
-    document.getElementById('panel-' + t.getAttribute('data-tab')).classList.add('active');
-    syncCardFor(t.getAttribute('data-tab'));
-  });
+  t.addEventListener('click', function(){ activateTab(t.getAttribute('data-tab')); });
+});
+// 大类切换：显隐对应子 Tab 栏 + 同步卡片，并激活该大类的首个子 Tab
+var GROUP_DEFAULT = { fund: 'single', stock: 's-diagnose' };
+function activateGroup(g){
+  document.querySelectorAll('.group').forEach(function(x){ x.classList.toggle('active', x.getAttribute('data-group') === g); });
+  var isStock = g === 'stock';
+  document.getElementById('tabs-fund').style.display = isStock ? 'none' : '';
+  document.getElementById('tabs-stock').style.display = isStock ? '' : 'none';
+  document.getElementById('sync-card').style.display = isStock ? 'none' : '';
+  document.getElementById('s-sync-card').style.display = isStock ? '' : 'none';
+  activateTab(GROUP_DEFAULT[g]);
+}
+document.querySelectorAll('.group').forEach(function(gb){
+  gb.addEventListener('click', function(){ activateGroup(gb.getAttribute('data-group')); });
 });
 
 // 单次：随策略显隐参数组
@@ -625,6 +661,88 @@ document.getElementById('run-recommend').addEventListener('click', function(){
     .then(renderRec)
     .catch(function(e){ document.getElementById('rec-result').innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
     .finally(function(){ setBtn(btn, false, '生成推荐'); });
+});
+
+// ===== 持仓建议 =====
+function money(x){ return (x==null) ? '-' : Number(x).toLocaleString('zh-CN',{maximumFractionDigits:0}); }
+function hdActionColor(a){ if(a==='加仓') return '#c0392b'; if(a==='减仓'||a==='止盈') return '#27ae60'; return '#7f8c8d'; }
+function hdTimingLines(a){
+  var p = a.regime && a.regime.plan;
+  if(!p) return '';
+  return ' · 低吸线 '+p.buy.toFixed(4)+' · 高抛线 '+p.sell.toFixed(4);
+}
+function hdCard(a){
+  var ac = hdActionColor(a.action);
+  var b = a.best_strategy || {};
+  var amtTxt = a.suggest_amount>0 ? ' '+money(a.suggest_amount)+' 元' : '';
+  return '<div class="card" style="border-left:4px solid '+ac+'">'
+    + '<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">'
+    + '<span style="font-size:1.1rem;font-weight:700">'+esc(a.name)+'</span><span style="color:#7f8c8d">'+esc(a.code)+'</span>'
+    + '<span style="margin-left:auto;font-size:1.05rem;font-weight:700;background:#fdecea;color:'+ac+';padding:2px 12px;border-radius:12px">'+esc(a.action)+amtTxt+'</span></div>'
+    + '<div style="margin-top:8px;color:#34495e">持仓 '+money(a.amount)+' 元 · 收益 '+money(a.profit)+' 元 · 权重 '+(a.weight*100).toFixed(1)+'%</div>'
+    + '<div style="margin-top:6px;color:#34495e">择时：<strong style="color:'+ac+'">'+esc(a.signal||'-')+'</strong> · 形态 '+esc((a.regime&&a.regime.regime)||'-')+hdTimingLines(a)+'</div>'
+    + '<div style="margin-top:6px;color:#34495e">最优策略：<strong>'+esc(b.name||'-')+'</strong> · 样本外 收益 '+pct(b.oos_return||0)+' · 夏普 '+(b.oos_sharpe||0).toFixed(2)+' · 回撤 '+pct(b.oos_mdd||0)+'</div>'
+    + '<div style="margin-top:6px;color:#5a6a7a">'+esc(a.rationale)+'</div></div>';
+}
+function renderHoldings(rep){
+  var box = document.getElementById('hd-result');
+  if(!rep || !rep.summary){ box.innerHTML = '<span style="color:#c0392b">生成失败</span>'; return; }
+  var s = rep.summary, parts = [];
+  var sumLine = '总持仓 '+money(s.total_amount)+' 元 · 持仓 '+s.holding_count+' 只';
+  if(s.total_profit!=null) sumLine += ' · 持有收益 '+money(s.total_profit)+' 元';
+  if(s.cumulative_profit!=null) sumLine += ' · 累计收益 '+money(s.cumulative_profit)+' 元';
+  parts.push('<div class="card" style="margin-top:0"><div style="font-size:1.1rem;font-weight:600">组合汇总</div>'
+    + '<div style="margin-top:8px;color:#34495e">'+esc(sumLine)+'</div>'
+    + '<div style="margin-top:6px;color:#34495e">合计建议：加仓 <strong style="color:#c0392b">'+money(s.total_add)+'</strong> 元 · 减仓/止盈 <strong style="color:#27ae60">'+money(s.total_trim)+'</strong> 元</div>'
+    + (s.concentration_note ? '<div style="margin-top:6px;color:#c0392b">'+esc(s.concentration_note)+'</div>' : '')
+    + '</div>');
+  if(!rep.advices.length){
+    var sk = (rep.skipped&&rep.skipped.length) ? '（跳过 '+rep.skipped.length+' 只：'+esc(rep.skipped.join(', '))+'）' : '';
+    parts.push('<div style="color:#c0392b">无可分析持仓'+sk+'。请检查基金代码，或先在「数据同步」同步净值。</div>');
+  } else {
+    parts.push(rep.advices.map(hdCard).join(''));
+    if(rep.skipped && rep.skipped.length)
+      parts.push('<div class="hint" style="margin-top:6px">跳过 '+rep.skipped.length+' 只（加载失败/数据不足）：'+esc(rep.skipped.join(', '))+'</div>');
+  }
+  parts.push('<div class="hint" style="margin-top:6px;color:#c0392b">'+esc(rep.disclaimer)+'</div>');
+  box.innerHTML = parts.join('');
+}
+function addHoldingRow(){
+  var div = document.createElement('div');
+  div.className = 'crow';
+  div.innerHTML = '<div class="row">'
+    + '<div class="field"><label>基金代码</label><input class="hd-code" placeholder="如 161725"/></div>'
+    + '<div class="field"><label>持有金额(元)</label><input type="number" class="hd-amt" placeholder="选填"/></div>'
+    + '<div class="field"><label>持有收益(元)</label><input type="number" class="hd-pft" placeholder="选填"/></div>'
+    + '<button class="small del">删除</button></div>';
+  document.getElementById('hd-rows').appendChild(div);
+  div.querySelector('.del').addEventListener('click', function(){ div.remove(); });
+  attachCombobox(div.querySelector('.hd-code'));
+}
+document.getElementById('hd-add').addEventListener('click', addHoldingRow);
+addHoldingRow(); addHoldingRow();
+
+document.getElementById('run-holdings').addEventListener('click', function(){
+  var btn = this, holdings = [];
+  document.querySelectorAll('#hd-rows .crow').forEach(function(div){
+    var code = div.querySelector('.hd-code').value.trim();
+    if(!code) return;
+    var amt = div.querySelector('.hd-amt').value.trim();
+    var pft = div.querySelector('.hd-pft').value.trim();
+    holdings.push({ code: code, amount: amt===''?0:Number(amt), profit: pft===''?0:Number(pft) });
+  });
+  if(!holdings.length){ document.getElementById('hd-result').innerHTML = '<span style="color:#c0392b">请先添加至少一只持仓基金</span>'; return; }
+  var payload = { holdings: holdings };
+  var t = document.getElementById('hd-total').value.trim(); if(t!=='') payload.total_amount = Number(t);
+  var pf = document.getElementById('hd-profit').value.trim(); if(pf!=='') payload.total_profit = Number(pf);
+  var cu = document.getElementById('hd-cum').value.trim(); if(cu!=='') payload.cumulative_profit = Number(cu);
+  setBtn(btn, true, '生成建议');
+  document.getElementById('hd-result').textContent = '分析中…（首次联网抓取，请稍候）';
+  fetch('/api/holdings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)})
+    .then(function(res){ if(!res.ok) return res.text().then(function(x){ throw new Error(x); }); return res.json(); })
+    .then(renderHoldings)
+    .catch(function(e){ document.getElementById('hd-result').innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
+    .finally(function(){ setBtn(btn, false, '生成建议'); });
 });
 
 // ===== 股票 Tab =====
