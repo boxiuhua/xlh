@@ -50,6 +50,15 @@ button.del{color:#c0392b;border-color:#e8b9b3}
     </div>
     <div id="sync-result" class="hint" style="margin-top:8px"></div>
   </div>
+  <div class="card" id="s-sync-card" style="display:none">
+    <div class="row" style="align-items:flex-end">
+      <strong style="margin-right:8px">数据同步</strong>
+      <button class="small" id="s-sync-all">同步全部已缓存</button>
+      <div class="field combo"><label>股票代码</label><input id="s-sync-code" placeholder="如 600519 / 00700 / AAPL"/></div>
+      <button class="small" id="s-sync-one">同步此股票</button>
+    </div>
+    <div id="s-sync-result" class="hint" style="margin-top:8px"></div>
+  </div>
   <div class="tabs">
     <button class="tab active" data-tab="single">单次</button>
     <button class="tab" data-tab="compare">对比</button>
@@ -328,13 +337,20 @@ var ROW_FIELDS = {
 };
 var iframe = document.getElementById('result');
 
-// Tab 切换
+// Tab 切换（股票 Tab 显示股票同步卡片，基金 Tab 显示基金同步卡片）
+var STOCK_TABS = { 's-diagnose':1, 's-backtest':1, 's-screen':1 };
+function syncCardFor(tab){
+  var isStock = !!STOCK_TABS[tab];
+  document.getElementById('sync-card').style.display = isStock ? 'none' : '';
+  document.getElementById('s-sync-card').style.display = isStock ? '' : 'none';
+}
 document.querySelectorAll('.tab').forEach(function(t){
   t.addEventListener('click', function(){
     document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active');});
     document.querySelectorAll('.panel').forEach(function(x){x.classList.remove('active');});
     t.classList.add('active');
     document.getElementById('panel-' + t.getAttribute('data-tab')).classList.add('active');
+    syncCardFor(t.getAttribute('data-tab'));
   });
 });
 
@@ -459,27 +475,27 @@ document.getElementById('run-optimize').addEventListener('click', function(){
     .finally(function(){ setBtn(btn, false, '运行寻优'); });
 });
 
-function renderSync(items){
-  var box = document.getElementById('sync-result');
-  if(!Array.isArray(items) || !items.length){ box.innerHTML = '<span style="color:#7f8c8d">无可同步的基金（缓存为空）</span>'; return; }
+function renderSyncInto(boxId, items, emptyMsg){
+  var box = document.getElementById(boxId);
+  if(!Array.isArray(items) || !items.length){ box.innerHTML = '<span style="color:#7f8c8d">'+esc(emptyMsg)+'</span>'; return; }
   box.innerHTML = items.map(function(o){
     if(o.error) return '<div style="color:#c0392b">'+esc(o.code)+' 同步失败: '+esc(o.error)+'</div>';
     return '<div style="color:#1a7f37">'+esc(o.code)+' +'+o.added+' 条新 · 最新 '+esc(o.latest||'-')+'（共 '+o.total+'）</div>';
   }).join('');
 }
-function doSync(body, btn){
-  var box = document.getElementById('sync-result');
+function doSyncTo(url, boxId, emptyMsg, body, btn){
+  var box = document.getElementById(boxId);
   var t = btn.textContent; btn.disabled = true; btn.textContent = '同步中…'; box.textContent = '同步中…';
-  fetch('/api/sync', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
-    .then(function(r){ return r.json(); }).then(renderSync)
+  fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+    .then(function(r){ return r.json(); }).then(function(items){ renderSyncInto(boxId, items, emptyMsg); })
     .catch(function(e){ box.innerHTML = '<span style="color:#c0392b">同步请求失败: '+esc(String(e))+'</span>'; })
     .finally(function(){ btn.disabled = false; btn.textContent = t; });
 }
-document.getElementById('sync-all').addEventListener('click', function(){ doSync({}, this); });
+document.getElementById('sync-all').addEventListener('click', function(){ doSyncTo('/api/sync', 'sync-result', '无可同步的基金（缓存为空）', {}, this); });
 document.getElementById('sync-one').addEventListener('click', function(){
   var c = document.getElementById('sync-code').value.trim();
   if(!c){ document.getElementById('sync-result').innerHTML = '<span style="color:#c0392b">请先填基金代码</span>'; return; }
-  doSync({code:c}, this);
+  doSyncTo('/api/sync', 'sync-result', '无可同步的基金（缓存为空）', {code:c}, this);
 });
 attachCombobox(document.getElementById('sync-code'));
 
@@ -702,6 +718,17 @@ function buildSbParams(){
 sbStrat.addEventListener('change', buildSbParams); buildSbParams();
 attachStockCombobox(document.getElementById('sd-code'));
 attachStockCombobox(document.getElementById('sb-code'));
+attachStockCombobox(document.getElementById('s-sync-code'));
+
+// 股票数据同步（复用 /api/stock/sync，响应结构同基金 SyncOutcome）
+document.getElementById('s-sync-all').addEventListener('click', function(){
+  doSyncTo('/api/stock/sync', 's-sync-result', '无可同步的股票（缓存为空）', {}, this);
+});
+document.getElementById('s-sync-one').addEventListener('click', function(){
+  var c = document.getElementById('s-sync-code').value.trim();
+  if(!c){ document.getElementById('s-sync-result').innerHTML = '<span style="color:#c0392b">请先填股票代码</span>'; return; }
+  doSyncTo('/api/stock/sync', 's-sync-result', '无可同步的股票（缓存为空）', {code:c}, this);
+});
 
 document.getElementById('run-s-diagnose').addEventListener('click', function(){
   var btn = this, code = document.getElementById('sd-code').value.trim();

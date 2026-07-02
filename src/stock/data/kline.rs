@@ -55,13 +55,13 @@ fn fetch_body(secid: &Secid, fqt: u8) -> Result<String> {
     // 强制走 IPv4：push2his 的 IPv6 CDN 节点（trafficmanager.cn）在部分网络返回空/握手失败，
     // 而 IPv4 端点稳定。绑定本地 IPv4(0.0.0.0) 即令连接只用 IPv4。
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(8))
         .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
         .build()
         .map_err(|e| anyhow!("构建HTTP客户端失败: {e}"))?;
-    // K线响应体较大（数千日 300KB+），弱网下偶发 body 读取中断，重试至多 3 次。
+    // 东财已降为兜底源（腾讯为主）：短超时快速失败，避免主源已挂时的长时间空转。
     let mut last_err = None;
-    for _ in 0..3 {
+    for _ in 0..2 {
         let attempt = client.get(&url)
             .header("Referer", "https://www.eastmoney.com/")
             .header("User-Agent", "Mozilla/5.0")
@@ -72,15 +72,30 @@ fn fetch_body(secid: &Secid, fqt: u8) -> Result<String> {
             Err(e) => last_err = Some(e),
         }
     }
-    Err(anyhow!("抓取K线失败(重试3次): {}", last_err.unwrap()))
+    Err(anyhow!("抓取K线失败(重试2次): {}", last_err.unwrap()))
 }
 
-/// 抓不复权 OHLCV + 后复权收盘，merge 成 StockBar。
-pub fn fetch(secid: &Secid) -> Result<Vec<StockBar>> {
+/// 东财 push2his 抓取（不复权 + 后复权，merge）。现为兜底源。
+pub fn eastmoney_fetch(secid: &Secid) -> Result<Vec<StockBar>> {
     let raw = parse_one(&fetch_body(secid, 0)?)?;
     if raw.is_empty() { return Err(anyhow!("{} 无K线数据", secid.param())); }
     let adj = parse_one(&fetch_body(secid, 2)?)?;
     Ok(merge(raw, adj))
+}
+
+/// 抓 K线 → StockBar。腾讯为主（push2his 在部分网络不可达），东财兜底。
+pub fn fetch(secid: &Secid) -> Result<Vec<StockBar>> {
+    let primary = super::tencent::fetch(secid);
+    if let Ok(bars) = &primary {
+        if !bars.is_empty() { return Ok(primary.unwrap()); }
+    }
+    match eastmoney_fetch(secid) {
+        Ok(bars) => Ok(bars),
+        Err(em_err) => match primary {
+            Err(tx_err) => Err(anyhow!("腾讯抓取失败({tx_err})；东财兜底也失败({em_err})")),
+            Ok(_) => Err(anyhow!("腾讯返回空；东财兜底失败: {em_err}")),
+        },
+    }
 }
 
 #[cfg(test)]

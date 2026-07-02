@@ -4,6 +4,7 @@ use crate::data::DataHandler;
 
 pub mod secid;
 pub mod kline;
+pub mod tencent;
 pub mod search;
 pub mod cache;
 pub mod sync;
