@@ -2,13 +2,36 @@
 
 基金投资理财研判系统 —— A股基金定投/择时回测、参数寻优与市场状态诊断；并扩展支持**股票（A股/港股/美股）**的行情抓取、单股回测、技术诊断与跨股选股。
 
-## 运行命令
+## 运行与部署
+
+本项目是 **Rust 单体程序**（一个可执行文件 `xlh` + 库）：Web 界面为**内嵌的 axum 服务**，前端 HTML 直接编译进二进制（`web/page.rs` 的 `INDEX_HTML`），无独立前端构建、无外部静态资源。本质是本地桌面工具，非容器化服务。
+
+### 运行
 
 ```bash
 cargo run --release -- serve          # 启动本地 Web 界面（默认 http://127.0.0.1:8080）
 cargo run --release -- serve --port 9000
 cargo run --release -- -c config.toml # 无子命令时按配置文件跑 CLI 回测/对比/寻优
 ```
+
+`serve` 启动后浏览器打开 `http://127.0.0.1:8080`，即「基金 / 股票」两级 Tab 界面。
+
+### 部署（脱离 cargo）
+
+编译为自包含单文件二进制，拷贝即可运行：
+
+```bash
+cargo build --release
+./target/release/xlh serve --port 8080   # Windows 为 target/release/xlh.exe
+```
+
+- **无运行时依赖**：TLS 用 `rustls`（纯 Rust，不依赖系统 OpenSSL）；前端内嵌，无需 Node/静态目录。
+- **需外网访问**：联网抓取腾讯 `web.ifzq.gtimg.cn`、东财 `fund.eastmoney.com` 等；缓存写入**工作目录下的 `./.cache/`**（详见「数据存储」），请在期望存放缓存的目录里启动。
+
+### 注意
+
+- **仅监听 `127.0.0.1`**（`web/mod.rs` 中 `serve` 写死本地回环），只能本机访问。若要对局域网/服务器提供，需把绑定地址改为 `0.0.0.0`（当前不可配置）。
+- **无鉴权**：接口裸暴露，勿直接挂公网；确需对外请在前面套反向代理（nginx/Caddy）加认证。
 
 ---
 
