@@ -18,6 +18,25 @@ pub struct HttpReq {
     pub form: bool,
 }
 
+/// 是否形如 UUID（8-4-4-4-12 十六进制）——飞书自定义机器人 hook token 的形态。
+fn is_uuid(s: &str) -> bool {
+    let groups = [8usize, 4, 4, 4, 12];
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == groups.len()
+        && parts.iter().zip(groups).all(|(p, n)| p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// 规范化 webhook：飞书若填的是裸 hook token(UUID)，自动补全为完整 URL；其余原样返回。
+/// 让用户在表单/配置里只贴 token 也能用，同时 `oc_...`(群会话ID) 等非 token 仍保持原样以便被校验拦下。
+pub fn canonical_webhook(kind: &str, webhook: &str) -> String {
+    let w = webhook.trim();
+    if kind == "feishu" && !w.starts_with("http") && is_uuid(w) {
+        format!("https://open.feishu.cn/open-apis/bot/v2/hook/{w}")
+    } else {
+        w.to_string()
+    }
+}
+
 fn hmac_b64(key: &[u8], data: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC 接受任意长度密钥");
     mac.update(data);
@@ -58,7 +77,7 @@ pub fn build_request(cfg: &ChannelCfg, title: &str, md: &str, ts_ms: i64) -> Htt
                 obj["timestamp"] = serde_json::Value::String(ts_s.to_string());
                 obj["sign"] = serde_json::Value::String(sign);
             }
-            HttpReq { url: cfg.webhook.clone(), body: obj.to_string(), form: false }
+            HttpReq { url: canonical_webhook(&cfg.kind, &cfg.webhook), body: obj.to_string(), form: false }
         }
         // 企业微信：markdown 消息，无加签（密钥在 URL 的 key 参数里）。
         "wework" => {
@@ -146,6 +165,29 @@ mod tests {
         let r = build_request(&cfg("dingtalk", ""), "t", "m", 1_700_000_000_000);
         assert!(!r.url.contains("sign="));
         assert_eq!(r.url, "https://hook/xyz");
+    }
+
+    #[test]
+    fn feishu_bare_token_expands_to_full_url() {
+        let mut c = cfg("feishu", "");
+        c.webhook = "097074dc-0f9c-44c0-a7ab-af8942e24143".into();
+        let r = build_request(&c, "t", "正文", 0);
+        assert_eq!(r.url, "https://open.feishu.cn/open-apis/bot/v2/hook/097074dc-0f9c-44c0-a7ab-af8942e24143");
+    }
+
+    #[test]
+    fn feishu_full_url_left_as_is() {
+        let mut c = cfg("feishu", "");
+        c.webhook = "https://open.feishu.cn/open-apis/bot/v2/hook/abc".into();
+        let r = build_request(&c, "t", "m", 0);
+        assert_eq!(r.url, "https://open.feishu.cn/open-apis/bot/v2/hook/abc");
+    }
+
+    #[test]
+    fn feishu_chat_id_not_expanded() {
+        // oc_ 群会话ID 不是 UUID → 不补全，保持原样以便被上层校验拦下
+        assert_eq!(canonical_webhook("feishu", "oc_f1103754b002dc17b290d470b9b1d05c"),
+            "oc_f1103754b002dc17b290d470b9b1d05c");
     }
 
     #[test]

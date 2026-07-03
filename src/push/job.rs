@@ -102,12 +102,20 @@ pub fn build_message(cfg: &PushConfig) -> Result<(String, bool)> {
     Ok((md, has_new))
 }
 
-/// 跑一次：组装 → （only_on_new_data 且无新数据则跳过）→ 发送。
+/// 定时守护跑一次：组装 → （only_on_new_data 且无新数据则跳过）→ 发送。
+/// only_on_new_data 只约束定时推送（规避周末/节假日空推）。
 pub fn run(cfg: &PushConfig) -> Result<()> {
     let (md, has_new) = build_message(cfg)?;
     if cfg.schedule.only_on_new_data && !has_new {
         println!("无新数据，跳过推送");
         return Ok(());
     }
+    channels::send(&cfg.channel, "基金持仓建议", &md)
+}
+
+/// 手动「立即推送」/ CLI --once：无条件组装并发送，忽略 only_on_new_data。
+/// 手动触发即明确的发送意图，不应被「无新数据」拦截。
+pub fn run_forced(cfg: &PushConfig) -> Result<()> {
+    let (md, _has_new) = build_message(cfg)?;
     channels::send(&cfg.channel, "基金持仓建议", &md)
 }

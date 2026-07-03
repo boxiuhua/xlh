@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::holdings::Holding;
 
 const CHANNELS: [&str; 4] = ["dingtalk", "feishu", "wework", "serverchan"];
+/// 以 webhook 作为完整 URL 请求的渠道（serverchan 的 webhook 是 sendkey，不在此列）。
+const URL_CHANNELS: [&str; 3] = ["dingtalk", "feishu", "wework"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PushConfig {
@@ -88,6 +90,18 @@ pub fn validate(cfg: &PushConfig) -> Result<()> {
     }
     if cfg.channel.webhook.trim().is_empty() {
         return Err(anyhow!("channel.webhook 不能为空"));
+    }
+    // URL 类渠道的 webhook 必须是完整 http(s) 地址，否则发送时才炸出含糊的 builder error。
+    // 飞书裸 hook token(UUID) 会被 canonical_webhook 补全为完整 URL，故此处按补全后的形态校验。
+    if URL_CHANNELS.contains(&cfg.channel.kind.as_str()) {
+        let w = super::channels::canonical_webhook(&cfg.channel.kind, &cfg.channel.webhook);
+        if !(w.starts_with("http://") || w.starts_with("https://")) {
+            return Err(anyhow!(
+                "{} 的 webhook 必须是完整 URL（http/https 开头）或飞书 hook token，当前为 '{}'。\
+                 飞书需填「自定义机器人」的 Webhook 地址（形如 https://open.feishu.cn/open-apis/bot/v2/hook/…）\
+                 或其末段 token(UUID)，而非群会话ID(oc_…)",
+                cfg.channel.kind, cfg.channel.webhook.trim()));
+        }
     }
     cron::Schedule::from_str(&cfg.schedule.cron)
         .map_err(|e| anyhow!("cron 表达式非法 '{}': {e}", cfg.schedule.cron))?;
@@ -177,6 +191,47 @@ profit = 1500
     fn rejects_bad_cron() {
         let cfg: PushConfig = toml::from_str(&SAMPLE.replace("0 30 8 * * *", "not a cron")).unwrap();
         assert!(validate(&cfg).unwrap_err().to_string().contains("cron"));
+    }
+
+    #[test]
+    fn rejects_feishu_webhook_that_is_not_url() {
+        // 群会话ID(oc_...) 不是自定义机器人 webhook URL → 应在校验期报错，而非发送时炸 builder error
+        let t = SAMPLE.replace("https://open.feishu.cn/open-apis/bot/v2/hook/xxx", "oc_f1103754b002dc17b290d470b9b1d05c");
+        let cfg: PushConfig = toml::from_str(&t).unwrap();
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("webhook") && err.contains("URL"), "应提示 webhook 需为 URL，实际: {err}");
+    }
+
+    #[test]
+    fn accepts_feishu_webhook_with_https() {
+        // SAMPLE 本就是合法 https webhook
+        let cfg: PushConfig = toml::from_str(SAMPLE).unwrap();
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn accepts_feishu_bare_hook_token() {
+        // 只贴 hook token(UUID) 也应通过（发送时自动补全为完整 URL）
+        let t = SAMPLE.replace("https://open.feishu.cn/open-apis/bot/v2/hook/xxx", "097074dc-0f9c-44c0-a7ab-af8942e24143");
+        let cfg: PushConfig = toml::from_str(&t).unwrap();
+        assert!(validate(&cfg).is_ok(), "飞书裸 token 应通过校验");
+    }
+
+    #[test]
+    fn serverchan_sendkey_need_not_be_url() {
+        let t = r#"
+[schedule]
+cron = "0 30 8 * * *"
+[channel]
+kind = "serverchan"
+webhook = "SCTKEY123"
+[[holdings]]
+code = "161725"
+amount = 12000
+profit = 900
+"#;
+        let cfg: PushConfig = toml::from_str(t).unwrap();
+        assert!(validate(&cfg).is_ok(), "serverchan 的 webhook 是 sendkey，不应要求 URL");
     }
 
     #[test]

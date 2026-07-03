@@ -10,9 +10,9 @@ pub mod job;
 pub use config::{load, PushConfig};
 pub use job::build_message;
 
-/// 立即跑一次任务（同步+建议+诊断+推送）。
+/// 立即跑一次任务（同步+建议+诊断+推送）。手动触发，强制发送，忽略 only_on_new_data。
 pub fn run_once(cfg: &PushConfig) -> anyhow::Result<()> {
-    job::run(cfg)
+    job::run_forced(cfg)
 }
 
 /// 按 cron 常驻守护。
