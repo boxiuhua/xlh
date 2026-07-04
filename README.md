@@ -4,7 +4,7 @@
 
 ## 运行与部署
 
-本项目是 **Rust 单体程序**（一个可执行文件 `xlh` + 库）：Web 界面为**内嵌的 axum 服务**，前端 HTML 直接编译进二进制（`web/page.rs` 的 `INDEX_HTML`），无独立前端构建、无外部静态资源。本质是本地桌面工具，非容器化服务。
+本项目是 **Rust 单体程序**（一个可执行文件 `xlh` + 库）：Web 界面为**内嵌的 axum 服务**，前端 HTML 直接编译进二进制（`web/page.rs` 的 `INDEX_HTML`），无独立前端构建、无外部静态资源。本质是本地桌面工具，也可容器化部署到服务器（见下文「Docker 部署」）。
 
 ### 运行
 
@@ -43,8 +43,53 @@ cargo build --release
 
 ### 注意
 
-- **仅监听 `127.0.0.1`**（`web/mod.rs` 中 `serve` 写死本地回环），只能本机访问。若要对局域网/服务器提供，需把绑定地址改为 `0.0.0.0`（当前不可配置）。
+- **默认仅监听 `127.0.0.1`**（`web/mod.rs` 中 `serve`），只能本机访问。若要对局域网/服务器提供，设环境变量 **`XLH_BIND=0.0.0.0`**（Docker 镜像内已默认置为 `0.0.0.0`）。
 - **无鉴权**：接口裸暴露，勿直接挂公网；确需对外请在前面套反向代理（nginx/Caddy）加认证。
+
+### Docker 部署
+
+仓库已含 `Dockerfile`（多阶段构建，运行镜像仅约 150MB）、`docker-compose.yml`（本地开发）、`docker-compose.prod.yml`（线上，仅运行不编译）、`scripts/deploy.sh`（一键发到服务器）。
+
+> 说明：镜像里**不含** `config.toml` / `push.toml`（含密钥），一律运行时挂载；`.cache/`、`output/` 也挂卷持久化。plotters 画 PNG 需要的 `freetype/fontconfig`+字体已装进运行镜像；TLS 用 rustls，无需 OpenSSL。
+
+**本地构建与运行**
+
+```bash
+docker build -t xlh:latest .
+docker compose up -d xlh-web                    # Web 界面 → http://localhost:8080
+docker compose --profile push up -d xlh-push    # 定时推送守护（按需）
+docker compose logs -f xlh-web
+```
+
+**发到线上服务器（免镜像仓库，save + scp + load）**
+
+Git Bash 里一键：
+
+```bash
+scripts/deploy.sh user@服务器IP                 # 加 WITH_PUSH=1 同时起推送守护
+```
+
+或手动（本机 **PowerShell** 用 `docker save -o`，别用 `| gzip >`，PowerShell 无 gzip 且 `>` 会损坏二进制）：
+
+```powershell
+docker save xlh:latest -o xlh-latest.tar
+scp xlh-latest.tar docker-compose.prod.yml config.toml push.toml user@服务器IP:/opt/xlh/
+```
+
+```bash
+# 服务器（Linux）
+cd /opt/xlh && mkdir -p .cache output
+docker load -i xlh-latest.tar
+docker compose -f docker-compose.prod.yml up -d
+```
+
+**对外暴露**：`docker-compose.prod.yml` 默认把端口绑在 `127.0.0.1:8080`（防裸奔）。要开外网访问，改成 `- "8080:8080"` 后 `up -d`，**并在云安全组/防火墙放行入方向 TCP 8080**（来源建议限成你自己的 IP）。因界面无鉴权且 `push.toml` 含密钥，长期对外强烈建议前置 Nginx/Caddy + Basic Auth + HTTPS，只对外开 443。
+
+**常见坑**
+
+- **`写入 push.toml 失败: Is a directory`**：启动容器时宿主 `push.toml` **文件不存在**，Docker 会把挂载源自动建成**目录**。修复：`docker compose ... down` → `rm -rf push.toml` → 重新 `scp` 真正的文件 → 确认 `ls -l push.toml` 是文件 → `up -d`。**务必先放好文件再 `up`**（`config.toml` 同理）。
+- **外网打不开、`docker ps` 显示 `127.0.0.1:8080->8080`**：端口只绑了本机，按上面「对外暴露」改绑定并放行安全组。
+- **Windows Docker Desktop 本机 `localhost:8080` 返回 502**：是 Docker Desktop 的 WSL2 端口转发问题（对所有容器都复现，与本项目无关），Linux 服务器上不存在。
 
 ---
 
