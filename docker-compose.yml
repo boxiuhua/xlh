@@ -1,0 +1,27 @@
+services:
+  # Web 回测界面： http://localhost:8080
+  xlh-web:
+    build: .
+    image: xlh:latest
+    container_name: xlh-web
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./.cache:/app/.cache          # 净值/基金列表缓存，持久化避免重复抓取
+      - ./output:/app/output          # 回测报告输出
+      - ./push.toml:/app/push.toml     # Web 推送配置 Tab 读写此文件
+    restart: unless-stopped
+    command: ["serve", "--port", "8080"]
+
+  # 定时推送守护（钉钉/飞书/企业微信/Server酱）——按需启用：
+  #   docker compose --profile push up -d xlh-push
+  xlh-push:
+    build: .
+    image: xlh:latest
+    container_name: xlh-push
+    profiles: ["push"]
+    volumes:
+      - ./.cache:/app/.cache
+      - ./push.toml:/app/push.toml
+    restart: unless-stopped
+    command: ["push", "--file", "push.toml"]

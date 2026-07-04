@@ -1,0 +1,30 @@
+# 线上服务器用：只跑镜像，不在服务器上编译。
+# 用法： docker compose -f docker-compose.prod.yml up -d
+#
+# 前提：镜像已在本机（docker load 或 docker pull 得到 xlh:latest / 你的仓库地址），
+#       且当前目录已备好 config.toml、push.toml，以及 .cache/ output/ 两个目录。
+services:
+  xlh-web:
+    image: xlh:latest            # 若用镜像仓库，改成 registry.example.com/you/xlh:latest
+    container_name: xlh-web
+    # 只监听本机回环，前面套 Nginx/Caddy 反代 + HTTPS + 认证；
+    # 若确实要直接对公网开放（不推荐），改成 "8080:8080" 并用安全组限制来源 IP。
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./.cache:/app/.cache
+      - ./output:/app/output
+      - ./push.toml:/app/push.toml
+    restart: unless-stopped
+    command: ["serve", "--port", "8080"]
+
+  # 定时推送守护，按需启用： docker compose -f docker-compose.prod.yml --profile push up -d
+  xlh-push:
+    image: xlh:latest
+    container_name: xlh-push
+    profiles: ["push"]
+    volumes:
+      - ./.cache:/app/.cache
+      - ./push.toml:/app/push.toml
+    restart: unless-stopped
+    command: ["push", "--file", "push.toml"]

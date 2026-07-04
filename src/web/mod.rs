@@ -314,7 +314,12 @@ async fn funds_handler() -> axum::Json<Vec<crate::data::fundlist::FundInfo>> {
 }
 
 pub async fn serve(port: u16) -> Result<()> {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    // 默认只监听本机；容器内可用 XLH_BIND=0.0.0.0 对外暴露。
+    let host: std::net::IpAddr = std::env::var("XLH_BIND")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+    let addr = std::net::SocketAddr::new(host, port);
     let listener = tokio::net::TcpListener::bind(addr).await
         .with_context(|| format!("绑定 {addr} 失败"))?;
     println!("回测界面已启动：http://{addr}  (Ctrl+C 退出)");
