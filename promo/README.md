@@ -56,7 +56,7 @@ npm run render:w          # 横屏 16:9 渲染 → out/xlh-16x9.mp4
    编辑 `src/components/QRPlaceholder.tsx`，修改：
    ```tsx
    // 从占位符：
-   // <Rect ... />
+   // <div ... />
    
    // 改为实际图片：
    <Img src={staticFile('qr.png')} width={...} height={...} />
@@ -106,7 +106,8 @@ export const TOTAL = 1800; // 总帧数 = 总秒数 × 30fps（默认30fps）
 promo/
 ├── src/
 │   ├── index.ts                    # 入口点
-│   ├── Promo.tsx                   # 主 Composition（两版注册）
+│   ├── Root.tsx                    # 注册 PromoVertical/PromoWide 两个 Composition
+│   ├── Promo.tsx                   # 场景组装组件（按 SCENES 顺序拼接各场景）
 │   ├── theme.ts                    # 主题、SCENES、COLORS、FPS 常量
 │   ├── components/
 │   │   ├── Bg.tsx                  # 背景

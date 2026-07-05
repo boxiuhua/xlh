@@ -30,7 +30,7 @@ export const HoldingRow: React.FC<{ name: string; action: string; amount: string
         width: vertical ? '80%' : 460,
       }}
     >
-      <div style={{ fontSize: fs, fontWeight: 700, color: COLORS.text, flex: 1 }}>{name}</div>
+      <div style={{ fontSize: fs, fontWeight: 700, color: COLORS.text, flex: 1, whiteSpace: 'nowrap' }}>{name}</div>
       <div
         style={{
           fontSize: fs * 0.85,
@@ -40,6 +40,8 @@ export const HoldingRow: React.FC<{ name: string; action: string; amount: string
           padding: '4px 14px',
           borderRadius: 999,
           transform: `scale(${tag})`,
+          whiteSpace: 'nowrap',
+          flexShrink: 0,
         }}
       >
         {action}

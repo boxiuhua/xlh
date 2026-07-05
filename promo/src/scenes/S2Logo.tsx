@@ -9,9 +9,11 @@ export const S2Logo: React.FC = () => {
   const pop = spring({ frame, fps, config: { damping: 12, stiffness: 120 } });
   const scale = interpolate(pop, [0, 1], [0.4, 1]);
   const glow = interpolate(frame % 90, [0, 45, 90], [0.3, 0.8, 0.3]);
-  const logoSize = vertical ? width * 0.34 : width * 0.2;
+  const logoSize = vertical ? width * 0.34 : width * 0.17;
   return (
-    <AbsoluteFill style={{ justifyContent: 'center', alignItems: 'center' }}>
+    <AbsoluteFill
+      style={{ justifyContent: 'center', alignItems: 'center', paddingBottom: vertical ? 0 : '20%' }}
+    >
       <div
         style={{
           fontFamily,
