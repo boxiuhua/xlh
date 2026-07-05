@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use rusqlite::{Connection, OptionalExtension};
 
-use super::model::User;
+use super::model::{renew_expiry, CodeRow, User};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
@@ -153,6 +153,101 @@ pub fn list_users(conn: &Connection) -> Result<Vec<User>> {
     Ok(rows)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum CodeFilter { Unused, Used, All }
+
+#[derive(Debug, thiserror::Error)]
+pub enum ActivateError {
+    #[error("授权码不存在")]
+    NotFound,
+    #[error("授权码已被使用")]
+    AlreadyUsed,
+    #[error("授权码已作废")]
+    Revoked,
+    #[error(transparent)]
+    Db(#[from] rusqlite::Error),
+}
+
+pub fn issue_code(conn: &Connection, code: &str, days: i64) -> Result<()> {
+    let now = chrono::Local::now().date_naive().to_string();
+    conn.execute(
+        "INSERT INTO codes (code, days, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![code, days, now],
+    )?;
+    Ok(())
+}
+
+pub fn list_codes(conn: &Connection, filter: CodeFilter) -> Result<Vec<CodeRow>> {
+    let where_clause = match filter {
+        CodeFilter::Unused => "WHERE used_by IS NULL AND revoked = 0",
+        CodeFilter::Used => "WHERE used_by IS NOT NULL",
+        CodeFilter::All => "",
+    };
+    let sql = format!(
+        "SELECT code, days, used_by, used_at, revoked, created_at FROM codes {where_clause} ORDER BY created_at DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(CodeRow {
+                code: r.get(0)?,
+                days: r.get(1)?,
+                used_by: r.get(2)?,
+                used_at: r.get(3)?,
+                revoked: r.get::<_, i64>(4)? != 0,
+                created_at: r.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn revoke_code(conn: &Connection, code: &str) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE codes SET revoked = 1 WHERE code = ?1 AND used_by IS NULL",
+        [code],
+    )?;
+    Ok(n == 1)
+}
+
+/// 事务内：一次性占用授权码 + 续期用户到期日。返回新到期日。
+pub fn activate(conn: &mut Connection, code: &str, user_id: i64) -> std::result::Result<NaiveDate, ActivateError> {
+    let now = chrono::Local::now().date_naive();
+    let tx = conn.transaction()?;
+
+    // 读码天数与状态
+    let row: Option<(i64, Option<i64>, i64)> = tx
+        .query_row(
+            "SELECT days, used_by, revoked FROM codes WHERE code = ?1",
+            [code],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let (days, used_by, revoked) = row.ok_or(ActivateError::NotFound)?;
+    if revoked != 0 { return Err(ActivateError::Revoked); }
+    if used_by.is_some() { return Err(ActivateError::AlreadyUsed); }
+
+    // 条件占用：并发下只有一方 changes()==1
+    let claimed = tx.execute(
+        "UPDATE codes SET used_by = ?1, used_at = ?2 WHERE code = ?3 AND used_by IS NULL AND revoked = 0",
+        rusqlite::params![user_id, now.to_string(), code],
+    )?;
+    if claimed != 1 { return Err(ActivateError::AlreadyUsed); }
+
+    // 读当前到期日并续期
+    let cur: Option<String> = tx.query_row(
+        "SELECT expires_at FROM users WHERE id = ?1", [user_id], |r| r.get(0),
+    )?;
+    let new_exp = renew_expiry(cur.and_then(|s| s.parse().ok()), now, days);
+    tx.execute(
+        "UPDATE users SET expires_at = ?1 WHERE id = ?2",
+        rusqlite::params![new_exp.to_string(), user_id],
+    )?;
+
+    tx.commit()?;
+    Ok(new_exp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +285,40 @@ mod tests {
         create_user(&conn, "b", "h", false).unwrap();
         assert_eq!(count_admins(&conn).unwrap(), 1);
         assert_eq!(list_users(&conn).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn activate_consumes_code_and_renews() {
+        let mut conn = open_in_memory().unwrap();
+        let uid = create_user(&conn, "u", "h", false).unwrap();
+        issue_code(&conn, "CODE1", 30).unwrap();
+
+        let exp = activate(&mut conn, "CODE1", uid).unwrap();
+        assert_eq!(exp, renew_expiry(None, chrono::Local::now().date_naive(), 30));
+
+        // 二次使用同码失败
+        let err = activate(&mut conn, "CODE1", uid).unwrap_err();
+        assert!(matches!(err, ActivateError::AlreadyUsed));
+    }
+
+    #[test]
+    fn activate_unknown_and_revoked() {
+        let mut conn = open_in_memory().unwrap();
+        let uid = create_user(&conn, "u", "h", false).unwrap();
+        assert!(matches!(activate(&mut conn, "NOPE", uid).unwrap_err(), ActivateError::NotFound));
+
+        issue_code(&conn, "R", 10).unwrap();
+        assert!(revoke_code(&conn, "R").unwrap());
+        assert!(matches!(activate(&mut conn, "R", uid).unwrap_err(), ActivateError::Revoked));
+    }
+
+    #[test]
+    fn list_and_revoke_filters() {
+        let conn = open_in_memory().unwrap();
+        issue_code(&conn, "A", 30).unwrap();
+        issue_code(&conn, "B", 30).unwrap();
+        assert_eq!(list_codes(&conn, CodeFilter::Unused).unwrap().len(), 2);
+        assert!(revoke_code(&conn, "A").unwrap());
+        assert_eq!(list_codes(&conn, CodeFilter::Unused).unwrap().len(), 1);
     }
 }
