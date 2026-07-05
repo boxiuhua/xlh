@@ -322,6 +322,7 @@ pub fn router(state: AuthState) -> Router {
 
     // 需登录 + 授权：核心业务
     let licensed = core_routes::<AuthState>()
+        .merge(holdings_history_routes())
         .route_layer(from_fn_with_state(state.clone(), auth::require_license))
         .route_layer(from_fn_with_state(state.clone(), auth::require_login));
 
@@ -373,6 +374,7 @@ async fn funds_handler() -> axum::Json<Vec<crate::data::fundlist::FundInfo>> {
 pub async fn serve(config_path: std::path::PathBuf, port: u16) -> Result<()> {
     let cfg = auth::config::load_auth(&config_path);
     let conn = auth::store::open(&cfg.db_path).context("打开授权数据库失败")?;
+    crate::history::migrate(&conn).context("建历史表失败")?;
     let state = auth::AuthState::new(conn, cfg);
 
     // 默认只监听本机；容器内可用 XLH_BIND=0.0.0.0 对外暴露。
@@ -616,6 +618,60 @@ fn holdings_blocking(input: crate::holdings::HoldingsInput) -> crate::holdings::
         &params,
         |code| crate::data::cache::load_or_fetch(code, std::path::Path::new(".cache"), start, end),
     )
+}
+
+async fn holdings_save_handler(
+    axum::extract::State(st): axum::extract::State<auth::AuthState>,
+    axum::Extension(user): axum::Extension<auth::CurrentUser>,
+    axum::Json(input): axum::Json<crate::holdings::HoldingsInput>,
+) -> std::result::Result<axum::Json<serde_json::Value>, AppError> {
+    let input_for_run = input.clone();
+    let report = tokio::task::spawn_blocking(move || holdings_blocking(input_for_run))
+        .await
+        .map_err(|e| anyhow!("任务执行失败: {e}"))?;
+    let summary = crate::holdings::summarize(&report);
+    let payload = serde_json::to_string(&serde_json::json!({ "input": input, "report": report }))
+        .map_err(|e| anyhow!("序列化历史失败: {e}"))?;
+    let id = {
+        let conn = st.db.lock().unwrap();
+        crate::history::save(&conn, Some(user.id), "web", &summary, &payload)
+            .map_err(|e| anyhow!("保存历史失败: {e}"))?
+    };
+    Ok(axum::Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+async fn holdings_history_list_handler(
+    axum::extract::State(st): axum::extract::State<auth::AuthState>,
+    axum::Extension(user): axum::Extension<auth::CurrentUser>,
+) -> axum::Json<Vec<crate::history::AdviceRecord>> {
+    let rows = {
+        let conn = st.db.lock().unwrap();
+        crate::history::list_web(&conn, user.id, 100).unwrap_or_default()
+    };
+    axum::Json(rows)
+}
+
+async fn holdings_history_detail_handler(
+    axum::extract::State(st): axum::extract::State<auth::AuthState>,
+    axum::Extension(user): axum::Extension<auth::CurrentUser>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Response {
+    let found = {
+        let conn = st.db.lock().unwrap();
+        crate::history::get_web(&conn, id, user.id).ok().flatten()
+    };
+    match found {
+        Some(payload) => ([(axum::http::header::CONTENT_TYPE, "application/json")], payload).into_response(),
+        None => (axum::http::StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+/// 持仓历史路由（需要 AuthState + CurrentUser，故不进泛型 core_routes）。
+fn holdings_history_routes() -> Router<auth::AuthState> {
+    Router::new()
+        .route("/api/holdings/save", post(holdings_save_handler))
+        .route("/api/holdings/history", get(holdings_history_list_handler))
+        .route("/api/holdings/history/:id", get(holdings_history_detail_handler))
 }
 
 // ===== 推送配置 Tab 后端 =====
@@ -1158,6 +1214,62 @@ mod tests {
         assert!(v["summary"].is_object(), "应含 summary");
         assert!(v["advices"].as_array().unwrap().is_empty(), "空持仓 advices 为空");
         assert_eq!(v["summary"]["holding_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn holdings_save_requires_login() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        let conn = crate::web::auth::store::open_in_memory().unwrap();
+        crate::history::migrate(&conn).unwrap();
+        let state = crate::web::auth::AuthState::new(conn, Default::default());
+        let app = super::router(state);
+        let resp = app.oneshot(
+            Request::builder().method("POST").uri("/api/holdings/save")
+                .header("content-type", "application/json")
+                .body(Body::from("{\"holdings\":[]}")).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn holdings_save_then_history_for_active_user() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        let conn = crate::web::auth::store::open_in_memory().unwrap();
+        crate::history::migrate(&conn).unwrap();
+        let state = crate::web::auth::AuthState::new(conn, Default::default());
+        // 造一个已激活用户 + 会话
+        let token = "tok-hist".to_string();
+        {
+            let c = state.db.lock().unwrap();
+            let uid = crate::web::auth::store::create_user(&c, "u", "h", false).unwrap();
+            crate::web::auth::store::set_expiry(&c, uid, chrono::Local::now().date_naive() + chrono::Duration::days(30)).unwrap();
+            let exp = chrono::Local::now().date_naive() + chrono::Duration::days(1);
+            crate::web::auth::store::create_session(&c, &token, uid, exp).unwrap();
+        }
+        // 保存（空持仓，离线可跑，报告 advices 为空但仍成功保存）
+        let app = super::router(state.clone());
+        let save = app.oneshot(
+            Request::builder().method("POST").uri("/api/holdings/save")
+                .header("content-type", "application/json")
+                .header("cookie", format!("xlh_session={token}"))
+                .body(Body::from("{\"holdings\":[]}")).unwrap()
+        ).await.unwrap();
+        assert_eq!(save.status(), StatusCode::OK);
+        // 列表应有 1 条
+        let app2 = super::router(state);
+        let list = app2.oneshot(
+            Request::builder().uri("/api/holdings/history")
+                .header("cookie", format!("xlh_session={token}"))
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(list.into_body(), 1_000_000).await.unwrap();
+        let arr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(arr.as_array().unwrap().len(), 1);
     }
 
     #[test]
