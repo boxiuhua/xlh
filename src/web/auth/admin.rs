@@ -138,6 +138,28 @@ pub async fn admin_page() -> axum::response::Html<&'static str> {
     axum::response::Html(ADMIN_HTML)
 }
 
+pub async fn push_history_list(State(st): State<AuthState>) -> Response {
+    let rows = {
+        let conn = st.db.lock().unwrap();
+        crate::history::list_push(&conn, 200).unwrap_or_default()
+    };
+    Json(rows).into_response()
+}
+
+pub async fn push_history_detail(
+    State(st): State<AuthState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Response {
+    let found = {
+        let conn = st.db.lock().unwrap();
+        crate::history::get_push(&conn, id).ok().flatten()
+    };
+    match found {
+        Some(payload) => ([(axum::http::header::CONTENT_TYPE, "application/json")], payload).into_response(),
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
 const ADMIN_HTML: &str = r##"<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>xlh · 管理后台</title>
@@ -163,6 +185,11 @@ const ADMIN_HTML: &str = r##"<!doctype html>
 <h2>用户</h2>
 <table id="users"><thead><tr><th>ID</th><th>用户名</th><th>状态</th><th>到期</th><th>操作</th></tr></thead><tbody></tbody></table>
 
+<h2>推送历史</h2>
+<button onclick="loadPushHistory()">刷新推送历史</button>
+<table id="pushhist"><thead><tr><th>时间</th><th>摘要</th><th></th></tr></thead><tbody></tbody></table>
+<pre id="pushdetail" style="background:#1e293b;padding:10px;border-radius:8px;white-space:pre-wrap;display:none"></pre>
+
 <script>
 async function api(u,m,b){const r=await fetch(u,{method:m||'GET',headers:b?{'content-type':'application/json'}:{},body:b?JSON.stringify(b):undefined});if(r.status===404){document.body.innerHTML='<h1>403</h1>';return null;}return r.json().catch(()=>({}));}
 async function ov(){const j=await api('/api/admin/overview');if(j)document.getElementById('ov').textContent=`用户 ${j.total} · 在用 ${j.active} · 临期 ${j.warning}`;}
@@ -176,7 +203,9 @@ async function loadUsers(){const j=await api('/api/admin/users');const tb=docume
 async function ext(id){const days=+document.getElementById('d'+id).value;await api('/api/admin/users/extend','POST',{user_id:id,days});loadUsers();ov();}
 async function dis(id,d){await api('/api/admin/users/disable','POST',{user_id:id,disabled:d});loadUsers();}
 async function adm(id,a){await api('/api/admin/users/set_admin','POST',{user_id:id,is_admin:a});loadUsers();}
-ov();loadCodes('unused');loadUsers();
+async function loadPushHistory(){const j=await api('/api/admin/push-history');const tb=document.querySelector('#pushhist tbody');tb.innerHTML='';(j||[]).forEach(function(r){tb.innerHTML+=`<tr><td>${r.created_at}</td><td>${r.summary}</td><td><button onclick="showPush(${r.id})">详情</button></td></tr>`;});}
+async function showPush(id){const r=await fetch('/api/admin/push-history/'+id);if(!r.ok){return;}const j=await r.json();const el=document.getElementById('pushdetail');el.style.display='block';el.textContent=JSON.stringify(j,null,2);}
+ov();loadCodes('unused');loadUsers();loadPushHistory();
 </script></body></html>"##;
 
 pub async fn overview(State(st): State<AuthState>) -> Response {

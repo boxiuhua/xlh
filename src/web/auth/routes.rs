@@ -14,6 +14,8 @@ pub fn admin_router() -> Router<AuthState> {
         .route("/api/admin/users/disable", post(admin::disable_user))
         .route("/api/admin/users/set_admin", post(admin::set_admin))
         .route("/api/admin/overview", get(admin::overview))
+        .route("/api/admin/push-history", get(admin::push_history_list))
+        .route("/api/admin/push-history/:id", get(admin::push_history_detail))
 }
 
 #[cfg(test)]
@@ -85,6 +87,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn push_history_hidden_for_non_admin() {
+        let state = test_state();
+        let token = "tok-ph".to_string();
+        {
+            let conn = state.db.lock().unwrap();
+            let uid = store::create_user(&conn, "np", "h", false).unwrap();
+            let exp = chrono::Local::now().date_naive() + chrono::Duration::days(1);
+            store::create_session(&conn, &token, uid, exp).unwrap();
+        }
+        let app = crate::web::router(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/admin/push-history")
+                    .header("cookie", format!("xlh_session={token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
     }
 
     /// 建立一个已登录用户会话，返回其 token；`admin`/`activated` 控制身份与授权。
