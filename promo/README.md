@@ -77,19 +77,20 @@ npm run render:w          # 横屏 16:9 渲染 → out/xlh-16x9.mp4
 export const FPS = 30;
 
 export const SCENES: SceneDef[] = [
-  { name: 'S1Hook', durationInFrames: 210 },      // 场景 1：钩子
-  { name: 'S2Logo', durationInFrames: 210 },      // 场景 2：亮相
-  { name: 'S3Backtest', durationInFrames: 300 },  // 场景 3：回测寻优
-  // ... 其他场景
-  { name: 'S8Cta', durationInFrames: 90 },        // 场景 8：CTA
+  { name: 'S1Hook', durationInFrames: 300 },      // 1 痛点
+  { name: 'S2Logo', durationInFrames: 240 },      // 2 亮相
+  { name: 'S3Backtest', durationInFrames: 330 },  // 3 回测（真实界面）
+  { name: 'SOptimize', durationInFrames: 240 },   // 4 参数寻优
+  // ... 共 13 场景 ...
+  { name: 'S8Cta', durationInFrames: 240 },       // 13 CTA
 ];
 
-export const TOTAL = 1800; // 总帧数 = 总秒数 × 30fps（默认30fps）
+export const TOTAL = 3600; // 总帧数 = 总秒数 × 30fps
 ```
 
 **调整逻辑**
 - 每个场景帧数对应时长：帧数 ÷ 30 = 秒数（基于 30fps）
-- 总时长调整：修改 `TOTAL` 值（帧数）或改变场景帧数总和（TOTAL=1800 帧 ≈ 60s）
+- 总时长调整：修改 `TOTAL` 值（帧数），并让场景帧数总和相等（当前 TOTAL=3600 帧 ≈ 120s，13 场景）
 - 修改后重新渲染即生效
 
 ## 文案资料
@@ -110,7 +111,7 @@ promo/
 │   ├── components/
 │   │   ├── Bg.tsx                  # 背景
 │   │   ├── Caption.tsx             # 文本字幕组件
-│   │   ├── AudioTrack.tsx          # 音轨（8 段场景配音，按帧对齐）
+│   │   ├── AudioTrack.tsx          # 音轨（13 段场景配音，按帧对齐）
 │   │   ├── Screenshot.tsx          # 真实界面截图的浏览器窗口框
 │   │   ├── Candles.tsx             # K 线蜡烛图
 │   │   ├── GrowLine.tsx            # 增长曲线
@@ -123,18 +124,21 @@ promo/
 │   │   ├── Timeline.tsx            # 时间轴
 │   │   ├── Bullets.tsx             # 要点列表
 │   │   └── QRPlaceholder.tsx       # 真实微信二维码
-│   └── scenes/
-│       ├── S1Hook.tsx              # 场景 1：钩子
-│       ├── S2Logo.tsx              # 场景 2：亮相
-│       ├── S3Backtest.tsx          # 场景 3：回测
-│       ├── S4Diagnose.tsx          # 场景 4：诊断
-│       ├── S5Picks.tsx             # 场景 5：选股/持仓建议
-│       ├── S6Push.tsx              # 场景 6：推送
-│       ├── S7History.tsx           # 场景 7：历史存档
-│       └── S8Cta.tsx               # 场景 8：CTA
+│   └── scenes/                     # 13 场景（顺序见 theme.ts SCENES）
+│       ├── S1Hook / S2Logo         # 痛点 / 亮相
+│       ├── S3Backtest              # 回测（真实界面截图）
+│       ├── SOptimize               # 参数寻优
+│       ├── S4Diagnose              # 市场状态诊断
+│       ├── SStockTech              # 股票技术诊断(MA/MACD/RSI)
+│       ├── SMarket                 # A股/港股/美股 行情
+│       ├── SPicks                  # 智能选股排名
+│       ├── S5Picks                 # 持仓建议（真实界面截图）
+│       ├── S6Push / S7History      # 自动推送 / 历史
+│       ├── SStats                  # 数据总览（数字滚动）
+│       └── S8Cta                   # CTA
 ├── public/                         # 静态资源
-│   ├── qr.png                      # 微信二维码
-│   ├── vo/s1..s8.mp3               # 8 段场景配音
+│   ├── qr.png                      # 微信二维码（身份区已打码）
+│   ├── vo/s1..s13.mp3              # 13 段场景配音（edge-tts）
 │   └── shots/*.png                 # 真实系统界面截图（回测/持仓）
 ├── package.json
 ├── tsconfig.json
