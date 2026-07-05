@@ -1029,3 +1029,8 @@ loadPushConfig();
 </body>
 </html>
 "##;
+
+/// 登录页占位 handler（Task 12 会替换为真页面）。
+pub async fn login_html_handler() -> axum::response::Html<&'static str> {
+    axum::response::Html("<!doctype html><title>登录</title><p>login page placeholder</p>")
+}

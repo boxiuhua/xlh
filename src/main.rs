@@ -43,7 +43,7 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Serve { port }) => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(xlh::web::serve(port))?;
+            rt.block_on(xlh::web::serve(cli.config.clone(), port))?;
             Ok(())
         }
         Some(Commands::Push { file, once }) => {

@@ -160,7 +160,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_route_returns_json_array() {
-        let resp = crate::web::router()
+        let resp = crate::web::core_router()
             .oneshot(Request::builder().uri("/api/stock/search?q=xyzzy_no_such").body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(resp.status(), 200);
@@ -171,7 +171,7 @@ mod tests {
 
     #[tokio::test]
     async fn diagnose_bad_code_is_400() {
-        let resp = crate::web::router()
+        let resp = crate::web::core_router()
             .oneshot(Request::builder().uri("/api/stock/diagnose?code=bad!!code").body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(resp.status(), 400);
@@ -180,7 +180,7 @@ mod tests {
     #[tokio::test]
     async fn sync_bad_code_returns_error_array() {
         let body = serde_json::json!({"code":"bad!!code"}).to_string();
-        let resp = crate::web::router()
+        let resp = crate::web::core_router()
             .oneshot(Request::builder().method("POST").uri("/api/stock/sync")
                 .header(header::CONTENT_TYPE, "application/json").body(Body::from(body)).unwrap())
             .await.unwrap();

@@ -251,31 +251,75 @@ pub fn build_run_from_query(q: &RunQuery) -> Result<RunSpec> {
     })
 }
 
-use axum::extract::Query;
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::from_fn_with_state;
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
 use axum::Router;
 
-pub fn router() -> Router {
+use auth::AuthState;
+
+/// 核心业务 /api 路由（不含 `/` 首页）。对任意 state 泛型：这些 handler
+/// 都无需 state，故既能装进 `Router<()>`（测试直连 `core_router`），
+/// 也能装进 `Router<AuthState>`（生产授权分组）。
+fn core_routes<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     Router::new()
-        .route("/", get(index))
         .route("/api/run", get(run_handler))
         .route("/api/funds", get(funds_handler))
         .route("/api/regime", get(regime_handler))
         .route("/api/recommend", get(recommend_handler))
-        .route("/api/holdings", axum::routing::post(holdings_handler))
+        .route("/api/holdings", post(holdings_handler))
         .route("/api/push/config", get(push_config_get).post(push_config_save))
-        .route("/api/push/preview", axum::routing::post(push_preview))
-        .route("/api/push/test", axum::routing::post(push_test))
-        .route("/api/compare", axum::routing::post(compare_handler))
-        .route("/api/optimize", axum::routing::post(optimize_handler))
-        .route("/api/sync", axum::routing::post(sync_handler))
+        .route("/api/push/preview", post(push_preview))
+        .route("/api/push/test", post(push_test))
+        .route("/api/compare", post(compare_handler))
+        .route("/api/optimize", post(optimize_handler))
+        .route("/api/sync", post(sync_handler))
         .route("/api/stock/search", get(stock::search_handler))
         .route("/api/stock/diagnose", get(stock::diagnose_handler))
         .route("/api/stock/run", get(stock::run_handler))
         .route("/api/stock/recommend", get(stock::recommend_handler))
-        .route("/api/stock/sync", axum::routing::post(stock::sync_handler))
+        .route("/api/stock/sync", post(stock::sync_handler))
+}
+
+/// 无授权的业务路由（首页 + 全部核心 API），供既有单元测试直连 `.oneshot`。
+/// 不带 state、不套任何认证中间件。
+#[cfg(test)]
+pub(crate) fn core_router() -> Router {
+    core_routes::<()>().route("/", get(index_page))
+}
+
+/// 生产入口：公开 / 需登录 / 需登录+授权 / 需登录+管理 四组，末尾注入 state。
+pub fn router(state: AuthState) -> Router {
+    // 公开：登录/注册页与其 API；`/` 自带登录判断（未登录跳 /login）
+    let public = Router::new()
+        .route("/", get(index))
+        .route("/login", get(page::login_html_handler))
+        .route("/api/auth/register", post(auth::handlers::register))
+        .route("/api/auth/login", post(auth::handlers::login));
+
+    // 需登录（不要求授权）：logout、activate、me
+    let authed = Router::new()
+        .route("/api/auth/logout", post(auth::handlers::logout))
+        .route("/api/auth/activate", post(auth::handlers::activate))
+        .route("/api/auth/me", get(auth::handlers::me))
+        .route_layer(from_fn_with_state(state.clone(), auth::require_login));
+
+    // 需登录 + 授权：核心业务
+    let licensed = core_routes::<AuthState>()
+        .route_layer(from_fn_with_state(state.clone(), auth::require_license))
+        .route_layer(from_fn_with_state(state.clone(), auth::require_login));
+
+    // 需登录 + 管理员
+    let admin = auth::routes::admin_router()
+        .route_layer(from_fn_with_state(state.clone(), auth::require_admin))
+        .route_layer(from_fn_with_state(state.clone(), auth::require_login));
+
+    public.merge(authed).merge(licensed).merge(admin).with_state(state)
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,7 +358,11 @@ async fn funds_handler() -> axum::Json<Vec<crate::data::fundlist::FundInfo>> {
     axum::Json(funds)
 }
 
-pub async fn serve(port: u16) -> Result<()> {
+pub async fn serve(config_path: std::path::PathBuf, port: u16) -> Result<()> {
+    let cfg = auth::config::load_auth(&config_path);
+    let conn = auth::store::open(&cfg.db_path).context("打开授权数据库失败")?;
+    let state = auth::AuthState::new(conn, cfg);
+
     // 默认只监听本机；容器内可用 XLH_BIND=0.0.0.0 对外暴露。
     let host: std::net::IpAddr = std::env::var("XLH_BIND")
         .ok()
@@ -324,12 +372,30 @@ pub async fn serve(port: u16) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await
         .with_context(|| format!("绑定 {addr} 失败"))?;
     println!("回测界面已启动：http://{addr}  (Ctrl+C 退出)");
-    axum::serve(listener, router()).await.context("服务运行失败")?;
+    axum::serve(listener, router(state)).await.context("服务运行失败")?;
     Ok(())
 }
 
-async fn index() -> Html<&'static str> {
+/// 无条件返回主页面 HTML（供 `core_router` 直连测试）。
+#[cfg(test)]
+async fn index_page() -> Html<&'static str> {
     Html(page::INDEX_HTML)
+}
+
+/// 生产首页：已登录返回主页面，未登录跳转 /login（自带判断，不套 require_login）。
+async fn index(State(st): State<AuthState>, headers: HeaderMap) -> Response {
+    let now = chrono::Local::now().date_naive();
+    let logged_in = auth::session::read_cookie(&headers)
+        .and_then(|t| {
+            let conn = st.db.lock().unwrap();
+            auth::store::lookup_session_user(&conn, &t, now).ok().flatten()
+        })
+        .is_some();
+    if logged_in {
+        Html(page::INDEX_HTML).into_response()
+    } else {
+        Redirect::to("/login").into_response()
+    }
 }
 
 async fn run_handler(Query(q): Query<RunQuery>) -> std::result::Result<Html<String>, AppError> {
@@ -760,7 +826,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::{Request, header};
         use tower::ServiceExt;
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().method("POST").uri(uri)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(body.to_string())).unwrap())
@@ -793,7 +859,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(resp.status(), 200);
@@ -809,7 +875,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -840,7 +906,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -862,7 +928,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -877,7 +943,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -893,7 +959,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -909,7 +975,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().uri("/api/funds").body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(resp.status(), 200);
@@ -937,7 +1003,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().uri("/api/regime?fund_code=bad!!code").body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(resp.status(), 400);
@@ -949,7 +1015,7 @@ mod tests {
         use axum::http::{Request, header};
         use tower::ServiceExt;
         let body = serde_json::json!({"code":"bad!!code"}).to_string();
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().method("POST").uri("/api/sync")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(body)).unwrap())
@@ -975,7 +1041,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -993,7 +1059,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -1010,7 +1076,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -1026,7 +1092,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -1042,7 +1108,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().uri("/api/push/config").body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(resp.status(), 200);
@@ -1070,7 +1136,7 @@ mod tests {
         use axum::http::{Request, header};
         use tower::ServiceExt;
         let body = serde_json::json!({"holdings": []}).to_string();
-        let resp = super::router()
+        let resp = super::core_router()
             .oneshot(Request::builder().method("POST").uri("/api/holdings")
                 .header(header::CONTENT_TYPE, "application/json").body(Body::from(body)).unwrap())
             .await.unwrap();

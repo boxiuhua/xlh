@@ -114,6 +114,11 @@ pub async fn set_admin(State(st): State<AuthState>, Json(req): Json<SetAdminReq>
     Json(json!({"ok": true})).into_response()
 }
 
+/// 后台页占位 handler（Task 14 会替换为真页面）。
+pub async fn admin_page() -> axum::response::Html<&'static str> {
+    axum::response::Html("<!doctype html><title>管理后台</title><p>admin placeholder</p>")
+}
+
 pub async fn overview(State(st): State<AuthState>) -> Response {
     let now = chrono::Local::now().date_naive();
     let conn = st.db.lock().unwrap();
