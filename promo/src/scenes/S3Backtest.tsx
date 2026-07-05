@@ -7,16 +7,16 @@ export const S3Backtest: React.FC = () => {
   const { width, height } = useVideoConfig();
   const vertical = height >= width;
   const lineW = vertical ? width * 0.86 : width * 0.5;
-  const lineH = vertical ? height * 0.28 : height * 0.42;
-  const gridSize = vertical ? width * 0.55 : width * 0.28;
+  const lineH = vertical ? height * 0.22 : height * 0.42;
+  const gridSize = vertical ? width * 0.48 : width * 0.28;
   return (
     <AbsoluteFill
       style={{
         flexDirection: vertical ? 'column' : 'row',
-        justifyContent: 'center',
+        justifyContent: vertical ? 'flex-start' : 'center',
         alignItems: 'center',
         gap: vertical ? 40 : 80,
-        paddingTop: vertical ? '12%' : 0,
+        paddingTop: vertical ? '10%' : 0,
       }}
     >
       <GrowLine w={lineW} h={lineH} />
