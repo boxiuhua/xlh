@@ -257,6 +257,14 @@ xlhMe();
       <button class="run" id="run-holdings">生成建议</button>
       <div class="hint" style="margin-top:8px">按你的实际持仓，逐只多策略样本外评估 + 当下择时，给出加仓/持有/减仓/止盈/观望及建议金额。首次联网抓取净值较慢，命中缓存后秒级。</div>
       <div id="hd-result" style="margin-top:14px"></div>
+      <div id="hd-save-wrap" style="margin-top:10px;display:none">
+        <button class="small" id="hd-save">保存到历史</button>
+        <span id="hd-save-msg" style="margin-left:10px;color:#27ae60"></span>
+      </div>
+      <div style="margin-top:18px;border-top:1px solid #eee;padding-top:12px">
+        <button class="small" id="hd-hist-load">查看历史建议</button>
+        <div id="hd-hist" style="margin-top:10px"></div>
+      </div>
     </div>
   </div>
 
@@ -820,10 +828,52 @@ document.getElementById('run-holdings').addEventListener('click', function(){
   document.getElementById('hd-result').textContent = '分析中…（首次联网抓取，请稍候）';
   fetch('/api/holdings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)})
     .then(function(res){ if(!res.ok) return res.text().then(function(x){ throw new Error(x); }); return res.json(); })
-    .then(renderHoldings)
+    .then(function(rep){
+      renderHoldings(rep);
+      window.hdLastPayload = payload;
+      document.getElementById('hd-save-wrap').style.display = 'block';
+      document.getElementById('hd-save-msg').textContent = '';
+    })
     .catch(function(e){ document.getElementById('hd-result').innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
     .finally(function(){ setBtn(btn, false, '生成建议'); });
 });
+
+document.getElementById('hd-save').addEventListener('click', function(){
+  if(!window.hdLastPayload){ return; }
+  var btn = this; setBtn(btn, true, '保存到历史');
+  fetch('/api/holdings/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(window.hdLastPayload)})
+    .then(function(res){ if(!res.ok) return res.text().then(function(x){ throw new Error(x); }); return res.json(); })
+    .then(function(){ document.getElementById('hd-save-msg').textContent = '已保存到历史'; loadHdHistory(); })
+    .catch(function(e){ document.getElementById('hd-save-msg').style.color='#c0392b'; document.getElementById('hd-save-msg').textContent = '保存失败：'+String(e.message||e); })
+    .finally(function(){ setBtn(btn, false, '保存到历史'); });
+});
+
+function loadHdHistory(){
+  fetch('/api/holdings/history')
+    .then(function(res){ return res.ok ? res.json() : []; })
+    .then(function(list){
+      var box = document.getElementById('hd-hist');
+      if(!list.length){ box.innerHTML = '<span class="hint">暂无历史记录</span>'; return; }
+      var html = '<table style="width:100%;border-collapse:collapse">';
+      list.forEach(function(r){
+        html += '<tr style="border-bottom:1px solid #eee"><td style="padding:6px 8px;color:#7f8c8d">'+esc(r.created_at)+'</td><td style="padding:6px 8px">'+esc(r.summary)+'</td><td style="padding:6px 8px"><button class="small hd-hist-view" data-id="'+r.id+'">查看</button></td></tr>';
+      });
+      html += '</table>';
+      box.innerHTML = html;
+      box.querySelectorAll('.hd-hist-view').forEach(function(b){
+        b.addEventListener('click', function(){ viewHdHistory(b.getAttribute('data-id')); });
+      });
+    });
+}
+
+function viewHdHistory(id){
+  fetch('/api/holdings/history/'+id)
+    .then(function(res){ if(!res.ok) throw new Error('记录不存在'); return res.json(); })
+    .then(function(j){ renderHoldings(j.report); document.getElementById('hd-result').scrollIntoView({behavior:'smooth'}); })
+    .catch(function(e){ document.getElementById('hd-result').innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; });
+}
+
+document.getElementById('hd-hist-load').addEventListener('click', loadHdHistory);
 
 // ===== 股票 Tab =====
 // 股票代码服务端搜索补全（无全量清单，按 q 查 /api/stock/search）
