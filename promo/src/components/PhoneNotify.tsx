@@ -11,8 +11,12 @@ export const PhoneNotify: React.FC = () => {
   const frame = useCurrentFrame();
   const { fps, width, height } = useVideoConfig();
   const vertical = height >= width;
-  const phoneW = vertical ? width * 0.6 : height * 0.62;
-  const phoneH = phoneW * 2.05;
+  // 手机需按可用高度封顶，保持 2.05 的宽高比，避免在竖屏/横屏下超出画面
+  // 或压穿底部字幕带（S6Push 的 Caption 绝对定位，不参与 flex 布局）。
+  const avail = height * (vertical ? 0.5 : 0.45);
+  const capW = vertical ? width * 0.6 : height * 0.62;
+  const phoneH = Math.min(capW * 2.05, avail);
+  const phoneW = phoneH / 2.05;
   const fs = phoneW * 0.062;
   return (
     <div
