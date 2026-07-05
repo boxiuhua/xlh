@@ -132,7 +132,11 @@ pub fn set_admin(conn: &Connection, user_id: i64, is_admin: bool) -> Result<()> 
 }
 
 pub fn count_admins(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row("SELECT COUNT(*) FROM users WHERE is_admin = 1", [], |r| r.get(0))?)
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND disabled = 0",
+        [],
+        |r| r.get(0),
+    )?)
 }
 
 pub fn list_users(conn: &Connection) -> Result<Vec<User>> {
@@ -319,6 +323,17 @@ mod tests {
         create_user(&conn, "b", "h", false).unwrap();
         assert_eq!(count_admins(&conn).unwrap(), 1);
         assert_eq!(list_users(&conn).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn count_admins_excludes_disabled() {
+        let conn = open_in_memory().unwrap();
+        create_user(&conn, "admin1", "h", true).unwrap();
+        let admin2 = create_user(&conn, "admin2", "h", true).unwrap();
+        set_disabled(&conn, admin2, true).unwrap();
+
+        // 只有一个启用的管理员，禁用账号不应被计入，防止末位管理员保护被绕过
+        assert_eq!(count_admins(&conn).unwrap(), 1);
     }
 
     #[test]
