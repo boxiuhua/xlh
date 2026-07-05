@@ -101,8 +101,18 @@ pub struct DisableReq { pub user_id: i64, pub disabled: bool }
 
 pub async fn disable_user(State(st): State<AuthState>, Json(req): Json<DisableReq>) -> Response {
     let conn = st.db.lock().unwrap();
-    let _ = store::set_disabled(&conn, req.user_id, req.disabled);
-    Json(json!({"ok": true})).into_response()
+    // 不允许封禁最后一个启用中的管理员，否则无人能进 /admin。
+    if req.disabled {
+        if let Ok(Some(u)) = store::find_user_by_id(&conn, req.user_id) {
+            if u.is_admin && !u.disabled && store::count_admins(&conn).unwrap_or(0) <= 1 {
+                return json_error(StatusCode::BAD_REQUEST, "last_admin", None);
+            }
+        }
+    }
+    match store::set_disabled(&conn, req.user_id, req.disabled) {
+        Ok(_) => Json(json!({"ok": true})).into_response(),
+        Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", None),
+    }
 }
 
 #[derive(Deserialize)]
@@ -110,8 +120,18 @@ pub struct SetAdminReq { pub user_id: i64, pub is_admin: bool }
 
 pub async fn set_admin(State(st): State<AuthState>, Json(req): Json<SetAdminReq>) -> Response {
     let conn = st.db.lock().unwrap();
-    let _ = store::set_admin(&conn, req.user_id, req.is_admin);
-    Json(json!({"ok": true})).into_response()
+    // 不允许撤销最后一个管理员，否则永久锁死后台。
+    if !req.is_admin {
+        if let Ok(Some(u)) = store::find_user_by_id(&conn, req.user_id) {
+            if u.is_admin && store::count_admins(&conn).unwrap_or(0) <= 1 {
+                return json_error(StatusCode::BAD_REQUEST, "last_admin", None);
+            }
+        }
+    }
+    match store::set_admin(&conn, req.user_id, req.is_admin) {
+        Ok(_) => Json(json!({"ok": true})).into_response(),
+        Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", None),
+    }
 }
 
 pub async fn admin_page() -> axum::response::Html<&'static str> {

@@ -42,21 +42,40 @@ pub async fn register(State(st): State<AuthState>, Json(cred): Json<Credentials>
     }
 }
 
+/// 固定的合法 argon2 PHC 串，用于“用户名不存在”路径的等时假校验，抵消枚举计时旁道。
+fn dummy_phc() -> &'static str {
+    static D: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    D.get_or_init(|| super::password::hash("dummy_password").unwrap_or_default())
+}
+
 pub async fn login(State(st): State<AuthState>, Json(cred): Json<Credentials>) -> Response {
-    let conn = st.db.lock().unwrap();
-    let found = store::find_user_by_name(&conn, &cred.username).ok().flatten();
-    // 统一失败文案，避免用户名枚举
-    let (uid, hash, user) = match found {
-        Some(t) => t,
-        None => return json_error(StatusCode::UNAUTHORIZED, "invalid_login", None),
+    // (a) 加锁取数后立即释放，绝不在慢速 argon2 校验期间持锁（否则串行化全库、可 DoS）。
+    let found = {
+        let conn = st.db.lock().unwrap();
+        store::find_user_by_name(&conn, &cred.username).ok().flatten()
     };
-    if user.disabled || !super::password::verify(&cred.password, &hash) {
-        return json_error(StatusCode::UNAUTHORIZED, "invalid_login", None);
-    }
+    // (b)/(c) 在锁外做口令校验；用户名不存在时对固定 PHC 做等量假校验，避免计时枚举。
+    let uid = match found {
+        Some((uid, hash, user)) => {
+            let ok = super::password::verify(&cred.password, &hash);
+            if user.disabled || !ok {
+                return json_error(StatusCode::UNAUTHORIZED, "invalid_login", None);
+            }
+            uid
+        }
+        None => {
+            let _ = super::password::verify(&cred.password, dummy_phc());
+            return json_error(StatusCode::UNAUTHORIZED, "invalid_login", None);
+        }
+    };
+    // (d) 仅在写会话时再次短暂持锁。
     let token = session::new_token();
     let exp = chrono::Local::now().date_naive() + chrono::Duration::days(st.cfg.session_ttl_days);
-    if store::create_session(&conn, &token, uid, exp).is_err() {
-        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "session_failed", None);
+    {
+        let conn = st.db.lock().unwrap();
+        if store::create_session(&conn, &token, uid, exp).is_err() {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "session_failed", None);
+        }
     }
     let mut headers = HeaderMap::new();
     headers.insert(SET_COOKIE, session::set_cookie_header(&token, st.cfg.session_ttl_days).parse().unwrap());

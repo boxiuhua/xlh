@@ -266,7 +266,11 @@ pub fn lookup_session_user(conn: &Connection, token: &str, now: NaiveDate) -> Re
         )
         .optional()?;
     let Some((user_id, exp)) = uid else { return Ok(None) };
-    let session_exp: NaiveDate = exp.parse().unwrap_or(now);
+    // 无法解析的到期时间视为已过期（fail-closed），绝不放行损坏会话。
+    let session_exp: NaiveDate = match exp.parse() {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
     if session_exp < now {
         return Ok(None); // 会话过期
     }
@@ -366,5 +370,23 @@ mod tests {
 
         delete_session(&conn, "tok").unwrap();
         assert!(lookup_session_user(&conn, "tok", now).unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_session_expiry_fails_closed() {
+        // 无法解析的 expires_at 必须被视为过期（fail-closed），而非放行。
+        let conn = open_in_memory().unwrap();
+        let uid = create_user(&conn, "u", "h", false).unwrap();
+        let now = chrono::Local::now().date_naive();
+        let created = now.to_string();
+        conn.execute(
+            "INSERT INTO sessions (token, user_id, expires_at, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["bad", uid, "not-a-date", created],
+        )
+        .unwrap();
+        assert!(
+            lookup_session_user(&conn, "bad", now).unwrap().is_none(),
+            "损坏的到期时间必须失败关闭（返回 None）"
+        );
     }
 }

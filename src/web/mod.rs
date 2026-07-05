@@ -273,9 +273,6 @@ where
         .route("/api/regime", get(regime_handler))
         .route("/api/recommend", get(recommend_handler))
         .route("/api/holdings", post(holdings_handler))
-        .route("/api/push/config", get(push_config_get).post(push_config_save))
-        .route("/api/push/preview", post(push_preview))
-        .route("/api/push/test", post(push_test))
         .route("/api/compare", post(compare_handler))
         .route("/api/optimize", post(optimize_handler))
         .route("/api/sync", post(sync_handler))
@@ -286,11 +283,25 @@ where
         .route("/api/stock/sync", post(stock::sync_handler))
 }
 
-/// 无授权的业务路由（首页 + 全部核心 API），供既有单元测试直连 `.oneshot`。
+/// 推送配置路由（含 push.toml 运营者密钥）。生产中仅挂在管理员分组（require_admin），
+/// 不属于按 license 放行的核心业务组；测试用 `core_router` 中直连以复用既有 push 测试。
+fn push_routes<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/api/push/config", get(push_config_get).post(push_config_save))
+        .route("/api/push/preview", post(push_preview))
+        .route("/api/push/test", post(push_test))
+}
+
+/// 无授权的业务路由（首页 + 全部核心 API + 推送配置），供既有单元测试直连 `.oneshot`。
 /// 不带 state、不套任何认证中间件。
 #[cfg(test)]
 pub(crate) fn core_router() -> Router {
-    core_routes::<()>().route("/", get(index_page))
+    core_routes::<()>()
+        .merge(push_routes::<()>())
+        .route("/", get(index_page))
 }
 
 /// 生产入口：公开 / 需登录 / 需登录+授权 / 需登录+管理 四组，末尾注入 state。
@@ -314,8 +325,9 @@ pub fn router(state: AuthState) -> Router {
         .route_layer(from_fn_with_state(state.clone(), auth::require_license))
         .route_layer(from_fn_with_state(state.clone(), auth::require_login));
 
-    // 需登录 + 管理员
+    // 需登录 + 管理员：后台 + 推送配置（含运营者密钥，仅运营者可见）
     let admin = auth::routes::admin_router()
+        .merge(push_routes::<AuthState>())
         .route_layer(from_fn_with_state(state.clone(), auth::require_admin))
         .route_layer(from_fn_with_state(state.clone(), auth::require_login));
 

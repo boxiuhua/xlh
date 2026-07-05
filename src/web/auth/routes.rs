@@ -86,4 +86,108 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
+
+    /// 建立一个已登录用户会话，返回其 token；`admin`/`activated` 控制身份与授权。
+    fn seed_user(state: &AuthState, name: &str, token: &str, admin: bool, activated: bool) -> i64 {
+        let conn = state.db.lock().unwrap();
+        let uid = store::create_user(&conn, name, "h", admin).unwrap();
+        let now = chrono::Local::now().date_naive();
+        if activated {
+            store::set_expiry(&conn, uid, now + chrono::Duration::days(30)).unwrap();
+        }
+        store::create_session(&conn, token, uid, now + chrono::Duration::days(1)).unwrap();
+        uid
+    }
+
+    async fn post_admin(app: axum::Router, uri: &str, token: &str, body: serde_json::Value) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("cookie", format!("xlh_session={token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn cannot_deadmin_sole_admin() {
+        let state = test_state();
+        let uid = seed_user(&state, "root", "atok", true, true);
+        let status = post_admin(
+            router(state.clone()),
+            "/api/admin/users/set_admin",
+            "atok",
+            serde_json::json!({"user_id": uid, "is_admin": false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "撤销唯一管理员应被拒");
+        let conn = state.db.lock().unwrap();
+        assert!(
+            store::find_user_by_id(&conn, uid).unwrap().unwrap().is_admin,
+            "唯一管理员应仍为管理员"
+        );
+    }
+
+    #[tokio::test]
+    async fn cannot_disable_sole_admin() {
+        let state = test_state();
+        let uid = seed_user(&state, "root", "atok", true, true);
+        let status = post_admin(
+            router(state.clone()),
+            "/api/admin/users/disable",
+            "atok",
+            serde_json::json!({"user_id": uid, "disabled": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "封禁唯一管理员应被拒");
+        let conn = state.db.lock().unwrap();
+        assert!(
+            !store::find_user_by_id(&conn, uid).unwrap().unwrap().disabled,
+            "唯一管理员应仍启用"
+        );
+    }
+
+    #[tokio::test]
+    async fn deadmin_allowed_when_two_admins() {
+        let state = test_state();
+        let uid1 = seed_user(&state, "root", "atok", true, true);
+        // 第二个管理员
+        {
+            let conn = state.db.lock().unwrap();
+            store::create_user(&conn, "root2", "h", true).unwrap();
+        }
+        let status = post_admin(
+            router(state.clone()),
+            "/api/admin/users/set_admin",
+            "atok",
+            serde_json::json!({"user_id": uid1, "is_admin": false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "存在第二管理员时可撤销");
+        let conn = state.db.lock().unwrap();
+        assert!(!store::find_user_by_id(&conn, uid1).unwrap().unwrap().is_admin);
+    }
+
+    #[tokio::test]
+    async fn push_config_is_admin_only() {
+        // 已激活的非管理员访问推送配置应 404（管理员门禁），不得读取运营者密钥。
+        let state = test_state();
+        seed_user(&state, "cust", "ctok", false, true);
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/push/config")
+                    .header("cookie", "xlh_session=ctok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "非管理员不得访问推送配置");
+    }
 }
