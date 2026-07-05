@@ -62,11 +62,14 @@ async function xlhMe(){
   document.getElementById('xlh-admin').style.display=j.is_admin?'inline':'none';
 }
 async function xlhActivate(){
-  const code=document.getElementById('xlh-code').value.trim(); if(!code)return;
-  const r=await fetch('/api/auth/activate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code})});
-  const j=await r.json().catch(()=>({}));
-  if(r.ok){alert('激活成功，到期日 '+j.expires_at);location.reload();}
-  else{alert(({code_not_found:'授权码不存在',code_used:'授权码已被使用',code_revoked:'授权码已作废'})[j.error]||('激活失败: '+(j.error||r.status)));}
+  const code=document.getElementById('xlh-code').value.trim();
+  if(!code){alert('请输入授权码');return;}
+  try{
+    const r=await fetch('/api/auth/activate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code})});
+    const j=await r.json().catch(()=>({}));
+    if(r.ok){alert('激活成功，到期日 '+j.expires_at);location.reload();}
+    else{alert(({code_not_found:'授权码不存在',code_used:'授权码已被使用',code_revoked:'授权码已作废'})[j.error]||('激活失败: '+(j.error||r.status)));}
+  }catch(e){alert('激活请求失败：'+((e&&e.message)||e));}
 }
 async function xlhLogout(){await fetch('/api/auth/logout',{method:'POST'});location.href='/login';}
 // 核心请求 403 时提示激活
