@@ -36,6 +36,41 @@ enum Commands {
         #[arg(long)]
         once: bool,
     },
+    /// 创建管理员（密码经环境变量 XLH_ADMIN_PASSWORD 传入）
+    Admin {
+        #[command(subcommand)]
+        action: AdminCmd,
+    },
+    /// 授权码管理
+    License {
+        #[command(subcommand)]
+        action: LicenseCmd,
+    },
+    /// 列出用户
+    User {
+        #[command(subcommand)]
+        action: UserCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminCmd {
+    /// 创建管理员账号
+    Create { #[arg(long)] username: String },
+}
+
+#[derive(Subcommand)]
+enum LicenseCmd {
+    /// 生成授权码
+    Issue { #[arg(long)] days: i64, #[arg(long, default_value_t = 1)] count: u32 },
+    /// 列出授权码
+    List { #[arg(long, default_value = "unused")] filter: String },
+}
+
+#[derive(Subcommand)]
+enum UserCmd {
+    /// 列出所有用户
+    List,
 }
 
 fn main() -> Result<()> {
@@ -50,6 +85,16 @@ fn main() -> Result<()> {
             let cfg = xlh::push::load(&file)?;
             if once { xlh::push::run_once(&cfg) } else { xlh::push::run_daemon(&cfg) }
         }
+        Some(Commands::Admin { action }) => match action {
+            AdminCmd::Create { username } => xlh::web::auth::cli::admin_create(&cli.config, &username),
+        },
+        Some(Commands::License { action }) => match action {
+            LicenseCmd::Issue { days, count } => xlh::web::auth::cli::license_issue(&cli.config, days, count),
+            LicenseCmd::List { filter } => xlh::web::auth::cli::license_list(&cli.config, &filter),
+        },
+        Some(Commands::User { action }) => match action {
+            UserCmd::List => xlh::web::auth::cli::user_list(&cli.config),
+        },
         None => run_cli(&cli.config),
     }
 }
