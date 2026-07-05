@@ -23,27 +23,25 @@ npm run render:v          # 竖屏 9:16 渲染 → out/xlh-9x16.mp4
 npm run render:w          # 横屏 16:9 渲染 → out/xlh-16x9.mp4
 ```
 
-## 音频集成
+## 配音（已内置 AI 配音）
 
-### 添加配音与背景音乐
+宣传片已内置 **8 段 AI 配音**（用 [edge-tts](https://github.com/rany2/edge-tts) 微软神经网络 TTS 生成，音色 `zh-CN-YunxiNeural` 阳光男声），文件在 `public/vo/s1.mp3 … s8.mp3`，由 `src/components/AudioTrack.tsx` 按各场景起始帧对齐播放。渲染出的 MP4 已含配音音轨（aac 立体声）。
 
-1. **准备音频文件**  
-   将配音与 BGM 文件放入 `public/` 目录：
-   - `public/narration.mp3` — 配音
-   - `public/bgm.mp3` — 背景音乐
+### 换音色 / 改配音文案
 
-2. **启用音轨**  
-   编辑 `src/components/AudioTrack.tsx`，取消注释相关代码以启用：
-   ```tsx
-   // 例如：
-   // <Audio src={staticFile('narration.mp3')} />
-   // <Audio src={staticFile('bgm.mp3')} />
-   ```
-
-3. **重新渲染**  
+1. 安装 edge-tts（需 Python）：`pip install edge-tts`
+2. 重新生成某一段（示例：把场景 3 换成温柔女声）：
    ```bash
-   npm run render:v  # 或 npm run render:w
+   python -m edge_tts --voice zh-CN-XiaoxiaoNeural --rate "+8%" \
+     --text "你的新文案" --write-media public/vo/s3.mp3
    ```
+   常用中文音色：`zh-CN-YunxiNeural`(阳光男)、`zh-CN-YunyangNeural`(新闻男)、`zh-CN-YunjianNeural`(激情男)、`zh-CN-XiaoxiaoNeural`(温柔女)、`zh-CN-XiaoyiNeural`(活泼女)。查看全部：`python -m edge_tts --list-voices`
+3. 各段口播稿见 `COPY.md`；改完 `npm run render:v` / `render:w` 重渲即生效。
+   > 若新配音比对应场景更长，会与下一段叠音——可提高 `--rate` 压缩时长，或在 `src/theme.ts` 调整该场景帧数。
+
+### 加背景音乐（可选）
+
+把 `bgm.mp3` 放入 `public/`，在 `AudioTrack.tsx` 里加一行 `<Audio src={staticFile('bgm.mp3')} volume={0.12} />`，重渲即可。
 
 ## 二维码配置
 
@@ -112,7 +110,8 @@ promo/
 │   ├── components/
 │   │   ├── Bg.tsx                  # 背景
 │   │   ├── Caption.tsx             # 文本字幕组件
-│   │   ├── AudioTrack.tsx          # 音轨（占位）
+│   │   ├── AudioTrack.tsx          # 音轨（8 段场景配音，按帧对齐）
+│   │   ├── Screenshot.tsx          # 真实界面截图的浏览器窗口框
 │   │   ├── Candles.tsx             # K 线蜡烛图
 │   │   ├── GrowLine.tsx            # 增长曲线
 │   │   ├── ParamGrid.tsx           # 参数网格
@@ -123,7 +122,7 @@ promo/
 │   │   ├── PhoneNotify.tsx         # 手机推送通知
 │   │   ├── Timeline.tsx            # 时间轴
 │   │   ├── Bullets.tsx             # 要点列表
-│   │   └── QRPlaceholder.tsx       # 二维码占位
+│   │   └── QRPlaceholder.tsx       # 真实微信二维码
 │   └── scenes/
 │       ├── S1Hook.tsx              # 场景 1：钩子
 │       ├── S2Logo.tsx              # 场景 2：亮相
@@ -133,7 +132,10 @@ promo/
 │       ├── S6Push.tsx              # 场景 6：推送
 │       ├── S7History.tsx           # 场景 7：历史存档
 │       └── S8Cta.tsx               # 场景 8：CTA
-├── public/                         # 静态资源（音频、二维码、图片）
+├── public/                         # 静态资源
+│   ├── qr.png                      # 微信二维码
+│   ├── vo/s1..s8.mp3               # 8 段场景配音
+│   └── shots/*.png                 # 真实系统界面截图（回测/持仓）
 ├── package.json
 ├── tsconfig.json
 ├── remotion.config.ts
