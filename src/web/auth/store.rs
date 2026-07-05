@@ -44,6 +44,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     }
     let conn = Connection::open(path).with_context(|| format!("打开 {} 失败", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL").ok();
+    conn.busy_timeout(std::time::Duration::from_secs(5)).ok();
     migrate(&conn)?;
     Ok(conn)
 }

@@ -843,7 +843,7 @@ document.getElementById('hd-save').addEventListener('click', function(){
   var btn = this; setBtn(btn, true, '保存到历史');
   fetch('/api/holdings/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(window.hdLastPayload)})
     .then(function(res){ if(!res.ok) return res.text().then(function(x){ throw new Error(x); }); return res.json(); })
-    .then(function(){ document.getElementById('hd-save-msg').textContent = '已保存到历史'; loadHdHistory(); })
+    .then(function(){ document.getElementById('hd-save-msg').style.color = '#27ae60'; document.getElementById('hd-save-msg').textContent = '已保存到历史'; loadHdHistory(); })
     .catch(function(e){ document.getElementById('hd-save-msg').style.color='#c0392b'; document.getElementById('hd-save-msg').textContent = '保存失败：'+String(e.message||e); })
     .finally(function(){ setBtn(btn, false, '保存到历史'); });
 });
