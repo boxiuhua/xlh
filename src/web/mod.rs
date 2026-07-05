@@ -1,5 +1,6 @@
 pub mod page;
 pub mod stock;
+pub mod auth;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;

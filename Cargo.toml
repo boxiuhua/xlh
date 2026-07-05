@@ -19,6 +19,9 @@ cron = "0.12"
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+rusqlite = { version = "0.31", features = ["bundled"] }
+argon2 = "0.5"
+rand = "0.8"
 
 [[bin]]
 name = "xlh"
