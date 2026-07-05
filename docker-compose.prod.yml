@@ -15,6 +15,7 @@ services:
       - ./.cache:/app/.cache
       - ./output:/app/output
       - ./push.toml:/app/push.toml
+      - ./data:/app/data
     restart: unless-stopped
     command: ["serve", "--port", "8080"]
 

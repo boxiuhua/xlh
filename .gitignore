@@ -3,3 +3,4 @@
 /output
 Cargo.lock
 /push.toml
+/data/

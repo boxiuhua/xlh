@@ -32,3 +32,10 @@ initial_cash = 0.0
 chart = true
 html  = true
 out_dir = "output"
+
+# [auth]
+# db_path = "data/xlh.db"
+# open_registration = true
+# warn_days = 7
+# grace_days = 3
+# session_ttl_days = 30

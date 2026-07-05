@@ -91,6 +91,60 @@ docker compose -f docker-compose.prod.yml up -d
 - **外网打不开、`docker ps` 显示 `127.0.0.1:8080->8080`**：端口只绑了本机，按上面「对外暴露」改绑定并放行安全组。
 - **Windows Docker Desktop 本机 `localhost:8080` 返回 502**：是 Docker Desktop 的 WSL2 端口转发问题（对所有容器都复现，与本项目无关），Linux 服务器上不存在。
 
+### 授权与收费
+
+本项目内置 **SaaS 授权体系**，支持在线激活、到期宽限与功能锁定。
+
+**首次部署：创建管理员账户**
+
+```bash
+XLH_ADMIN_PASSWORD=YourSecurePassword123 xlh admin create --username admin
+```
+
+启动 Web 后访问 `/admin`（左上管理后台入口），用上述凭证登录。
+
+**发码与激活**
+
+1. **命令行发码**（推荐自动化集成）：
+   ```bash
+   xlh license issue --days 365 --count 10
+   ```
+   生成 10 张 1 年有效期授权码，输出到 stdout（可重定向或复制分发）。
+
+2. **网页后台发码**（交互式）：
+   登入 `/admin` 后台 → 「授权码管理」tab → 输入有效期/数量 → 生成并下载；自动邮件群发客户（若配置 SMTP）。
+
+**客户激活流程**
+
+1. **注册**：Web 首页「注册」tab（若服务端启用开放注册 `open_registration = true`）或邮件邀请链接。
+2. **激活**：登录后顶栏出现「未激活」提示，输入授权码 → 立即激活。
+3. **到期前提醒**：顶栏倒数提示「还剩 X 天」（可配 `warn_days`，默认 7 天）。
+4. **到期后宽限**：进入 `grace_days` 宽限期（默认 3 天）期间正常使用，顶栏警告「宽限中」。
+5. **宽限结束锁定**：超期后无法访问核心功能（回测、推送、股诊等），仅可编辑用户信息或删除账户。
+
+**持久化配置**
+
+授权库与会话数据存储在**运行目录下的 `data/xlh.db` 文件**（SQLite）；Docker 部署时务必挂卷持久化：
+
+```yaml
+# docker-compose.yml / docker-compose.prod.yml
+volumes:
+  - ./data:/app/data    # 授权库、会话数据必须持久化
+```
+
+如容器重启或迁移，勿丢失此目录，否则所有授权码与用户登录状态丧失。
+
+**配置选项**（`config.toml` 中可选，缺省用默认值）
+
+```toml
+[auth]
+db_path = "data/xlh.db"           # SQLite 库路径（默认）
+open_registration = true           # 允许网页注册（false 则仅邮件邀请）
+warn_days = 7                       # 到期前多少天开始顶栏倒数
+grace_days = 3                      # 超期后宽限期天数
+session_ttl_days = 30              # 会话 Cookie 有效期（天）
+```
+
 ---
 
 ## 数据存储
