@@ -42,6 +42,37 @@ button.del{color:#c0392b;border-color:#e8b9b3}
 </style>
 </head>
 <body>
+<div id="xlh-bar" style="position:sticky;top:0;z-index:50;display:flex;gap:12px;align-items:center;padding:8px 14px;font:13px system-ui;background:#111827;color:#e5e7eb;border-bottom:1px solid #374151">
+  <span id="xlh-user"></span>
+  <span id="xlh-status"></span>
+  <span style="flex:1"></span>
+  <input id="xlh-code" placeholder="授权码" style="padding:4px 8px;border-radius:6px;border:1px solid #374151;background:#0b1220;color:#e5e7eb">
+  <button onclick="xlhActivate()" style="padding:4px 10px;border:0;border-radius:6px;background:#3b82f6;color:#fff;cursor:pointer">激活/续期</button>
+  <a id="xlh-admin" href="/admin" style="display:none;color:#93c5fd">管理后台</a>
+  <button onclick="xlhLogout()" style="padding:4px 10px;border:0;border-radius:6px;background:#374151;color:#fff;cursor:pointer">退出</button>
+</div>
+<script>
+async function xlhMe(){
+  const r=await fetch('/api/auth/me'); if(!r.ok){location.href='/login';return;}
+  const j=await r.json();
+  document.getElementById('xlh-user').textContent='👤 '+j.username;
+  const color={active:'#4ade80',warning:'#facc15',grace:'#f87171',inactive:'#f87171',expired:'#f87171'}[j.status]||'#e5e7eb';
+  const text={active:'授权正常 · 到期 '+j.expires_at,warning:'⚠ '+j.remaining_days+' 天后到期，请续期',grace:'⚠ 已到期，宽限期内（尽快续期）',inactive:'未激活，请输入授权码',expired:'已过期，请续期'}[j.status]||j.status;
+  const s=document.getElementById('xlh-status'); s.textContent=text; s.style.color=color;
+  document.getElementById('xlh-admin').style.display=j.is_admin?'inline':'none';
+}
+async function xlhActivate(){
+  const code=document.getElementById('xlh-code').value.trim(); if(!code)return;
+  const r=await fetch('/api/auth/activate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code})});
+  const j=await r.json().catch(()=>({}));
+  if(r.ok){alert('激活成功，到期日 '+j.expires_at);location.reload();}
+  else{alert(({code_not_found:'授权码不存在',code_used:'授权码已被使用',code_revoked:'授权码已作废'})[j.error]||('激活失败: '+(j.error||r.status)));}
+}
+async function xlhLogout(){await fetch('/api/auth/logout',{method:'POST'});location.href='/login';}
+// 核心请求 403 时提示激活
+const _f=window.fetch; window.fetch=async(...a)=>{const r=await _f(...a);if(r.status===403){const c=r.clone();const j=await c.json().catch(()=>({}));if(j.error==='license_required'||j.error==='expired'){document.getElementById('xlh-code').focus();}}return r;};
+xlhMe();
+</script>
 <div class="wrap">
   <h1>xlh 回测</h1>
   <div class="groups">
@@ -1030,7 +1061,38 @@ loadPushConfig();
 </html>
 "##;
 
-/// 登录页占位 handler（Task 12 会替换为真页面）。
 pub async fn login_html_handler() -> axum::response::Html<&'static str> {
-    axum::response::Html("<!doctype html><title>登录</title><p>login page placeholder</p>")
+    axum::response::Html(LOGIN_HTML)
 }
+
+pub const LOGIN_HTML: &str = r##"<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>xlh · 登录</title>
+<style>
+ body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;align-items:center;justify-content:center}
+ .card{background:#1e293b;padding:32px;border-radius:12px;width:320px;box-shadow:0 8px 30px rgba(0,0,0,.4)}
+ h1{font-size:20px;margin:0 0 16px} input{width:100%;box-sizing:border-box;margin:6px 0;padding:10px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#e2e8f0}
+ button{width:100%;padding:10px;margin-top:10px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font-weight:600;cursor:pointer}
+ .tab{display:flex;gap:8px;margin-bottom:12px} .tab button{background:#334155} .tab button.on{background:#3b82f6}
+ .msg{min-height:18px;font-size:13px;color:#f87171;margin-top:8px}
+</style></head><body>
+<div class="card">
+  <div class="tab"><button id="tlogin" class="on" onclick="mode('login')">登录</button><button id="treg" onclick="mode('register')">注册</button></div>
+  <h1 id="title">登录</h1>
+  <input id="u" placeholder="用户名（3-32 位字母数字）" autocomplete="username">
+  <input id="p" type="password" placeholder="密码（≥6 位）" autocomplete="current-password">
+  <button onclick="submit()">提交</button>
+  <div class="msg" id="msg"></div>
+</div>
+<script>
+let M='login';
+function mode(m){M=m;document.getElementById('tlogin').className=m=='login'?'on':'';document.getElementById('treg').className=m=='register'?'on':'';document.getElementById('title').textContent=m=='login'?'登录':'注册';document.getElementById('msg').textContent='';}
+async function submit(){
+  const u=document.getElementById('u').value.trim(),p=document.getElementById('p').value;
+  const url=M=='login'?'/api/auth/login':'/api/auth/register';
+  const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:u,password:p})});
+  const j=await r.json().catch(()=>({}));
+  if(r.ok){ if(M=='register'){mode('login');document.getElementById('msg').style.color='#4ade80';document.getElementById('msg').textContent='注册成功，请登录';} else {location.href='/';} }
+  else { document.getElementById('msg').style.color='#f87171';document.getElementById('msg').textContent=({invalid_login:'用户名或密码错误',username_taken:'用户名已被占用',invalid_credentials:'用户名或密码格式不符',registration_closed:'当前未开放注册'})[j.error]||('失败: '+(j.error||r.status)); }
+}
+</script></body></html>"##;
