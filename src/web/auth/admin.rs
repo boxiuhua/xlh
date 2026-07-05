@@ -114,10 +114,50 @@ pub async fn set_admin(State(st): State<AuthState>, Json(req): Json<SetAdminReq>
     Json(json!({"ok": true})).into_response()
 }
 
-/// 后台页占位 handler（Task 14 会替换为真页面）。
 pub async fn admin_page() -> axum::response::Html<&'static str> {
-    axum::response::Html("<!doctype html><title>管理后台</title><p>admin placeholder</p>")
+    axum::response::Html(ADMIN_HTML)
 }
+
+const ADMIN_HTML: &str = r##"<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>xlh · 管理后台</title>
+<style>
+ body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:20px}
+ h1{font-size:20px} h2{font-size:16px;margin-top:28px;border-bottom:1px solid #334155;padding-bottom:6px}
+ table{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px} th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #1e293b}
+ input,button{padding:6px 10px;border-radius:6px;border:1px solid #334155;background:#0b1220;color:#e2e8f0}
+ button{background:#3b82f6;border:0;color:#fff;cursor:pointer;margin-left:4px}
+ code{background:#1e293b;padding:2px 6px;border-radius:4px}
+ a{color:#93c5fd}
+</style></head><body>
+<h1>xlh 管理后台 · <a href="/">返回主界面</a></h1>
+<div id="ov"></div>
+
+<h2>发码</h2>
+<div>天数 <input id="days" type="number" value="365" style="width:90px"> 数量 <input id="count" type="number" value="1" style="width:70px">
+<button onclick="gen()">生成</button></div>
+<pre id="newcodes" style="background:#1e293b;padding:10px;border-radius:8px;white-space:pre-wrap"></pre>
+<div><button onclick="loadCodes('unused')">未用</button><button onclick="loadCodes('used')">已用</button><button onclick="loadCodes('all')">全部</button></div>
+<table id="codes"><thead><tr><th>码</th><th>天数</th><th>使用者</th><th>状态</th><th></th></tr></thead><tbody></tbody></table>
+
+<h2>用户</h2>
+<table id="users"><thead><tr><th>ID</th><th>用户名</th><th>状态</th><th>到期</th><th>操作</th></tr></thead><tbody></tbody></table>
+
+<script>
+async function api(u,m,b){const r=await fetch(u,{method:m||'GET',headers:b?{'content-type':'application/json'}:{},body:b?JSON.stringify(b):undefined});if(r.status===404){document.body.innerHTML='<h1>403</h1>';return null;}return r.json().catch(()=>({}));}
+async function ov(){const j=await api('/api/admin/overview');if(j)document.getElementById('ov').textContent=`用户 ${j.total} · 在用 ${j.active} · 临期 ${j.warning}`;}
+async function gen(){const days=+document.getElementById('days').value,count=+document.getElementById('count').value;const j=await api('/api/admin/codes','POST',{days,count});document.getElementById('newcodes').textContent=(j.codes||[]).join('\n');loadCodes('unused');}
+async function loadCodes(f){const j=await api('/api/admin/codes?filter='+f);const tb=document.querySelector('#codes tbody');tb.innerHTML='';(j||[]).forEach(c=>{const st=c.revoked?'已作废':(c.used_by?'已用':'未用');tb.innerHTML+=`<tr><td><code>${c.code}</code></td><td>${c.days}</td><td>${c.used_by||''}</td><td>${st}</td><td>${c.used_by||c.revoked?'':`<button onclick="revoke('${c.code}')">作废</button>`}</td></tr>`;});}
+async function revoke(code){await api('/api/admin/codes/revoke','POST',{code});loadCodes('unused');}
+async function loadUsers(){const j=await api('/api/admin/users');const tb=document.querySelector('#users tbody');tb.innerHTML='';(j.users||[]).forEach(u=>{tb.innerHTML+=`<tr><td>${u.id}</td><td>${u.username}${u.is_admin?' 👑':''}</td><td>${u.status}${u.disabled?' (封禁)':''}</td><td>${u.expires_at||'—'}</td><td>
+  <input type="number" value="30" style="width:64px" id="d${u.id}"><button onclick="ext(${u.id})">续期</button>
+  <button onclick="dis(${u.id},${!u.disabled})">${u.disabled?'解封':'封禁'}</button>
+  <button onclick="adm(${u.id},${!u.is_admin})">${u.is_admin?'撤管理':'设管理'}</button></td></tr>`;});}
+async function ext(id){const days=+document.getElementById('d'+id).value;await api('/api/admin/users/extend','POST',{user_id:id,days});loadUsers();ov();}
+async function dis(id,d){await api('/api/admin/users/disable','POST',{user_id:id,disabled:d});loadUsers();}
+async function adm(id,a){await api('/api/admin/users/set_admin','POST',{user_id:id,is_admin:a});loadUsers();}
+ov();loadCodes('unused');loadUsers();
+</script></body></html>"##;
 
 pub async fn overview(State(st): State<AuthState>) -> Response {
     let now = chrono::Local::now().date_naive();
