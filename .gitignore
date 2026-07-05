@@ -4,3 +4,5 @@
 Cargo.lock
 /push.toml
 /data/
+/promo/node_modules
+/promo/out

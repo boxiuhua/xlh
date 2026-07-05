@@ -1,0 +1,22 @@
+{
+  "name": "xlh-promo",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "studio": "remotion studio",
+    "render:v": "remotion render src/index.ts PromoVertical out/xlh-9x16.mp4",
+    "render:w": "remotion render src/index.ts PromoWide out/xlh-16x9.mp4",
+    "tsc": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@remotion/google-fonts": "^4.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "remotion": "^4.0.0"
+  },
+  "devDependencies": {
+    "@remotion/cli": "^4.0.0",
+    "@types/react": "^18.3.3",
+    "typescript": "^5.5.4"
+  }
+}
