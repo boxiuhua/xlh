@@ -19,7 +19,7 @@ export const S4Diagnose: React.FC = () => {
     >
       <StatusLight size={dot} />
       <MarketTags />
-      <Caption text="市场状态诊断" sub="A股 / 港股 / 美股 全覆盖" />
+      <Caption text="市场状态诊断" sub="当下是涨、是跌、还是震荡，一眼诊断；A股 / 港股 / 美股全覆盖" />
     </AbsoluteFill>
   );
 };

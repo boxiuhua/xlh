@@ -8,7 +8,7 @@ export const S6Push: React.FC = () => {
   return (
     <AbsoluteFill style={{ justifyContent: 'center', alignItems: 'center', paddingTop: vertical ? '4%' : 0, paddingBottom: vertical ? '18%' : '8%' }}>
       <PhoneNotify />
-      <Caption text="定时推送到微信 / 钉钉 / 飞书" sub="不用盯盘，建议自动送达" />
+      <Caption text="定时推送到微信 / 钉钉 / 飞书" sub="到点自动同步数据、生成建议并推送，不用天天盯盘" />
     </AbsoluteFill>
   );
 };

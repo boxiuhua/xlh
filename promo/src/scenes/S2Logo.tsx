@@ -39,7 +39,7 @@ export const S2Logo: React.FC = () => {
       >
         投资研判系统
       </div>
-      <Caption text="让每一个买卖决策，有数据撑腰" />
+      <Caption text="让每一个买卖决策，有数据撑腰" sub="回测·诊断·选股·持仓建议·自动推送，一套工具全搞定" />
     </AbsoluteFill>
   );
 };

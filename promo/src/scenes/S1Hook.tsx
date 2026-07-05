@@ -29,7 +29,7 @@ export const S1Hook: React.FC = () => {
       >
         ?
       </div>
-      <Caption text="追涨杀跌？该加仓还是减仓？" sub="凭感觉，其实就是在赌" color={COLORS.text} />
+      <Caption text="追涨杀跌？该加仓还是减仓？" sub="凭感觉买卖，很容易在情绪里追高杀跌、反复亏钱" color={COLORS.text} />
     </AbsoluteFill>
   );
 };

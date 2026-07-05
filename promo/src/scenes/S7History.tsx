@@ -16,7 +16,7 @@ export const S7History: React.FC = () => {
         <span style={{ fontSize: fs * 1.4 }}>🛡️</span>
         <span style={{ color: COLORS.text, fontSize: fs, fontWeight: 700 }}>本地 / 私有部署，数据自己掌控</span>
       </div>
-      <Caption text="持仓建议历史，决策可回溯" />
+      <Caption text="持仓建议历史，决策可回溯" sub="每次建议自动存档、随时回看；本地私有部署，数据自己掌控" />
     </AbsoluteFill>
   );
 };
