@@ -20,7 +20,7 @@ pub struct Holding {
 }
 
 /// 组合输入：顶部三项选填，缺失时由各只推导/留空。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HoldingsInput {
     #[serde(default)]
     pub total_amount: Option<f64>,
@@ -181,6 +181,41 @@ where
         advices,
         skipped,
         disclaimer: DISCLAIMER.to_string(),
+    }
+}
+
+/// 历史列表摘要：只数 + 建议加/减仓总额。
+pub fn summarize(report: &HoldingsReport) -> String {
+    format!(
+        "{} 只 · 加仓 {:.0} 减仓 {:.0}",
+        report.summary.holding_count,
+        report.summary.total_add,
+        report.summary.total_trim,
+    )
+}
+
+#[cfg(test)]
+mod history_summary_tests {
+    use super::*;
+
+    #[test]
+    fn summarize_uses_counts_and_totals() {
+        let report = HoldingsReport {
+            generated: "2026-07-05".into(),
+            summary: PortfolioSummary {
+                total_amount: 100000.0,
+                total_profit: None,
+                cumulative_profit: None,
+                holding_count: 3,
+                total_add: 1200.0,
+                total_trim: 800.0,
+                concentration_note: String::new(),
+            },
+            advices: vec![],
+            skipped: vec![],
+            disclaimer: String::new(),
+        };
+        assert_eq!(summarize(&report), "3 只 · 加仓 1200 减仓 800");
     }
 }
 
