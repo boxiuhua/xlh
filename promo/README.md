@@ -76,20 +76,22 @@ npm run render:w          # 横屏 16:9 渲染 → out/xlh-16x9.mp4
 ```typescript
 // src/theme.ts
 
-export const SCENES = [
-  { name: 'S1Hook', frames: 90 },      // 场景 1：钩子
-  { name: 'S2Promo', frames: 120 },    // 场景 2：亮相
-  { name: 'S3Backtest', frames: 150 }, // 场景 3：回测寻优
+export const FPS = 30;
+
+export const SCENES: SceneDef[] = [
+  { name: 'S1Hook', durationInFrames: 210 },      // 场景 1：钩子
+  { name: 'S2Logo', durationInFrames: 210 },      // 场景 2：亮相
+  { name: 'S3Backtest', durationInFrames: 300 },  // 场景 3：回测寻优
   // ... 其他场景
-  { name: 'S8Cta', frames: 120 },      // 场景 8：CTA
+  { name: 'S8Cta', durationInFrames: 90 },        // 场景 8：CTA
 ];
 
-export const TOTAL = 900; // 总帧数 = 总秒数 × 60fps（默认60fps）
+export const TOTAL = 1800; // 总帧数 = 总秒数 × 30fps（默认30fps）
 ```
 
 **调整逻辑**
-- 每个场景帧数对应时长：帧数 ÷ 60 = 秒数（基于 60fps）
-- 总时长调整：修改 `TOTAL` 值（帧数）或改变场景帧数总和
+- 每个场景帧数对应时长：帧数 ÷ 30 = 秒数（基于 30fps）
+- 总时长调整：修改 `TOTAL` 值（帧数）或改变场景帧数总和（TOTAL=1800 帧 ≈ 60s）
 - 修改后重新渲染即生效
 
 ## 文案资料
@@ -107,22 +109,28 @@ promo/
 │   ├── Promo.tsx                   # 主 Composition（两版注册）
 │   ├── theme.ts                    # 主题、SCENES、COLORS、FPS 常量
 │   ├── components/
+│   │   ├── Bg.tsx                  # 背景
 │   │   ├── Caption.tsx             # 文本字幕组件
-│   │   ├── StockCard.tsx           # 股票卡片
-│   │   ├── HoldingRow.tsx          # 持仓行
+│   │   ├── AudioTrack.tsx          # 音轨（占位）
+│   │   ├── Candles.tsx             # K 线蜡烛图
 │   │   ├── GrowLine.tsx            # 增长曲线
 │   │   ├── ParamGrid.tsx           # 参数网格
 │   │   ├── StatusLight.tsx         # 状态指示灯
-│   │   ├── AudioTrack.tsx          # 音轨（占位）
+│   │   ├── MarketTags.tsx          # 市场标签
+│   │   ├── StockCard.tsx           # 股票卡片
+│   │   ├── HoldingRow.tsx          # 持仓行
+│   │   ├── PhoneNotify.tsx         # 手机推送通知
+│   │   ├── Timeline.tsx            # 时间轴
+│   │   ├── Bullets.tsx             # 要点列表
 │   │   └── QRPlaceholder.tsx       # 二维码占位
 │   └── scenes/
 │       ├── S1Hook.tsx              # 场景 1：钩子
-│       ├── S2Promo.tsx             # 场景 2：亮相
+│       ├── S2Logo.tsx              # 场景 2：亮相
 │       ├── S3Backtest.tsx          # 场景 3：回测
-│       ├── S4Status.tsx            # 场景 4：诊断
-│       ├── S5Holding.tsx           # 场景 5：持仓建议
+│       ├── S4Diagnose.tsx          # 场景 4：诊断
+│       ├── S5Picks.tsx             # 场景 5：选股/持仓建议
 │       ├── S6Push.tsx              # 场景 6：推送
-│       ├── S7Archive.tsx           # 场景 7：历史存档
+│       ├── S7History.tsx           # 场景 7：历史存档
 │       └── S8Cta.tsx               # 场景 8：CTA
 ├── public/                         # 静态资源（音频、二维码、图片）
 ├── package.json
