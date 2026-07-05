@@ -248,6 +248,36 @@ pub fn activate(conn: &mut Connection, code: &str, user_id: i64) -> std::result:
     Ok(new_exp)
 }
 
+pub fn create_session(conn: &Connection, token: &str, user_id: i64, expires_at: NaiveDate) -> Result<()> {
+    let now = chrono::Local::now().date_naive().to_string();
+    conn.execute(
+        "INSERT INTO sessions (token, user_id, expires_at, created_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![token, user_id, expires_at.to_string(), now],
+    )?;
+    Ok(())
+}
+
+pub fn lookup_session_user(conn: &Connection, token: &str, now: NaiveDate) -> Result<Option<User>> {
+    let uid: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT user_id, expires_at FROM sessions WHERE token = ?1",
+            [token],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((user_id, exp)) = uid else { return Ok(None) };
+    let session_exp: NaiveDate = exp.parse().unwrap_or(now);
+    if session_exp < now {
+        return Ok(None); // 会话过期
+    }
+    find_user_by_id(conn, user_id)
+}
+
+pub fn delete_session(conn: &Connection, token: &str) -> Result<()> {
+    conn.execute("DELETE FROM sessions WHERE token = ?1", [token])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +350,21 @@ mod tests {
         assert_eq!(list_codes(&conn, CodeFilter::Unused).unwrap().len(), 2);
         assert!(revoke_code(&conn, "A").unwrap());
         assert_eq!(list_codes(&conn, CodeFilter::Unused).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn session_roundtrip_and_expiry() {
+        let conn = open_in_memory().unwrap();
+        let uid = create_user(&conn, "u", "h", false).unwrap();
+        let now = chrono::Local::now().date_naive();
+
+        create_session(&conn, "tok", uid, now + chrono::Duration::days(30)).unwrap();
+        assert_eq!(lookup_session_user(&conn, "tok", now).unwrap().unwrap().id, uid);
+
+        // 过期会话不返回用户
+        assert!(lookup_session_user(&conn, "tok", now + chrono::Duration::days(31)).unwrap().is_none());
+
+        delete_session(&conn, "tok").unwrap();
+        assert!(lookup_session_user(&conn, "tok", now).unwrap().is_none());
     }
 }
