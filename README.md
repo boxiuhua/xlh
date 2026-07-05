@@ -112,15 +112,15 @@ XLH_ADMIN_PASSWORD=YourSecurePassword123 xlh admin create --username admin
    生成 10 张 1 年有效期授权码，输出到 stdout（可重定向或复制分发）。
 
 2. **网页后台发码**（交互式）：
-   登入 `/admin` 后台 → 「授权码管理」tab → 输入有效期/数量 → 生成并下载；自动邮件群发客户（若配置 SMTP）。
+   登入 `/admin` 后台 → 「授权码管理」tab → 输入有效期/数量 → 生成后在页面 `<pre>` 区手动复制授权码，线下发给客户（无自动邮件发送/下载功能）。
 
 **客户激活流程**
 
-1. **注册**：Web 首页「注册」tab（若服务端启用开放注册 `open_registration = true`）或邮件邀请链接。
+1. **注册**：Web 首页「注册」tab（若服务端启用开放注册 `open_registration = true`）；若关闭开放注册，则由管理员通过 CLI/后台手动建号。
 2. **激活**：登录后顶栏出现「未激活」提示，输入授权码 → 立即激活。
 3. **到期前提醒**：顶栏倒数提示「还剩 X 天」（可配 `warn_days`，默认 7 天）。
 4. **到期后宽限**：进入 `grace_days` 宽限期（默认 3 天）期间正常使用，顶栏警告「宽限中」。
-5. **宽限结束锁定**：超期后无法访问核心功能（回测、推送、股诊等），仅可编辑用户信息或删除账户。
+5. **宽限结束锁定**：超期后无法访问核心功能（回测、推送、股诊等），仍可登录、查看授权状态、输入新授权码激活/续期、退出登录。
 
 **持久化配置**
 
@@ -139,7 +139,7 @@ volumes:
 ```toml
 [auth]
 db_path = "data/xlh.db"           # SQLite 库路径（默认）
-open_registration = true           # 允许网页注册（false 则仅邮件邀请）
+open_registration = true           # 允许网页注册（false 则关闭自助注册，需管理员手动建号）
 warn_days = 7                       # 到期前多少天开始顶栏倒数
 grace_days = 3                      # 超期后宽限期天数
 session_ttl_days = 30              # 会话 Cookie 有效期（天）
