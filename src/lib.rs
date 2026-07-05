@@ -15,5 +15,6 @@ pub mod runner;
 pub mod optimize;
 pub mod recommend;
 pub mod holdings;
+pub mod history;
 pub mod push;
 pub mod web;
