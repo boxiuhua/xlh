@@ -83,7 +83,13 @@ fn main() -> Result<()> {
         }
         Some(Commands::Push { file, once }) => {
             let cfg = xlh::push::load(&file)?;
-            if once { xlh::push::run_once(&cfg) } else { xlh::push::run_daemon(&cfg) }
+            let db_path = xlh::web::auth::config::load_auth(&cli.config).db_path;
+            let hist = xlh::history::open_or_default(&db_path).ok();
+            if once {
+                xlh::push::run_once(&cfg, hist.as_ref())
+            } else {
+                xlh::push::run_daemon(&cfg, hist.as_ref())
+            }
         }
         Some(Commands::Admin { action }) => match action {
             AdminCmd::Create { username } => xlh::web::auth::cli::admin_create(&cli.config, &username),

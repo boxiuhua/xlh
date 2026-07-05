@@ -9,13 +9,14 @@ pub mod job;
 
 pub use config::{load, PushConfig};
 pub use job::build_message;
+use rusqlite::Connection;
 
 /// 立即跑一次任务（同步+建议+诊断+推送）。手动触发，强制发送，忽略 only_on_new_data。
-pub fn run_once(cfg: &PushConfig) -> anyhow::Result<()> {
-    job::run_forced(cfg)
+pub fn run_once(cfg: &PushConfig, hist: Option<&Connection>) -> anyhow::Result<()> {
+    job::run_forced(cfg, hist)
 }
 
 /// 按 cron 常驻守护。
-pub fn run_daemon(cfg: &PushConfig) -> anyhow::Result<()> {
-    schedule::run_daemon(cfg)
+pub fn run_daemon(cfg: &PushConfig, hist: Option<&Connection>) -> anyhow::Result<()> {
+    schedule::run_daemon(cfg, hist)
 }

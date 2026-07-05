@@ -5,6 +5,7 @@ use chrono::{DateTime, Local, TimeZone};
 use cron::Schedule;
 
 use super::config::PushConfig;
+use rusqlite::Connection;
 
 /// 给定 cron 与起点，算下一次触发时刻。
 pub fn next_after<Tz: TimeZone>(cron: &str, after: &DateTime<Tz>) -> Result<DateTime<Tz>>
@@ -16,7 +17,7 @@ where
 }
 
 /// 守护：解析 cron，循环 sleep 到下一次触发并跑任务。单次失败仅记日志、继续。
-pub fn run_daemon(cfg: &PushConfig) -> Result<()> {
+pub fn run_daemon(cfg: &PushConfig, hist: Option<&Connection>) -> Result<()> {
     // 提前校验一次表达式
     Schedule::from_str(&cfg.schedule.cron).map_err(|e| anyhow!("cron 非法: {e}"))?;
     println!("推送守护已启动，cron = {}（Ctrl+C 退出）", cfg.schedule.cron);
@@ -26,7 +27,7 @@ pub fn run_daemon(cfg: &PushConfig) -> Result<()> {
         println!("下次推送：{}", next.format("%Y-%m-%d %H:%M:%S"));
         let wait = (next - now).to_std().unwrap_or(std::time::Duration::ZERO);
         std::thread::sleep(wait);
-        match super::job::run(cfg) {
+        match super::job::run(cfg, hist) {
             Ok(()) => println!("[{}] 推送完成", Local::now().format("%H:%M:%S")),
             Err(e) => eprintln!("[{}] 推送失败：{e}", Local::now().format("%H:%M:%S")),
         }
