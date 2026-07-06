@@ -49,7 +49,20 @@ button.del{color:#c0392b;border-color:#e8b9b3}
   <input id="xlh-code" placeholder="授权码" style="padding:4px 8px;border-radius:6px;border:1px solid #374151;background:#0b1220;color:#e5e7eb">
   <button onclick="xlhActivate()" style="padding:4px 10px;border:0;border-radius:6px;background:#3b82f6;color:#fff;cursor:pointer">激活/续期</button>
   <a id="xlh-admin" href="/admin" style="display:none;color:#93c5fd">管理后台</a>
+  <button onclick="xlhPwOpen()" style="padding:4px 10px;border:0;border-radius:6px;background:#374151;color:#fff;cursor:pointer">修改密码</button>
   <button onclick="xlhLogout()" style="padding:4px 10px;border:0;border-radius:6px;background:#374151;color:#fff;cursor:pointer">退出</button>
+</div>
+<div id="xlh-pw-mask" style="display:none;position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.5);align-items:center;justify-content:center">
+  <div style="background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:10px;padding:18px;width:300px;font:13px system-ui">
+    <div style="font-size:15px;margin-bottom:12px">修改密码</div>
+    <input id="pw-old" type="password" placeholder="旧密码" style="width:100%;box-sizing:border-box;margin-bottom:8px;padding:6px 8px;border-radius:6px;border:1px solid #374151;background:#0b1220;color:#e5e7eb">
+    <input id="pw-new" type="password" placeholder="新密码（至少6位）" style="width:100%;box-sizing:border-box;margin-bottom:8px;padding:6px 8px;border-radius:6px;border:1px solid #374151;background:#0b1220;color:#e5e7eb">
+    <input id="pw-new2" type="password" placeholder="确认新密码" style="width:100%;box-sizing:border-box;margin-bottom:12px;padding:6px 8px;border-radius:6px;border:1px solid #374151;background:#0b1220;color:#e5e7eb">
+    <div style="text-align:right">
+      <button onclick="xlhPwClose()" style="padding:5px 12px;border:0;border-radius:6px;background:#374151;color:#fff;cursor:pointer;margin-right:6px">取消</button>
+      <button onclick="xlhPwSubmit()" style="padding:5px 12px;border:0;border-radius:6px;background:#3b82f6;color:#fff;cursor:pointer">提交</button>
+    </div>
+  </div>
 </div>
 <script>
 async function xlhMe(){
@@ -72,6 +85,19 @@ async function xlhActivate(){
   }catch(e){alert('激活请求失败：'+((e&&e.message)||e));}
 }
 async function xlhLogout(){await fetch('/api/auth/logout',{method:'POST'});location.href='/login';}
+function xlhPwOpen(){document.getElementById('pw-old').value='';document.getElementById('pw-new').value='';document.getElementById('pw-new2').value='';document.getElementById('xlh-pw-mask').style.display='flex';}
+function xlhPwClose(){document.getElementById('xlh-pw-mask').style.display='none';}
+async function xlhPwSubmit(){
+  const cur=document.getElementById('pw-old').value,nw=document.getElementById('pw-new').value,nw2=document.getElementById('pw-new2').value;
+  if(nw.length<6){alert('新密码至少 6 位');return;}
+  if(nw!==nw2){alert('两次新密码不一致');return;}
+  try{
+    const r=await fetch('/api/auth/change_password',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});
+    const j=await r.json().catch(()=>({}));
+    if(r.ok){alert('密码已修改');xlhPwClose();}
+    else{alert(({wrong_password:'旧密码错误',invalid_password:'新密码至少 6 位'})[j.error]||('修改失败: '+(j.error||r.status)));}
+  }catch(e){alert('请求失败：'+((e&&e.message)||e));}
+}
 // 核心请求 403 时提示激活
 const _f=window.fetch; window.fetch=async(...a)=>{const r=await _f(...a);if(r.status===403){const c=r.clone();const j=await c.json().catch(()=>({}));if(j.error==='license_required'||j.error==='expired'){document.getElementById('xlh-code').focus();}}return r;};
 xlhMe();
