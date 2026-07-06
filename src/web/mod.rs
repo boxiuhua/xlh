@@ -693,6 +693,7 @@ async fn push_config_save(
 ) -> std::result::Result<axum::Json<serde_json::Value>, AppError> {
     crate::push::config::validate(&cfg)?;
     crate::push::config::require_fixed_seconds(&cfg.schedule.cron)?;
+    crate::push::config::require_allowed_host(&cfg)?;
     crate::push::config::harden(&mut cfg);
     let conn = st.db.lock().unwrap();
     crate::push::store::upsert(&conn, user.id, &cfg)?;
@@ -715,6 +716,7 @@ async fn push_test(
 ) -> std::result::Result<axum::Json<serde_json::Value>, AppError> {
     crate::push::config::validate(&cfg)?;
     crate::push::config::require_fixed_seconds(&cfg.schedule.cron)?;
+    crate::push::config::require_allowed_host(&cfg)?;
     crate::push::config::harden(&mut cfg);
     let uid = user.id;
     // 锁外组装 + 网络发送，避免持库锁阻塞其它请求；成功后再短锁存历史。
