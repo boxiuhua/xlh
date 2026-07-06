@@ -246,6 +246,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn login_succeeds_with_correct_password() {
+        // 正常管理员（未封禁/未注销）以正确口令登录应 200 且下发会话 cookie。
+        let state = test_state();
+        {
+            let conn = state.db.lock().unwrap();
+            let h = crate::web::auth::password::hash("pw123456").unwrap();
+            store::create_user(&conn, "root", &h, true).unwrap();
+        }
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"username":"root","password":"pw123456"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "正确口令应登录成功");
+        assert!(resp.headers().contains_key("set-cookie"), "应下发会话 cookie");
+    }
+
+    #[tokio::test]
     async fn require_login_rejects_cancelled_session() {
         // 已注销用户即便持有有效会话，也应被 require_login 拦截（401）。
         let state = test_state();
