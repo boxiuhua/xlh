@@ -153,13 +153,10 @@ pub fn require_allowed_host(cfg: &PushConfig) -> Result<()> {
     }
 }
 
-/// 从完整 URL 提取小写主机名（去 scheme、userinfo、端口、路径）。解析失败返回 None。
+/// 用与实际发送相同的 URL 解析器（reqwest/url crate, WHATWG）提取小写主机名，
+/// 避免解析差异导致的白名单绕过（如 `https://evil.com\@allowed.host/`）。解析失败或无主机返回 None。
 fn host_of(url: &str) -> Option<String> {
-    let after_scheme = url.split("://").nth(1)?;
-    let authority = after_scheme.split('/').next()?;          // 去掉路径
-    let authority = authority.rsplit('@').next()?;             // 去掉 userinfo
-    let host = authority.split(':').next()?;                   // 去掉端口
-    if host.is_empty() { None } else { Some(host.to_ascii_lowercase()) }
+    reqwest::Url::parse(url).ok()?.host_str().map(|h| h.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -346,5 +343,37 @@ webhook = "https://x"
     fn allowed_host_exempts_serverchan() {
         let cfg = with_channel("serverchan", "SCTKEY123");
         assert!(require_allowed_host(&cfg).is_ok(), "serverchan 非 URL 渠道应豁免主机校验");
+    }
+
+    // 以下三个用例验证 host_of 与 reqwest 实际发送时的解析器一致，
+    // 杜绝手写字符串解析与 reqwest(url crate, WHATWG) 解析结果不一致导致的白名单绕过。
+
+    #[test]
+    fn allowed_host_rejects_backslash_authority_terminator_bypass() {
+        // reqwest/url crate 将反斜杠视为权威部分终止符，真实连接目标是 evil.com，而非 open.feishu.cn
+        let err = require_allowed_host(&with_channel("feishu", "https://evil.com\\@open.feishu.cn/"))
+            .unwrap_err().to_string();
+        assert!(err.contains("不在允许列表"), "应拒绝反斜杠权威终止符绕过: {err}");
+    }
+
+    #[test]
+    fn allowed_host_rejects_userinfo_bypass() {
+        // open.feishu.cn@evil.com 中 @ 之前是 userinfo，真实主机是 evil.com
+        let err = require_allowed_host(&with_channel("feishu", "https://open.feishu.cn@evil.com/"))
+            .unwrap_err().to_string();
+        assert!(err.contains("不在允许列表"), "应拒绝 userinfo 绕过: {err}");
+    }
+
+    #[test]
+    fn allowed_host_rejects_suffix_bypass() {
+        // open.feishu.cn.evil.com 的真实主机是整个 open.feishu.cn.evil.com，而非 open.feishu.cn
+        let err = require_allowed_host(&with_channel("feishu", "https://open.feishu.cn.evil.com/"))
+            .unwrap_err().to_string();
+        assert!(err.contains("不在允许列表"), "应拒绝域名后缀绕过: {err}");
+    }
+
+    #[test]
+    fn allowed_host_accepts_plain_valid_feishu_webhook() {
+        assert!(require_allowed_host(&with_channel("feishu", "https://open.feishu.cn/open-apis/bot/v2/hook/x")).is_ok());
     }
 }
