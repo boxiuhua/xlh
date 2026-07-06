@@ -707,7 +707,7 @@ async fn push_test(
     axum::Json(cfg): axum::Json<crate::push::PushConfig>,
 ) -> std::result::Result<axum::Json<serde_json::Value>, AppError> {
     crate::push::config::validate(&cfg)?;
-    let res = tokio::task::spawn_blocking(move || crate::push::run_once(&cfg, None))
+    let res = tokio::task::spawn_blocking(move || crate::push::run_once(&cfg, None, None))
         .await.map_err(|e| anyhow!("任务执行失败: {e}"))?;
     Ok(axum::Json(match res {
         Ok(()) => serde_json::json!({"ok": true}),

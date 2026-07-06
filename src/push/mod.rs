@@ -12,12 +12,12 @@ pub use config::{load, PushConfig};
 pub use job::build_message;
 use rusqlite::Connection;
 
-/// 立即跑一次任务（同步+建议+诊断+推送）。手动触发，强制发送，忽略 only_on_new_data。
-pub fn run_once(cfg: &PushConfig, hist: Option<&Connection>) -> anyhow::Result<()> {
-    job::run_forced(cfg, hist)
+/// 立即跑一次任务（手动触发，强制发送，忽略 only_on_new_data）。
+pub fn run_once(cfg: &PushConfig, hist: Option<&Connection>, user_id: Option<i64>) -> anyhow::Result<()> {
+    job::run_forced(cfg, hist, user_id)
 }
 
-/// 按 cron 常驻守护。
+/// 单配置按 cron 常驻守护（本任务暂留，Task 5 由多租户版取代）。
 pub fn run_daemon(cfg: &PushConfig, hist: Option<&Connection>) -> anyhow::Result<()> {
     schedule::run_daemon(cfg, hist)
 }

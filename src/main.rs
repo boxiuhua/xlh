@@ -86,7 +86,7 @@ fn main() -> Result<()> {
             let db_path = xlh::web::auth::config::load_auth(&cli.config).db_path;
             let hist = xlh::history::open_or_default(&db_path).ok();
             if once {
-                xlh::push::run_once(&cfg, hist.as_ref())
+                xlh::push::run_once(&cfg, hist.as_ref(), None)
             } else {
                 xlh::push::run_daemon(&cfg, hist.as_ref())
             }

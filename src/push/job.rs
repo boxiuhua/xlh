@@ -117,14 +117,13 @@ pub fn build_message(cfg: &PushConfig) -> Result<(String, bool)> {
     Ok((b.md, b.has_new))
 }
 
-/// 把本次基金持仓建议存入历史（source=push, user_id=None）；失败仅告警。
-fn save_push_history(hist: Option<&Connection>, b: &BuiltMessage) {
-    let Some(conn) = hist else { return };
+/// 把本次基金持仓建议存入历史（source=push）。advices 为空则不存；失败仅告警。
+pub fn save_history(conn: &Connection, user_id: Option<i64>, b: &BuiltMessage) {
     if b.fund_report.advices.is_empty() { return; }
     let summary = crate::holdings::summarize(&b.fund_report);
     match serde_json::to_string(&serde_json::json!({ "input": &b.fund_input, "report": &b.fund_report })) {
         Ok(payload) => {
-            if let Err(e) = crate::history::save(conn, None, "push", &summary, &payload) {
+            if let Err(e) = crate::history::save(conn, user_id, "push", &summary, &payload) {
                 eprintln!("保存推送历史失败：{e}");
             }
         }
@@ -134,21 +133,21 @@ fn save_push_history(hist: Option<&Connection>, b: &BuiltMessage) {
 
 /// 定时守护跑一次：组装 → （only_on_new_data 且无新数据则跳过）→ 发送。
 /// only_on_new_data 只约束定时推送（规避周末/节假日空推）。
-pub fn run(cfg: &PushConfig, hist: Option<&Connection>) -> Result<()> {
+pub fn run(cfg: &PushConfig, hist: Option<&Connection>, user_id: Option<i64>) -> Result<()> {
     let b = build_message_full(cfg)?;
     if cfg.schedule.only_on_new_data && !b.has_new {
         println!("无新数据，跳过推送");
         return Ok(());
     }
-    save_push_history(hist, &b);
+    if let Some(conn) = hist { save_history(conn, user_id, &b); }
     channels::send(&cfg.channel, "基金持仓建议", &b.md)
 }
 
 /// 手动「立即推送」/ CLI --once：无条件组装并发送，忽略 only_on_new_data。
 /// 手动触发即明确的发送意图，不应被「无新数据」拦截。
-pub fn run_forced(cfg: &PushConfig, hist: Option<&Connection>) -> Result<()> {
+pub fn run_forced(cfg: &PushConfig, hist: Option<&Connection>, user_id: Option<i64>) -> Result<()> {
     let b = build_message_full(cfg)?;
-    save_push_history(hist, &b);
+    if let Some(conn) = hist { save_history(conn, user_id, &b); }
     channels::send(&cfg.channel, "基金持仓建议", &b.md)
 }
 
@@ -177,13 +176,7 @@ mod push_history_tests {
     fn empty_advices_are_not_saved() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::history::migrate(&conn).unwrap();
-        save_push_history(Some(&conn), &empty_built());
+        save_history(&conn, None, &empty_built());
         assert_eq!(crate::history::list_push(&conn, 100).unwrap().len(), 0);
-    }
-
-    #[test]
-    fn none_conn_is_noop() {
-        // 不 panic 即可
-        save_push_history(None, &empty_built());
     }
 }

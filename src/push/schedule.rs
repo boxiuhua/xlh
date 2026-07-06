@@ -27,7 +27,7 @@ pub fn run_daemon(cfg: &PushConfig, hist: Option<&Connection>) -> Result<()> {
         println!("下次推送：{}", next.format("%Y-%m-%d %H:%M:%S"));
         let wait = (next - now).to_std().unwrap_or(std::time::Duration::ZERO);
         std::thread::sleep(wait);
-        match super::job::run(cfg, hist) {
+        match super::job::run(cfg, hist, None) {
             Ok(()) => println!("[{}] 推送完成", Local::now().format("%H:%M:%S")),
             Err(e) => eprintln!("[{}] 推送失败：{e}", Local::now().format("%H:%M:%S")),
         }
