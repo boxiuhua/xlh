@@ -216,6 +216,16 @@ pub fn count_admins(conn: &Connection) -> Result<i64> {
     )?)
 }
 
+pub fn first_admin_id(conn: &Connection) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1",
+        [],
+        |r| r.get(0),
+    )
+    .optional()
+    .context("查询首个管理员失败")
+}
+
 pub fn list_users(conn: &Connection) -> Result<Vec<User>> {
     let mut stmt = conn.prepare(
         "SELECT id, username, expires_at, is_admin, disabled, cancelled_at FROM users ORDER BY id",
