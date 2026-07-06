@@ -21,6 +21,8 @@ services:
     image: xlh:latest
     container_name: xlh-push
     profiles: ["push"]
+    environment:
+      - TZ=Asia/Shanghai            # 定时推送 cron 按此时区解释；非北京时区请改这里
     volumes:
       - ./.cache:/app/.cache
       - ./push.toml:/app/push.toml     # 仅用于首启把旧全局配置导入首个管理员

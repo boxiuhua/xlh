@@ -29,13 +29,19 @@ RUN touch src/main.rs src/lib.rs \
 ########## 运行阶段 ##########
 FROM debian:bookworm-slim AS runtime
 
-# 运行期依赖：freetype/fontconfig + 字体（plotters 画 PNG 用），ca-certificates 兜底
+# 运行期依赖：freetype/fontconfig + 字体（plotters 画 PNG 用），ca-certificates 兜底，
+# tzdata 提供时区库（否则 chrono::Local 回落 UTC，定时推送 cron 会差 8 小时）。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libfreetype6 \
         libfontconfig1 \
         fonts-dejavu-core \
         ca-certificates \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# 默认时区设为北京时间：定时推送的 cron 按本地时间解释，与用户预期一致（可用 -e TZ=... 覆盖）。
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo "$TZ" > /etc/timezone
 
 WORKDIR /app
 
