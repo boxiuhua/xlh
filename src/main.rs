@@ -27,12 +27,9 @@ enum Commands {
         #[arg(long, default_value_t = 8080)]
         port: u16,
     },
-    /// 定时推送持仓建议 + 基金诊断（钉钉/飞书/企业微信/Server酱）
+    /// 定时推送持仓建议（多用户；读主库中各用户配置）
     Push {
-        /// 推送配置文件
-        #[arg(long, default_value = "push.toml")]
-        file: PathBuf,
-        /// 立即跑一次即退出（否则按 cron 常驻守护）
+        /// 立即对所有授权用户跑一次即退出（否则按各自 cron 常驻守护）
         #[arg(long)]
         once: bool,
     },
@@ -81,14 +78,16 @@ fn main() -> Result<()> {
             rt.block_on(xlh::web::serve(cli.config.clone(), port))?;
             Ok(())
         }
-        Some(Commands::Push { file, once }) => {
-            let cfg = xlh::push::load(&file)?;
-            let db_path = xlh::web::auth::config::load_auth(&cli.config).db_path;
-            let hist = xlh::history::open_or_default(&db_path).ok();
+        Some(Commands::Push { once }) => {
+            let auth_cfg = xlh::web::auth::config::load_auth(&cli.config);
+            let conn = xlh::web::auth::store::open(&auth_cfg.db_path)?;
+            xlh::history::migrate(&conn)?;
+            xlh::push::store::migrate(&conn)?;
+            xlh::push::store::migrate_legacy_push(&conn, std::path::Path::new("push.toml")).ok();
             if once {
-                xlh::push::run_once(&cfg, hist.as_ref(), None)
+                xlh::push::run_all_once(&conn, auth_cfg.warn_days, auth_cfg.grace_days)
             } else {
-                xlh::push::run_daemon(&cfg, hist.as_ref())
+                xlh::push::run_multi_daemon(&conn, auth_cfg.warn_days, auth_cfg.grace_days)
             }
         }
         Some(Commands::Admin { action }) => match action {
