@@ -153,7 +153,9 @@ pub async fn reset_password(State(st): State<AuthState>, Json(req): Json<ResetPa
     if store::update_password(&conn, req.user_id, &new_hash).is_err() {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", None);
     }
-    let _ = store::delete_sessions_except(&conn, req.user_id, None);
+    if let Err(e) = store::delete_sessions_except(&conn, req.user_id, None) {
+        eprintln!("重置密码后清理会话失败（user {}）：{e}", req.user_id);
+    }
     Json(json!({"ok": true})).into_response()
 }
 
@@ -174,7 +176,9 @@ pub async fn cancel_user(State(st): State<AuthState>, Json(req): Json<CancelReq>
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", None);
     }
     if req.cancelled {
-        let _ = store::delete_sessions_except(&conn, req.user_id, None); // 立即踢下线
+        if let Err(e) = store::delete_sessions_except(&conn, req.user_id, None) {
+            eprintln!("注销后清理会话失败（user {}）：{e}", req.user_id);
+        }
     }
     Json(json!({"ok": true})).into_response()
 }

@@ -145,7 +145,9 @@ pub async fn change_password(
     if store::update_password(&conn, user.id, &new_hash).is_err() {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", None);
     }
-    let _ = store::delete_sessions_except(&conn, user.id, keep.as_deref());
+    if let Err(e) = store::delete_sessions_except(&conn, user.id, keep.as_deref()) {
+        eprintln!("改密后清理其他会话失败（user {}）：{e}", user.id);
+    }
     (StatusCode::OK, Json(json!({"ok": true}))).into_response()
 }
 

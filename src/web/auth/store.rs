@@ -149,12 +149,14 @@ pub fn set_admin(conn: &Connection, user_id: i64, is_admin: bool) -> Result<()> 
     Ok(())
 }
 
+/// 按 id 取 pw_hash，供自助改密校验旧密码。
 pub fn pw_hash_by_id(conn: &Connection, user_id: i64) -> Result<Option<String>> {
     conn.query_row("SELECT pw_hash FROM users WHERE id = ?1", [user_id], |r| r.get(0))
         .optional()
         .context("查询口令失败")
 }
 
+/// 覆盖用户口令哈希。
 pub fn update_password(conn: &Connection, user_id: i64, new_hash: &str) -> Result<()> {
     conn.execute(
         "UPDATE users SET pw_hash = ?1 WHERE id = ?2",
@@ -188,7 +190,7 @@ pub fn set_cancelled(conn: &Connection, user_id: i64, cancelled: bool) -> Result
     Ok(())
 }
 
-/// 事务内删除用户及其会话。codes.used_by 保留作历史，不清理。
+/// 事务内删除用户及其会话；codes.used_by 有意保留作历史（依赖 SQLite 外键默认关闭）。
 pub fn delete_user(conn: &mut Connection, user_id: i64) -> Result<()> {
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])?;
@@ -197,6 +199,7 @@ pub fn delete_user(conn: &mut Connection, user_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// 统计未激活且未注销的用户数（注册上限用）。
 pub fn count_unactivated(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM users WHERE expires_at IS NULL AND cancelled_at IS NULL",
