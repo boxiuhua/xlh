@@ -300,4 +300,32 @@ mod tests {
         let h = store::pw_hash_by_id(&conn, uid).unwrap().unwrap();
         assert!(crate::web::auth::password::verify("new123", &h), "新密码可校验");
     }
+
+    #[tokio::test]
+    async fn register_blocked_at_cap() {
+        let state = test_state(); // 默认 open_registration = true
+        {
+            let conn = state.db.lock().unwrap();
+            for i in 0..10000 {
+                store::create_user(&conn, &format!("u{i}"), "h", false).unwrap();
+            }
+        }
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"username":"newbie","password":"pw123456"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(j["error"], "registration_full");
+    }
 }

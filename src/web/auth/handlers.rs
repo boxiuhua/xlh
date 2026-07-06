@@ -36,6 +36,9 @@ pub async fn register(State(st): State<AuthState>, Json(cred): Json<Credentials>
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "hash_failed", None),
     };
     let conn = st.db.lock().unwrap();
+    if store::count_unactivated(&conn).unwrap_or(0) >= 10000 {
+        return json_error(StatusCode::FORBIDDEN, "registration_full", None);
+    }
     match store::create_user(&conn, &cred.username, &hash, false) {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
         Err(_) => json_error(StatusCode::CONFLICT, "username_taken", None),
