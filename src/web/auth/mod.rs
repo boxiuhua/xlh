@@ -66,7 +66,7 @@ pub async fn require_login(State(st): State<AuthState>, mut req: Request, next: 
         None => None,
     };
     match user {
-        Some(u) if !u.disabled => {
+        Some(u) if !u.disabled && !u.cancelled => {
             req.extensions_mut().insert(CurrentUser::from(u));
             next.run(req).await
         }

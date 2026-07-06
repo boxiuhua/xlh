@@ -216,4 +216,53 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "非管理员不得访问推送配置");
     }
+
+    #[tokio::test]
+    async fn login_rejects_cancelled_user() {
+        let state = test_state();
+        {
+            let conn = state.db.lock().unwrap();
+            let h = crate::web::auth::password::hash("pw123456").unwrap();
+            let uid = store::create_user(&conn, "cx", &h, false).unwrap();
+            store::set_cancelled(&conn, uid, true).unwrap();
+        }
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"username":"cx","password":"pw123456"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn require_login_rejects_cancelled_session() {
+        // 已注销用户即便持有有效会话，也应被 require_login 拦截（401）。
+        let state = test_state();
+        {
+            let conn = state.db.lock().unwrap();
+            let uid = store::create_user(&conn, "cs", "h", false).unwrap();
+            store::set_cancelled(&conn, uid, true).unwrap();
+            let exp = chrono::Local::now().date_naive() + chrono::Duration::days(1);
+            store::create_session(&conn, "cstok", uid, exp).unwrap();
+        }
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/me")
+                    .header("cookie", "xlh_session=cstok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
 }

@@ -58,7 +58,7 @@ pub async fn login(State(st): State<AuthState>, Json(cred): Json<Credentials>) -
     let uid = match found {
         Some((uid, hash, user)) => {
             let ok = super::password::verify(&cred.password, &hash);
-            if user.disabled || !ok {
+            if user.disabled || user.cancelled || !ok {
                 return json_error(StatusCode::UNAUTHORIZED, "invalid_login", None);
             }
             uid
