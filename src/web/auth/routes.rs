@@ -265,4 +265,39 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[tokio::test]
+    async fn change_password_flow() {
+        let state = test_state();
+        let uid = {
+            let conn = state.db.lock().unwrap();
+            let h = crate::web::auth::password::hash("old123").unwrap();
+            let uid = store::create_user(&conn, "pu", &h, false).unwrap();
+            let now = chrono::Local::now().date_naive();
+            store::create_session(&conn, "ptok", uid, now + chrono::Duration::days(1)).unwrap();
+            store::create_session(&conn, "other", uid, now + chrono::Duration::days(1)).unwrap();
+            uid
+        };
+        // 旧密码错 → 400
+        assert_eq!(
+            post_admin(router(state.clone()), "/api/auth/change_password", "ptok",
+                serde_json::json!({"current_password":"bad","new_password":"new123"})).await,
+            StatusCode::BAD_REQUEST);
+        // 新密码过短 → 400
+        assert_eq!(
+            post_admin(router(state.clone()), "/api/auth/change_password", "ptok",
+                serde_json::json!({"current_password":"old123","new_password":"ab"})).await,
+            StatusCode::BAD_REQUEST);
+        // 成功 → 200
+        assert_eq!(
+            post_admin(router(state.clone()), "/api/auth/change_password", "ptok",
+                serde_json::json!({"current_password":"old123","new_password":"new123"})).await,
+            StatusCode::OK);
+        let conn = state.db.lock().unwrap();
+        let now = chrono::Local::now().date_naive();
+        assert!(store::lookup_session_user(&conn, "other", now).unwrap().is_none(), "其他会话应失效");
+        assert!(store::lookup_session_user(&conn, "ptok", now).unwrap().is_some(), "当前会话应保留");
+        let h = store::pw_hash_by_id(&conn, uid).unwrap().unwrap();
+        assert!(crate::web::auth::password::verify("new123", &h), "新密码可校验");
+    }
 }

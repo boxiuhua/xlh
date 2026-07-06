@@ -318,6 +318,7 @@ pub fn router(state: AuthState) -> Router {
         .route("/api/auth/logout", post(auth::handlers::logout))
         .route("/api/auth/activate", post(auth::handlers::activate))
         .route("/api/auth/me", get(auth::handlers::me))
+        .route("/api/auth/change_password", post(auth::handlers::change_password))
         .route_layer(from_fn_with_state(state.clone(), auth::require_login));
 
     // 需登录 + 授权：核心业务

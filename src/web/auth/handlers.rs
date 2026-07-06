@@ -107,6 +107,45 @@ pub async fn activate(State(st): State<AuthState>, Extension(user): Extension<Cu
     }
 }
 
+#[derive(Deserialize)]
+pub struct ChangePasswordReq {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+pub async fn change_password(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordReq>,
+) -> Response {
+    if req.new_password.chars().count() < 6 {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_password", None);
+    }
+    // 锁外做慢速 argon2 校验：先取 hash 立即释放锁。
+    let hash = {
+        let conn = st.db.lock().unwrap();
+        match store::pw_hash_by_id(&conn, user.id) {
+            Ok(Some(h)) => h,
+            _ => return json_error(StatusCode::UNAUTHORIZED, "unauthorized", None),
+        }
+    };
+    if !super::password::verify(&req.current_password, &hash) {
+        return json_error(StatusCode::BAD_REQUEST, "wrong_password", None);
+    }
+    let new_hash = match super::password::hash(&req.new_password) {
+        Ok(h) => h,
+        Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "hash_failed", None),
+    };
+    let keep = session::read_cookie(&headers);
+    let conn = st.db.lock().unwrap();
+    if store::update_password(&conn, user.id, &new_hash).is_err() {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", None);
+    }
+    let _ = store::delete_sessions_except(&conn, user.id, keep.as_deref());
+    (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+}
+
 pub async fn me(State(st): State<AuthState>, Extension(user): Extension<CurrentUser>) -> Response {
     let now = chrono::Local::now().date_naive();
     let status = LicenseStatus::of(user.expires_at, now, st.cfg.warn_days, st.cfg.grace_days);
