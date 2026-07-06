@@ -13,11 +13,6 @@ CREATE TABLE IF NOT EXISTS push_configs (
 "#;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
-    // 与全库其余外键（如 codes.used_by、sessions.user_id）一致：仅作文档性约束，不启用运行时
-    // 强制，避免用户删除等场景因悬空引用（孤儿行）而报 FOREIGN KEY constraint failed。
-    // 本 crate 使用的 bundled SQLite 默认将 foreign_keys 编译为 ON（不同于经典 SQLite 默认 OFF），
-    // 显式关闭以匹配既有设计假设（见 auth::store::delete_user 注释）。
-    conn.pragma_update(None, "foreign_keys", "OFF").ok();
     conn.execute_batch(SCHEMA).context("建 push_configs 表失败")?;
     Ok(())
 }

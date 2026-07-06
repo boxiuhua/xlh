@@ -60,12 +60,16 @@ pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("打开 {} 失败", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL").ok();
     conn.busy_timeout(std::time::Duration::from_secs(5)).ok();
+    // 外键强制显式关闭：本项目设计依赖删号后 codes.used_by 悬挂保留作历史，
+    // 且 push_configs 无级联删除；开启 FK 会使删除消费过授权码的用户失败。
+    conn.pragma_update(None, "foreign_keys", "OFF").ok();
     migrate(&conn)?;
     Ok(conn)
 }
 
 pub fn open_in_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
+    conn.pragma_update(None, "foreign_keys", "OFF").ok();
     migrate(&conn)?;
     Ok(conn)
 }
