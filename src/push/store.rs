@@ -151,4 +151,13 @@ mod tests {
         auth_store::create_user(&conn, "u", "h", false).unwrap();
         assert!(!import_to_first_admin(&conn, &sample_cfg()).unwrap());
     }
+
+    #[test]
+    fn delete_user_cascades_push_config() {
+        let mut conn = setup();
+        let uid = auth_store::create_user(&conn, "u", "h", false).unwrap();
+        upsert(&conn, uid, &sample_cfg()).unwrap();
+        auth_store::delete_user(&mut conn, uid).unwrap();
+        assert!(get(&conn, uid).unwrap().is_none(), "删号应连带清除推送配置");
+    }
 }

@@ -198,6 +198,8 @@ pub fn set_cancelled(conn: &Connection, user_id: i64, cancelled: bool) -> Result
 pub fn delete_user(conn: &mut Connection, user_id: i64) -> Result<()> {
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])?;
+    // push_configs 可能尚未建表（如纯 auth 测试）；容错删除。
+    let _ = tx.execute("DELETE FROM push_configs WHERE user_id = ?1", [user_id]);
     tx.execute("DELETE FROM users WHERE id = ?1", [user_id])?;
     tx.commit()?;
     Ok(())
