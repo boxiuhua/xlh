@@ -40,11 +40,12 @@ pub struct CurrentUser {
     pub is_admin: bool,
     pub expires_at: Option<NaiveDate>,
     pub disabled: bool,
+    pub cancelled: bool,
 }
 
 impl From<User> for CurrentUser {
     fn from(u: User) -> Self {
-        CurrentUser { id: u.id, username: u.username, is_admin: u.is_admin, expires_at: u.expires_at, disabled: u.disabled }
+        CurrentUser { id: u.id, username: u.username, is_admin: u.is_admin, expires_at: u.expires_at, disabled: u.disabled, cancelled: u.cancelled }
     }
 }
 

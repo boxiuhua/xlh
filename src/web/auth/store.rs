@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS users (
   expires_at TEXT,
   is_admin   INTEGER NOT NULL DEFAULT 0,
   disabled   INTEGER NOT NULL DEFAULT 0,
+  cancelled_at TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS codes (
@@ -33,6 +34,20 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA).context("建表失败")?;
+    ensure_column(conn, "users", "cancelled_at", "TEXT")?;
+    Ok(())
+}
+
+/// 幂等加列：仅当目标列不存在时执行 ALTER TABLE（SQLite 无 IF NOT EXISTS 语法）。
+fn ensure_column(conn: &Connection, table: &str, col: &str, ty: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == col);
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty}"), [])?;
+    }
     Ok(())
 }
 
@@ -71,7 +86,7 @@ pub fn create_user(conn: &Connection, username: &str, pw_hash: &str, is_admin: b
 
 pub fn find_user_by_name(conn: &Connection, username: &str) -> Result<Option<(i64, String, User)>> {
     conn.query_row(
-        "SELECT id, username, pw_hash, expires_at, is_admin, disabled FROM users WHERE username = ?1",
+        "SELECT id, username, pw_hash, expires_at, is_admin, disabled, cancelled_at FROM users WHERE username = ?1",
         [username],
         |r| {
             let id: i64 = r.get(0)?;
@@ -82,6 +97,7 @@ pub fn find_user_by_name(conn: &Connection, username: &str) -> Result<Option<(i6
                 expires_at: parse_date(r.get(3)?),
                 is_admin: r.get::<_, i64>(4)? != 0,
                 disabled: r.get::<_, i64>(5)? != 0,
+                cancelled: r.get::<_, Option<String>>(6)?.is_some(),
             };
             Ok((id, pw_hash, user))
         },
@@ -92,7 +108,7 @@ pub fn find_user_by_name(conn: &Connection, username: &str) -> Result<Option<(i6
 
 pub fn find_user_by_id(conn: &Connection, id: i64) -> Result<Option<User>> {
     conn.query_row(
-        "SELECT id, username, expires_at, is_admin, disabled FROM users WHERE id = ?1",
+        "SELECT id, username, expires_at, is_admin, disabled, cancelled_at FROM users WHERE id = ?1",
         [id],
         |r| {
             Ok(User {
@@ -101,6 +117,7 @@ pub fn find_user_by_id(conn: &Connection, id: i64) -> Result<Option<User>> {
                 expires_at: parse_date(r.get(2)?),
                 is_admin: r.get::<_, i64>(3)? != 0,
                 disabled: r.get::<_, i64>(4)? != 0,
+                cancelled: r.get::<_, Option<String>>(5)?.is_some(),
             })
         },
     )
@@ -142,7 +159,7 @@ pub fn count_admins(conn: &Connection) -> Result<i64> {
 
 pub fn list_users(conn: &Connection) -> Result<Vec<User>> {
     let mut stmt = conn.prepare(
-        "SELECT id, username, expires_at, is_admin, disabled FROM users ORDER BY id",
+        "SELECT id, username, expires_at, is_admin, disabled, cancelled_at FROM users ORDER BY id",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -152,6 +169,7 @@ pub fn list_users(conn: &Connection) -> Result<Vec<User>> {
                 expires_at: parse_date(r.get(2)?),
                 is_admin: r.get::<_, i64>(3)? != 0,
                 disabled: r.get::<_, i64>(4)? != 0,
+                cancelled: r.get::<_, Option<String>>(5)?.is_some(),
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -386,6 +404,33 @@ mod tests {
 
         delete_session(&conn, "tok").unwrap();
         assert!(lookup_session_user(&conn, "tok", now).unwrap().is_none());
+    }
+
+    #[test]
+    fn migration_adds_cancelled_column_to_legacy_db() {
+        // 旧库 schema：不含 cancelled_at
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, \
+             pw_hash TEXT NOT NULL, expires_at TEXT, is_admin INTEGER NOT NULL DEFAULT 0, \
+             disabled INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let id = create_user(&conn, "u", "h", false).unwrap();
+        let u = find_user_by_id(&conn, id).unwrap().unwrap();
+        assert!(!u.cancelled, "新用户默认未注销");
+    }
+
+    #[test]
+    fn cancelled_flag_reflects_column() {
+        let conn = open_in_memory().unwrap();
+        let id = create_user(&conn, "c", "h", false).unwrap();
+        conn.execute("UPDATE users SET cancelled_at = '2026-07-06' WHERE id = ?1", [id]).unwrap();
+        assert!(find_user_by_id(&conn, id).unwrap().unwrap().cancelled);
+        let (_, _, u) = find_user_by_name(&conn, "c").unwrap().unwrap();
+        assert!(u.cancelled);
+        assert!(list_users(&conn).unwrap().iter().find(|x| x.id == id).unwrap().cancelled);
     }
 
     #[test]
