@@ -203,8 +203,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_config_is_admin_only() {
-        // 已激活的非管理员访问推送配置应 404（管理员门禁），不得读取运营者密钥。
+    async fn push_config_allowed_for_licensed_non_admin() {
+        // 推送配置已按用户隔离迁到 licensed 组：已激活的非管理员应可访问自己的配置（不再要求管理员）。
         let state = test_state();
         seed_user(&state, "cust", "ctok", false, true);
         let resp = router(state)
@@ -217,7 +217,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "非管理员不得访问推送配置");
+        assert_eq!(resp.status(), StatusCode::OK, "已授权的非管理员应可访问自己的推送配置");
     }
 
     #[tokio::test]

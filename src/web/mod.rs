@@ -283,24 +283,19 @@ where
         .route("/api/stock/sync", post(stock::sync_handler))
 }
 
-/// 推送配置路由（含 push.toml 运营者密钥）。生产中仅挂在管理员分组（require_admin），
-/// 不属于按 license 放行的核心业务组；测试用 `core_router` 中直连以复用既有 push 测试。
-fn push_routes<S>() -> Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
+/// 每用户推送配置路由（挂在 licensed 组，按 CurrentUser 隔离）。
+fn push_user_routes() -> Router<auth::AuthState> {
     Router::new()
         .route("/api/push/config", get(push_config_get).post(push_config_save))
         .route("/api/push/preview", post(push_preview))
         .route("/api/push/test", post(push_test))
 }
 
-/// 无授权的业务路由（首页 + 全部核心 API + 推送配置），供既有单元测试直连 `.oneshot`。
+/// 无授权的业务路由（首页 + 全部核心 API），供既有单元测试直连 `.oneshot`。
 /// 不带 state、不套任何认证中间件。
 #[cfg(test)]
 pub(crate) fn core_router() -> Router {
     core_routes::<()>()
-        .merge(push_routes::<()>())
         .route("/", get(index_page))
 }
 
@@ -321,15 +316,15 @@ pub fn router(state: AuthState) -> Router {
         .route("/api/auth/change_password", post(auth::handlers::change_password))
         .route_layer(from_fn_with_state(state.clone(), auth::require_login));
 
-    // 需登录 + 授权：核心业务
+    // 需登录 + 授权：核心业务 + 每用户推送
     let licensed = core_routes::<AuthState>()
         .merge(holdings_history_routes())
+        .merge(push_user_routes())
         .route_layer(from_fn_with_state(state.clone(), auth::require_license))
         .route_layer(from_fn_with_state(state.clone(), auth::require_login));
 
-    // 需登录 + 管理员：后台 + 推送配置（含运营者密钥，仅运营者可见）
+    // 需登录 + 管理员：后台（不再含推送配置）
     let admin = auth::routes::admin_router()
-        .merge(push_routes::<AuthState>())
         .route_layer(from_fn_with_state(state.clone(), auth::require_admin))
         .route_layer(from_fn_with_state(state.clone(), auth::require_login));
 
@@ -376,6 +371,8 @@ pub async fn serve(config_path: std::path::PathBuf, port: u16) -> Result<()> {
     let cfg = auth::config::load_auth(&config_path);
     let conn = auth::store::open(&cfg.db_path).context("打开授权数据库失败")?;
     crate::history::migrate(&conn).context("建历史表失败")?;
+    crate::push::store::migrate(&conn).context("建推送配置表失败")?;
+    crate::push::store::migrate_legacy_push(&conn, std::path::Path::new("push.toml")).ok();
     let state = auth::AuthState::new(conn, cfg);
 
     // 默认只监听本机；容器内可用 XLH_BIND=0.0.0.0 对外暴露。
@@ -675,44 +672,67 @@ fn holdings_history_routes() -> Router<auth::AuthState> {
         .route("/api/holdings/history/:id", get(holdings_history_detail_handler))
 }
 
-// ===== 推送配置 Tab 后端 =====
-const PUSH_TOML: &str = "push.toml";
+// ===== 推送配置 Tab 后端（按用户隔离，存于授权库） =====
 
-async fn push_config_get() -> axum::Json<crate::push::PushConfig> {
-    let cfg = std::fs::read_to_string(PUSH_TOML).ok()
-        .and_then(|t| toml::from_str::<crate::push::PushConfig>(&t).ok())
-        .unwrap_or_else(crate::push::config::default_config);
+async fn push_config_get(
+    axum::extract::State(st): axum::extract::State<auth::AuthState>,
+    axum::Extension(user): axum::Extension<auth::CurrentUser>,
+) -> axum::Json<crate::push::PushConfig> {
+    let cfg = {
+        let conn = st.db.lock().unwrap();
+        crate::push::store::get(&conn, user.id).ok().flatten()
+    }
+    .unwrap_or_else(crate::push::config::default_config);
     axum::Json(cfg)
 }
 
 async fn push_config_save(
-    axum::Json(cfg): axum::Json<crate::push::PushConfig>,
+    axum::extract::State(st): axum::extract::State<auth::AuthState>,
+    axum::Extension(user): axum::Extension<auth::CurrentUser>,
+    axum::Json(mut cfg): axum::Json<crate::push::PushConfig>,
 ) -> std::result::Result<axum::Json<serde_json::Value>, AppError> {
     crate::push::config::validate(&cfg)?;
-    let text = toml::to_string(&cfg).map_err(|e| anyhow!("序列化 push.toml 失败: {e}"))?;
-    std::fs::write(PUSH_TOML, text).map_err(|e| anyhow!("写入 {PUSH_TOML} 失败: {e}"))?;
+    crate::push::config::require_fixed_seconds(&cfg.schedule.cron)?;
+    crate::push::config::harden(&mut cfg);
+    let conn = st.db.lock().unwrap();
+    crate::push::store::upsert(&conn, user.id, &cfg)?;
     Ok(axum::Json(serde_json::json!({"ok": true})))
 }
 
 async fn push_preview(
-    axum::Json(cfg): axum::Json<crate::push::PushConfig>,
+    axum::Json(mut cfg): axum::Json<crate::push::PushConfig>,
 ) -> std::result::Result<axum::Json<serde_json::Value>, AppError> {
-    // 预览不发送，故不校验 webhook；只组装消息。
+    crate::push::config::harden(&mut cfg);
     let (md, has_new) = tokio::task::spawn_blocking(move || crate::push::build_message(&cfg))
         .await.map_err(|e| anyhow!("任务执行失败: {e}"))??;
     Ok(axum::Json(serde_json::json!({"markdown": md, "has_new": has_new})))
 }
 
 async fn push_test(
-    axum::Json(cfg): axum::Json<crate::push::PushConfig>,
+    axum::extract::State(st): axum::extract::State<auth::AuthState>,
+    axum::Extension(user): axum::Extension<auth::CurrentUser>,
+    axum::Json(mut cfg): axum::Json<crate::push::PushConfig>,
 ) -> std::result::Result<axum::Json<serde_json::Value>, AppError> {
     crate::push::config::validate(&cfg)?;
-    let res = tokio::task::spawn_blocking(move || crate::push::run_once(&cfg, None, None))
-        .await.map_err(|e| anyhow!("任务执行失败: {e}"))?;
-    Ok(axum::Json(match res {
-        Ok(()) => serde_json::json!({"ok": true}),
-        Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
-    }))
+    crate::push::config::require_fixed_seconds(&cfg.schedule.cron)?;
+    crate::push::config::harden(&mut cfg);
+    let uid = user.id;
+    // 锁外组装 + 网络发送，避免持库锁阻塞其它请求；成功后再短锁存历史。
+    let sent = tokio::task::spawn_blocking(move || {
+        let b = crate::push::job::build_message_full(&cfg)?;
+        crate::push::channels::send(&cfg.channel, "基金持仓建议", &b.md)?;
+        anyhow::Ok(b)
+    })
+    .await
+    .map_err(|e| anyhow!("任务执行失败: {e}"))?;
+    match sent {
+        Ok(b) => {
+            let conn = st.db.lock().unwrap();
+            crate::push::job::save_history(&conn, Some(uid), &b);
+            Ok(axum::Json(serde_json::json!({"ok": true})))
+        }
+        Err(e) => Ok(axum::Json(serde_json::json!({"ok": false, "error": e.to_string()}))),
+    }
 }
 
 pub struct AppError(pub anyhow::Error);
@@ -901,6 +921,31 @@ mod tests {
                 .body(Body::from(body.to_string())).unwrap())
             .await.unwrap();
         resp.status()
+    }
+
+    fn push_state() -> crate::web::auth::AuthState {
+        let conn = crate::web::auth::store::open_in_memory().unwrap();
+        crate::history::migrate(&conn).unwrap();
+        crate::push::store::migrate(&conn).unwrap();
+        crate::web::auth::AuthState::new(conn, Default::default())
+    }
+    /// 造一个已授权用户 + 会话，返回 token。
+    fn seed_licensed(state: &crate::web::auth::AuthState, name: &str, token: &str) -> i64 {
+        let c = state.db.lock().unwrap();
+        let uid = crate::web::auth::store::create_user(&c, name, "h", false).unwrap();
+        let now = chrono::Local::now().date_naive();
+        crate::web::auth::store::set_expiry(&c, uid, now + chrono::Duration::days(30)).unwrap();
+        crate::web::auth::store::create_session(&c, token, uid, now + chrono::Duration::days(1)).unwrap();
+        uid
+    }
+    async fn push_post(state: crate::web::auth::AuthState, uri: &str, token: &str, body: serde_json::Value) -> axum::http::StatusCode {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        super::router(state).oneshot(
+            Request::builder().method("POST").uri(uri)
+                .header("content-type", "application/json")
+                .header("cookie", format!("xlh_session={token}"))
+                .body(Body::from(body.to_string())).unwrap()
+        ).await.unwrap().status()
     }
 
     #[tokio::test]
@@ -1173,13 +1218,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_config_get_returns_json() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-        let resp = super::core_router()
-            .oneshot(Request::builder().uri("/api/push/config").body(Body::empty()).unwrap())
-            .await.unwrap();
+    async fn push_config_get_returns_default_for_new_user() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let state = push_state();
+        seed_licensed(&state, "pu", "ptok");
+        let resp = super::router(state).oneshot(
+            Request::builder().uri("/api/push/config")
+                .header("cookie", "xlh_session=ptok").body(Body::empty()).unwrap()
+        ).await.unwrap();
         assert_eq!(resp.status(), 200);
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -1188,14 +1234,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn push_config_requires_auth() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        // 未登录 → 401
+        let state = push_state();
+        let r1 = super::router(state).oneshot(
+            Request::builder().uri("/api/push/config").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(r1.status(), axum::http::StatusCode::UNAUTHORIZED);
+        // 已登录未授权 → 403
+        let state = push_state();
+        {
+            let c = state.db.lock().unwrap();
+            let uid = crate::web::auth::store::create_user(&c, "np", "h", false).unwrap();
+            let now = chrono::Local::now().date_naive();
+            crate::web::auth::store::create_session(&c, "ntok", uid, now + chrono::Duration::days(1)).unwrap();
+        }
+        let r2 = super::router(state).oneshot(
+            Request::builder().uri("/api/push/config").header("cookie", "xlh_session=ntok").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(r2.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn push_config_save_empty_webhook_is_400() {
-        // webhook 为空 → validate 失败，且校验在写盘前，无副作用
+        let state = push_state();
+        seed_licensed(&state, "pu", "ptok");
         let body = serde_json::json!({
             "schedule": {"cron": "0 30 8 * * *"},
             "channel": {"kind": "feishu", "webhook": ""},
             "holdings": [{"code": "161725", "amount": 1000.0, "profit": 0.0}]
         });
-        assert_eq!(post_json("/api/push/config", body).await, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(push_post(state, "/api/push/config", "ptok", body).await, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn push_config_rejects_wildcard_seconds() {
+        let state = push_state();
+        seed_licensed(&state, "pu", "ptok");
+        let body = serde_json::json!({
+            "schedule": {"cron": "* 30 8 * * *"},
+            "channel": {"kind": "feishu", "webhook": "https://open.feishu.cn/x"},
+            "holdings": [{"code": "161725", "amount": 1000.0, "profit": 0.0}]
+        });
+        assert_eq!(push_post(state, "/api/push/config", "ptok", body).await, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn push_config_save_then_get_and_cache_dir_hardened() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let state = push_state();
+        seed_licensed(&state, "pu", "ptok");
+        let body = serde_json::json!({
+            "schedule": {"cron": "0 30 8 * * *"},
+            "channel": {"kind": "feishu", "webhook": "https://open.feishu.cn/x", "cache_dir": "/etc/evil"},
+            "holdings": [{"code": "161725", "amount": 1000.0, "profit": 0.0}]
+        });
+        assert_eq!(push_post(state.clone(), "/api/push/config", "ptok", body).await, axum::http::StatusCode::OK);
+        let resp = super::router(state).oneshot(
+            Request::builder().uri("/api/push/config").header("cookie", "xlh_session=ptok").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["channel"]["webhook"], "https://open.feishu.cn/x", "读回一致");
+        assert_eq!(v["channel"]["cache_dir"], ".cache", "cache_dir 被服务端覆盖");
     }
 
     #[tokio::test]
