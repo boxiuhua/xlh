@@ -26,6 +26,8 @@ services:
     profiles: ["push"]
     volumes:
       - ./.cache:/app/.cache
-      - ./push.toml:/app/push.toml
+      - ./push.toml:/app/push.toml     # 仅用于首启把旧全局配置导入首个管理员
+      - ./data:/app/data              # 多用户：从主库读各用户推送配置 + 落推送历史
     restart: unless-stopped
-    command: ["push", "--file", "push.toml"]
+    # 多用户守护：遍历主库中各用户配置，按各自 cron 投递（不再用 --file）
+    command: ["push"]
