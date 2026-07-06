@@ -36,6 +36,9 @@ pub async fn register(State(st): State<AuthState>, Json(cred): Json<Credentials>
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "hash_failed", None),
     };
     let conn = st.db.lock().unwrap();
+    if store::count_unactivated(&conn).unwrap_or(0) >= 10000 {
+        return json_error(StatusCode::FORBIDDEN, "registration_full", None);
+    }
     match store::create_user(&conn, &cred.username, &hash, false) {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
         Err(_) => json_error(StatusCode::CONFLICT, "username_taken", None),
@@ -58,7 +61,7 @@ pub async fn login(State(st): State<AuthState>, Json(cred): Json<Credentials>) -
     let uid = match found {
         Some((uid, hash, user)) => {
             let ok = super::password::verify(&cred.password, &hash);
-            if user.disabled || !ok {
+            if user.disabled || user.cancelled || !ok {
                 return json_error(StatusCode::UNAUTHORIZED, "invalid_login", None);
             }
             uid
@@ -105,6 +108,47 @@ pub async fn activate(State(st): State<AuthState>, Extension(user): Extension<Cu
         Err(store::ActivateError::Revoked) => json_error(StatusCode::BAD_REQUEST, "code_revoked", None),
         Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "activate_failed", None),
     }
+}
+
+#[derive(Deserialize)]
+pub struct ChangePasswordReq {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+pub async fn change_password(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordReq>,
+) -> Response {
+    if req.new_password.chars().count() < 6 {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_password", None);
+    }
+    // 锁外做慢速 argon2 校验：先取 hash 立即释放锁。
+    let hash = {
+        let conn = st.db.lock().unwrap();
+        match store::pw_hash_by_id(&conn, user.id) {
+            Ok(Some(h)) => h,
+            _ => return json_error(StatusCode::UNAUTHORIZED, "unauthorized", None),
+        }
+    };
+    if !super::password::verify(&req.current_password, &hash) {
+        return json_error(StatusCode::BAD_REQUEST, "wrong_password", None);
+    }
+    let new_hash = match super::password::hash(&req.new_password) {
+        Ok(h) => h,
+        Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "hash_failed", None),
+    };
+    let keep = session::read_cookie(&headers);
+    let conn = st.db.lock().unwrap();
+    if store::update_password(&conn, user.id, &new_hash).is_err() {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", None);
+    }
+    if let Err(e) = store::delete_sessions_except(&conn, user.id, keep.as_deref()) {
+        eprintln!("改密后清理其他会话失败（user {}）：{e}", user.id);
+    }
+    (StatusCode::OK, Json(json!({"ok": true}))).into_response()
 }
 
 pub async fn me(State(st): State<AuthState>, Extension(user): Extension<CurrentUser>) -> Response {

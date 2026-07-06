@@ -47,6 +47,7 @@ pub struct User {
     pub expires_at: Option<NaiveDate>,
     pub is_admin: bool,
     pub disabled: bool,
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

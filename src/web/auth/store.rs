@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS users (
   expires_at TEXT,
   is_admin   INTEGER NOT NULL DEFAULT 0,
   disabled   INTEGER NOT NULL DEFAULT 0,
+  cancelled_at TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS codes (
@@ -33,6 +34,20 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA).context("建表失败")?;
+    ensure_column(conn, "users", "cancelled_at", "TEXT")?;
+    Ok(())
+}
+
+/// 幂等加列：仅当目标列不存在时执行 ALTER TABLE（SQLite 无 IF NOT EXISTS 语法）。
+fn ensure_column(conn: &Connection, table: &str, col: &str, ty: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == col);
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty}"), [])?;
+    }
     Ok(())
 }
 
@@ -45,12 +60,16 @@ pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("打开 {} 失败", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL").ok();
     conn.busy_timeout(std::time::Duration::from_secs(5)).ok();
+    // 外键强制显式关闭：本项目设计依赖删号后 codes.used_by 悬挂保留作历史，
+    // 且 push_configs 无级联删除；开启 FK 会使删除消费过授权码的用户失败。
+    conn.pragma_update(None, "foreign_keys", "OFF").ok();
     migrate(&conn)?;
     Ok(conn)
 }
 
 pub fn open_in_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
+    conn.pragma_update(None, "foreign_keys", "OFF").ok();
     migrate(&conn)?;
     Ok(conn)
 }
@@ -71,7 +90,7 @@ pub fn create_user(conn: &Connection, username: &str, pw_hash: &str, is_admin: b
 
 pub fn find_user_by_name(conn: &Connection, username: &str) -> Result<Option<(i64, String, User)>> {
     conn.query_row(
-        "SELECT id, username, pw_hash, expires_at, is_admin, disabled FROM users WHERE username = ?1",
+        "SELECT id, username, pw_hash, expires_at, is_admin, disabled, cancelled_at FROM users WHERE username = ?1",
         [username],
         |r| {
             let id: i64 = r.get(0)?;
@@ -82,6 +101,7 @@ pub fn find_user_by_name(conn: &Connection, username: &str) -> Result<Option<(i6
                 expires_at: parse_date(r.get(3)?),
                 is_admin: r.get::<_, i64>(4)? != 0,
                 disabled: r.get::<_, i64>(5)? != 0,
+                cancelled: r.get::<_, Option<String>>(6)?.is_some(),
             };
             Ok((id, pw_hash, user))
         },
@@ -92,7 +112,7 @@ pub fn find_user_by_name(conn: &Connection, username: &str) -> Result<Option<(i6
 
 pub fn find_user_by_id(conn: &Connection, id: i64) -> Result<Option<User>> {
     conn.query_row(
-        "SELECT id, username, expires_at, is_admin, disabled FROM users WHERE id = ?1",
+        "SELECT id, username, expires_at, is_admin, disabled, cancelled_at FROM users WHERE id = ?1",
         [id],
         |r| {
             Ok(User {
@@ -101,6 +121,7 @@ pub fn find_user_by_id(conn: &Connection, id: i64) -> Result<Option<User>> {
                 expires_at: parse_date(r.get(2)?),
                 is_admin: r.get::<_, i64>(3)? != 0,
                 disabled: r.get::<_, i64>(4)? != 0,
+                cancelled: r.get::<_, Option<String>>(5)?.is_some(),
             })
         },
     )
@@ -132,17 +153,88 @@ pub fn set_admin(conn: &Connection, user_id: i64, is_admin: bool) -> Result<()> 
     Ok(())
 }
 
-pub fn count_admins(conn: &Connection) -> Result<i64> {
+/// 按 id 取 pw_hash，供自助改密校验旧密码。
+pub fn pw_hash_by_id(conn: &Connection, user_id: i64) -> Result<Option<String>> {
+    conn.query_row("SELECT pw_hash FROM users WHERE id = ?1", [user_id], |r| r.get(0))
+        .optional()
+        .context("查询口令失败")
+}
+
+/// 覆盖用户口令哈希。
+pub fn update_password(conn: &Connection, user_id: i64, new_hash: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE users SET pw_hash = ?1 WHERE id = ?2",
+        rusqlite::params![new_hash, user_id],
+    )?;
+    Ok(())
+}
+
+/// 删除该用户的会话；keep=Some(token) 保留当前会话，None 全删。返回删除行数。
+pub fn delete_sessions_except(conn: &Connection, user_id: i64, keep: Option<&str>) -> Result<usize> {
+    let n = match keep {
+        Some(tok) => conn.execute(
+            "DELETE FROM sessions WHERE user_id = ?1 AND token <> ?2",
+            rusqlite::params![user_id, tok],
+        )?,
+        None => conn.execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])?,
+    };
+    Ok(n)
+}
+
+pub fn set_cancelled(conn: &Connection, user_id: i64, cancelled: bool) -> Result<()> {
+    if cancelled {
+        let now = chrono::Local::now().date_naive().to_string();
+        conn.execute(
+            "UPDATE users SET cancelled_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, user_id],
+        )?;
+    } else {
+        conn.execute("UPDATE users SET cancelled_at = NULL WHERE id = ?1", [user_id])?;
+    }
+    Ok(())
+}
+
+/// 事务内删除用户及其会话；codes.used_by 有意保留作历史（依赖 SQLite 外键默认关闭）。
+pub fn delete_user(conn: &mut Connection, user_id: i64) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])?;
+    // push_configs 可能尚未建表（如纯 auth 测试）；容错删除。
+    let _ = tx.execute("DELETE FROM push_configs WHERE user_id = ?1", [user_id]);
+    tx.execute("DELETE FROM users WHERE id = ?1", [user_id])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// 统计未激活且未注销的用户数（注册上限用）。
+pub fn count_unactivated(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(
-        "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND disabled = 0",
+        "SELECT COUNT(*) FROM users WHERE expires_at IS NULL AND cancelled_at IS NULL",
         [],
         |r| r.get(0),
     )?)
 }
 
+pub fn count_admins(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND disabled = 0 AND cancelled_at IS NULL",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+pub fn first_admin_id(conn: &Connection) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1",
+        [],
+        |r| r.get(0),
+    )
+    .optional()
+    .context("查询首个管理员失败")
+}
+
 pub fn list_users(conn: &Connection) -> Result<Vec<User>> {
     let mut stmt = conn.prepare(
-        "SELECT id, username, expires_at, is_admin, disabled FROM users ORDER BY id",
+        "SELECT id, username, expires_at, is_admin, disabled, cancelled_at FROM users ORDER BY id",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -152,6 +244,7 @@ pub fn list_users(conn: &Connection) -> Result<Vec<User>> {
                 expires_at: parse_date(r.get(2)?),
                 is_admin: r.get::<_, i64>(3)? != 0,
                 disabled: r.get::<_, i64>(4)? != 0,
+                cancelled: r.get::<_, Option<String>>(5)?.is_some(),
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -389,6 +482,33 @@ mod tests {
     }
 
     #[test]
+    fn migration_adds_cancelled_column_to_legacy_db() {
+        // 旧库 schema：不含 cancelled_at
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, \
+             pw_hash TEXT NOT NULL, expires_at TEXT, is_admin INTEGER NOT NULL DEFAULT 0, \
+             disabled INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let id = create_user(&conn, "u", "h", false).unwrap();
+        let u = find_user_by_id(&conn, id).unwrap().unwrap();
+        assert!(!u.cancelled, "新用户默认未注销");
+    }
+
+    #[test]
+    fn cancelled_flag_reflects_column() {
+        let conn = open_in_memory().unwrap();
+        let id = create_user(&conn, "c", "h", false).unwrap();
+        conn.execute("UPDATE users SET cancelled_at = '2026-07-06' WHERE id = ?1", [id]).unwrap();
+        assert!(find_user_by_id(&conn, id).unwrap().unwrap().cancelled);
+        let (_, _, u) = find_user_by_name(&conn, "c").unwrap().unwrap();
+        assert!(u.cancelled);
+        assert!(list_users(&conn).unwrap().iter().find(|x| x.id == id).unwrap().cancelled);
+    }
+
+    #[test]
     fn corrupt_session_expiry_fails_closed() {
         // 无法解析的 expires_at 必须被视为过期（fail-closed），而非放行。
         let conn = open_in_memory().unwrap();
@@ -404,5 +524,55 @@ mod tests {
             lookup_session_user(&conn, "bad", now).unwrap().is_none(),
             "损坏的到期时间必须失败关闭（返回 None）"
         );
+    }
+
+    #[test]
+    fn password_and_session_helpers() {
+        let conn = open_in_memory().unwrap();
+        let uid = create_user(&conn, "u", "old", false).unwrap();
+        // 改密
+        update_password(&conn, uid, "new").unwrap();
+        assert_eq!(pw_hash_by_id(&conn, uid).unwrap().unwrap(), "new");
+        // 会话：留一删其余
+        create_session(&conn, "keep", uid, chrono::Local::now().date_naive() + chrono::Duration::days(1)).unwrap();
+        create_session(&conn, "drop", uid, chrono::Local::now().date_naive() + chrono::Duration::days(1)).unwrap();
+        assert_eq!(delete_sessions_except(&conn, uid, Some("keep")).unwrap(), 1);
+        let now = chrono::Local::now().date_naive();
+        assert!(lookup_session_user(&conn, "keep", now).unwrap().is_some());
+        assert!(lookup_session_user(&conn, "drop", now).unwrap().is_none());
+        // 全删
+        create_session(&conn, "x", uid, now + chrono::Duration::days(1)).unwrap();
+        assert_eq!(delete_sessions_except(&conn, uid, None).unwrap(), 2); // keep + x
+    }
+
+    #[test]
+    fn cancel_delete_and_count() {
+        let mut conn = open_in_memory().unwrap();
+        let a = create_user(&conn, "act", "h", false).unwrap();
+        set_expiry(&conn, a, "2026-08-01".parse().unwrap()).unwrap(); // 已激活
+        let n1 = create_user(&conn, "n1", "h", false).unwrap();       // 未激活
+        create_user(&conn, "n2", "h", false).unwrap();                // 未激活
+        assert_eq!(count_unactivated(&conn).unwrap(), 2, "已激活不计入");
+        // 注销 n1 → 不再计入未激活
+        set_cancelled(&conn, n1, true).unwrap();
+        assert!(find_user_by_id(&conn, n1).unwrap().unwrap().cancelled);
+        assert_eq!(count_unactivated(&conn).unwrap(), 1, "已注销不计入");
+        // 恢复
+        set_cancelled(&conn, n1, false).unwrap();
+        assert!(!find_user_by_id(&conn, n1).unwrap().unwrap().cancelled);
+        // 删除用户 + 其会话
+        create_session(&conn, "s", a, chrono::Local::now().date_naive() + chrono::Duration::days(1)).unwrap();
+        delete_user(&mut conn, a).unwrap();
+        assert!(find_user_by_id(&conn, a).unwrap().is_none());
+        assert!(lookup_session_user(&conn, "s", chrono::Local::now().date_naive()).unwrap().is_none());
+    }
+
+    #[test]
+    fn count_admins_excludes_cancelled() {
+        let conn = open_in_memory().unwrap();
+        create_user(&conn, "a1", "h", true).unwrap();
+        let a2 = create_user(&conn, "a2", "h", true).unwrap();
+        set_cancelled(&conn, a2, true).unwrap();
+        assert_eq!(count_admins(&conn).unwrap(), 1, "已注销管理员不计入");
     }
 }

@@ -13,6 +13,9 @@ pub fn admin_router() -> Router<AuthState> {
         .route("/api/admin/users/extend", post(admin::extend_user))
         .route("/api/admin/users/disable", post(admin::disable_user))
         .route("/api/admin/users/set_admin", post(admin::set_admin))
+        .route("/api/admin/users/reset_password", post(admin::reset_password))
+        .route("/api/admin/users/cancel", post(admin::cancel_user))
+        .route("/api/admin/users/delete", post(admin::delete_user))
         .route("/api/admin/overview", get(admin::overview))
         .route("/api/admin/push-history", get(admin::push_history_list))
         .route("/api/admin/push-history/:id", get(admin::push_history_detail))
@@ -200,8 +203,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_config_is_admin_only() {
-        // 已激活的非管理员访问推送配置应 404（管理员门禁），不得读取运营者密钥。
+    async fn push_config_allowed_for_licensed_non_admin() {
+        // 推送配置已按用户隔离迁到 licensed 组：已激活的非管理员应可访问自己的配置（不再要求管理员）。
         let state = test_state();
         seed_user(&state, "cust", "ctok", false, true);
         let resp = router(state)
@@ -214,6 +217,203 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "非管理员不得访问推送配置");
+        assert_eq!(resp.status(), StatusCode::OK, "已授权的非管理员应可访问自己的推送配置");
+    }
+
+    #[tokio::test]
+    async fn login_rejects_cancelled_user() {
+        let state = test_state();
+        {
+            let conn = state.db.lock().unwrap();
+            let h = crate::web::auth::password::hash("pw123456").unwrap();
+            let uid = store::create_user(&conn, "cx", &h, false).unwrap();
+            store::set_cancelled(&conn, uid, true).unwrap();
+        }
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"username":"cx","password":"pw123456"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn require_login_rejects_cancelled_session() {
+        // 已注销用户即便持有有效会话，也应被 require_login 拦截（401）。
+        let state = test_state();
+        {
+            let conn = state.db.lock().unwrap();
+            let uid = store::create_user(&conn, "cs", "h", false).unwrap();
+            store::set_cancelled(&conn, uid, true).unwrap();
+            let exp = chrono::Local::now().date_naive() + chrono::Duration::days(1);
+            store::create_session(&conn, "cstok", uid, exp).unwrap();
+        }
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/me")
+                    .header("cookie", "xlh_session=cstok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn change_password_flow() {
+        let state = test_state();
+        let uid = {
+            let conn = state.db.lock().unwrap();
+            let h = crate::web::auth::password::hash("old123").unwrap();
+            let uid = store::create_user(&conn, "pu", &h, false).unwrap();
+            let now = chrono::Local::now().date_naive();
+            store::create_session(&conn, "ptok", uid, now + chrono::Duration::days(1)).unwrap();
+            store::create_session(&conn, "other", uid, now + chrono::Duration::days(1)).unwrap();
+            uid
+        };
+        // 旧密码错 → 400
+        assert_eq!(
+            post_admin(router(state.clone()), "/api/auth/change_password", "ptok",
+                serde_json::json!({"current_password":"bad","new_password":"new123"})).await,
+            StatusCode::BAD_REQUEST);
+        // 新密码过短 → 400
+        assert_eq!(
+            post_admin(router(state.clone()), "/api/auth/change_password", "ptok",
+                serde_json::json!({"current_password":"old123","new_password":"ab"})).await,
+            StatusCode::BAD_REQUEST);
+        // 成功 → 200
+        assert_eq!(
+            post_admin(router(state.clone()), "/api/auth/change_password", "ptok",
+                serde_json::json!({"current_password":"old123","new_password":"new123"})).await,
+            StatusCode::OK);
+        let conn = state.db.lock().unwrap();
+        let now = chrono::Local::now().date_naive();
+        assert!(store::lookup_session_user(&conn, "other", now).unwrap().is_none(), "其他会话应失效");
+        assert!(store::lookup_session_user(&conn, "ptok", now).unwrap().is_some(), "当前会话应保留");
+        let h = store::pw_hash_by_id(&conn, uid).unwrap().unwrap();
+        assert!(crate::web::auth::password::verify("new123", &h), "新密码可校验");
+    }
+
+    #[tokio::test]
+    async fn register_blocked_at_cap() {
+        let state = test_state(); // 默认 open_registration = true
+        {
+            let conn = state.db.lock().unwrap();
+            for i in 0..10000 {
+                store::create_user(&conn, &format!("u{i}"), "h", false).unwrap();
+            }
+        }
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"username":"newbie","password":"pw123456"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(j["error"], "registration_full");
+    }
+
+    #[tokio::test]
+    async fn admin_reset_password_clears_sessions() {
+        let state = test_state();
+        seed_user(&state, "root", "atok", true, true);       // 管理员执行者
+        let uid = seed_user(&state, "cust", "ctok", false, true); // 目标（已建会话 ctok）
+        let s = post_admin(router(state.clone()), "/api/admin/users/reset_password", "atok",
+            serde_json::json!({"user_id": uid, "new_password": "reset123"})).await;
+        assert_eq!(s, StatusCode::OK);
+        let conn = state.db.lock().unwrap();
+        let now = chrono::Local::now().date_naive();
+        assert!(store::lookup_session_user(&conn, "ctok", now).unwrap().is_none(), "目标会话应被清空");
+        let h = store::pw_hash_by_id(&conn, uid).unwrap().unwrap();
+        assert!(crate::web::auth::password::verify("reset123", &h));
+    }
+
+    #[tokio::test]
+    async fn admin_cancel_and_delete_rules() {
+        let state = test_state();
+        seed_user(&state, "root", "atok", true, true); // 管理员执行者
+        // 未激活账号可直接删
+        let free = seed_user(&state, "free", "ftok", false, false);
+        assert_eq!(
+            post_admin(router(state.clone()), "/api/admin/users/delete", "atok",
+                serde_json::json!({"user_id": free})).await,
+            StatusCode::OK);
+        // 已激活未注销 → 必须先注销
+        let paid = seed_user(&state, "paid", "ptok", false, true);
+        assert_eq!(
+            post_admin(router(state.clone()), "/api/admin/users/delete", "atok",
+                serde_json::json!({"user_id": paid})).await,
+            StatusCode::BAD_REQUEST);
+        // 注销 paid（会话应被清）
+        assert_eq!(
+            post_admin(router(state.clone()), "/api/admin/users/cancel", "atok",
+                serde_json::json!({"user_id": paid, "cancelled": true})).await,
+            StatusCode::OK);
+        {
+            let conn = state.db.lock().unwrap();
+            let now = chrono::Local::now().date_naive();
+            assert!(store::lookup_session_user(&conn, "ptok", now).unwrap().is_none());
+        }
+        // 已注销 → 可删
+        assert_eq!(
+            post_admin(router(state.clone()), "/api/admin/users/delete", "atok",
+                serde_json::json!({"user_id": paid})).await,
+            StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cannot_cancel_or_delete_sole_admin() {
+        let state = test_state();
+        let uid = seed_user(&state, "root", "atok", true, true);
+        // 注销唯一管理员被拒
+        assert_eq!(
+            post_admin(router(state.clone()), "/api/admin/users/cancel", "atok",
+                serde_json::json!({"user_id": uid, "cancelled": true})).await,
+            StatusCode::BAD_REQUEST);
+        // 删除唯一管理员被拒（已激活且未注销，先命中 last_admin）
+        assert_eq!(
+            post_admin(router(state.clone()), "/api/admin/users/delete", "atok",
+                serde_json::json!({"user_id": uid})).await,
+            StatusCode::BAD_REQUEST);
+        let conn = state.db.lock().unwrap();
+        assert!(store::find_user_by_id(&conn, uid).unwrap().is_some(), "唯一管理员仍存在");
+    }
+
+    #[tokio::test]
+    async fn cancel_delete_hidden_for_non_admin() {
+        let state = test_state();
+        seed_user(&state, "cust", "ctok", false, true); // 非管理员
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/users/delete")
+                    .header("cookie", "xlh_session=ctok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"user_id": 1}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -113,6 +113,52 @@ pub fn validate(cfg: &PushConfig) -> Result<()> {
     Ok(())
 }
 
+/// 覆盖用户不可控字段：缓存目录固定为服务端默认，杜绝路径滥用。
+pub fn harden(cfg: &mut PushConfig) {
+    cfg.channel.cache_dir = default_cache_dir();
+}
+
+/// 要求 cron 秒位为固定数字（拒绝 * / 范围 / 列表 / 步进），避免每秒级狂刷。
+pub fn require_fixed_seconds(cron: &str) -> Result<()> {
+    let sec = cron.split_whitespace().next().unwrap_or("");
+    if sec.is_empty() || !sec.chars().all(|c| c.is_ascii_digit()) {
+        return Err(anyhow!(
+            "cron 秒位必须为固定值（不支持 * 或范围），以避免过于频繁的推送，当前为 '{sec}'"
+        ));
+    }
+    Ok(())
+}
+
+/// URL 类渠道（dingtalk/feishu/wework）的 webhook 主机白名单，防 SSRF：
+/// 用户提交的 webhook 只能指向各机器人平台的官方域名，不得指向内网/元数据地址。
+pub fn require_allowed_host(cfg: &PushConfig) -> Result<()> {
+    if !URL_CHANNELS.contains(&cfg.channel.kind.as_str()) {
+        return Ok(()); // serverchan 等非 URL 渠道无需校验
+    }
+    let url = super::channels::canonical_webhook(&cfg.channel.kind, &cfg.channel.webhook);
+    let host = host_of(&url).unwrap_or_default();
+    let allowed: &[&str] = match cfg.channel.kind.as_str() {
+        "dingtalk" => &["oapi.dingtalk.com"],
+        "feishu" => &["open.feishu.cn", "open.larksuite.com"],
+        "wework" => &["qyapi.weixin.qq.com"],
+        _ => &[],
+    };
+    if allowed.contains(&host.as_str()) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{} 的 webhook 主机 '{}' 不在允许列表 {:?} 内（仅允许对应机器人平台官方域名，防止指向内网地址）",
+            cfg.channel.kind, host, allowed
+        ))
+    }
+}
+
+/// 用与实际发送相同的 URL 解析器（reqwest/url crate, WHATWG）提取小写主机名，
+/// 避免解析差异导致的白名单绕过（如 `https://evil.com\@allowed.host/`）。解析失败或无主机返回 None。
+fn host_of(url: &str) -> Option<String> {
+    reqwest::Url::parse(url).ok()?.host_str().map(|h| h.to_ascii_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +291,89 @@ webhook = "https://x"
 "#;
         let cfg: PushConfig = toml::from_str(t).unwrap();
         assert!(validate(&cfg).unwrap_err().to_string().contains("至少配置一项"));
+    }
+
+    #[test]
+    fn harden_forces_cache_dir() {
+        let mut c = default_config();
+        c.channel.cache_dir = PathBuf::from("/etc/evil");
+        harden(&mut c);
+        assert_eq!(c.channel.cache_dir, default_cache_dir());
+    }
+
+    #[test]
+    fn fixed_seconds_accepts_and_rejects() {
+        assert!(require_fixed_seconds("0 30 8 * * *").is_ok());
+        assert!(require_fixed_seconds("30 0 12 * * *").is_ok());
+        for bad in ["* 30 8 * * *", "*/5 30 8 * * *", "0-30 0 8 * * *", "1,2 0 8 * * *", ""] {
+            assert!(require_fixed_seconds(bad).is_err(), "应拒绝 {bad}");
+        }
+    }
+
+    fn with_channel(kind: &str, webhook: &str) -> PushConfig {
+        let mut cfg: PushConfig = toml::from_str(SAMPLE).unwrap();
+        cfg.channel.kind = kind.to_string();
+        cfg.channel.webhook = webhook.to_string();
+        cfg
+    }
+
+    #[test]
+    fn allowed_host_accepts_official_feishu_domains() {
+        assert!(require_allowed_host(&with_channel("feishu", "https://open.feishu.cn/open-apis/bot/v2/hook/xxx")).is_ok());
+        assert!(require_allowed_host(&with_channel("feishu", "097074dc-0f9c-44c0-a7ab-af8942e24143")).is_ok(),
+            "飞书裸 token 经 canonical_webhook 补全为 open.feishu.cn 后应通过");
+        assert!(require_allowed_host(&with_channel("feishu", "https://open.larksuite.com/open-apis/bot/v2/hook/xxx")).is_ok());
+    }
+
+    #[test]
+    fn allowed_host_accepts_official_dingtalk_and_rejects_other_hosts() {
+        assert!(require_allowed_host(&with_channel("dingtalk", "https://oapi.dingtalk.com/robot/send?access_token=x")).is_ok());
+        assert!(require_allowed_host(&with_channel("dingtalk", "https://evil.com/x")).is_err());
+    }
+
+    #[test]
+    fn allowed_host_rejects_ssrf_targets_for_wework() {
+        let err = require_allowed_host(&with_channel("wework", "http://169.254.169.254/latest/meta-data")).unwrap_err().to_string();
+        assert!(err.contains("不在允许列表"), "应拒绝云元数据地址: {err}");
+        let err2 = require_allowed_host(&with_channel("wework", "http://127.0.0.1/x")).unwrap_err().to_string();
+        assert!(err2.contains("不在允许列表"), "应拒绝回环地址: {err2}");
+    }
+
+    #[test]
+    fn allowed_host_exempts_serverchan() {
+        let cfg = with_channel("serverchan", "SCTKEY123");
+        assert!(require_allowed_host(&cfg).is_ok(), "serverchan 非 URL 渠道应豁免主机校验");
+    }
+
+    // 以下三个用例验证 host_of 与 reqwest 实际发送时的解析器一致，
+    // 杜绝手写字符串解析与 reqwest(url crate, WHATWG) 解析结果不一致导致的白名单绕过。
+
+    #[test]
+    fn allowed_host_rejects_backslash_authority_terminator_bypass() {
+        // reqwest/url crate 将反斜杠视为权威部分终止符，真实连接目标是 evil.com，而非 open.feishu.cn
+        let err = require_allowed_host(&with_channel("feishu", "https://evil.com\\@open.feishu.cn/"))
+            .unwrap_err().to_string();
+        assert!(err.contains("不在允许列表"), "应拒绝反斜杠权威终止符绕过: {err}");
+    }
+
+    #[test]
+    fn allowed_host_rejects_userinfo_bypass() {
+        // open.feishu.cn@evil.com 中 @ 之前是 userinfo，真实主机是 evil.com
+        let err = require_allowed_host(&with_channel("feishu", "https://open.feishu.cn@evil.com/"))
+            .unwrap_err().to_string();
+        assert!(err.contains("不在允许列表"), "应拒绝 userinfo 绕过: {err}");
+    }
+
+    #[test]
+    fn allowed_host_rejects_suffix_bypass() {
+        // open.feishu.cn.evil.com 的真实主机是整个 open.feishu.cn.evil.com，而非 open.feishu.cn
+        let err = require_allowed_host(&with_channel("feishu", "https://open.feishu.cn.evil.com/"))
+            .unwrap_err().to_string();
+        assert!(err.contains("不在允许列表"), "应拒绝域名后缀绕过: {err}");
+    }
+
+    #[test]
+    fn allowed_host_accepts_plain_valid_feishu_webhook() {
+        assert!(require_allowed_host(&with_channel("feishu", "https://open.feishu.cn/open-apis/bot/v2/hook/x")).is_ok());
     }
 }
