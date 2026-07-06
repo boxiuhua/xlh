@@ -70,7 +70,8 @@ pub async fn list_users(State(st): State<AuthState>) -> Response {
                 let status = LicenseStatus::of(u.expires_at, now, st.cfg.warn_days, st.cfg.grace_days);
                 json!({
                     "id": u.id, "username": u.username, "expires_at": u.expires_at,
-                    "is_admin": u.is_admin, "disabled": u.disabled, "status": status,
+                    "is_admin": u.is_admin, "disabled": u.disabled, "cancelled": u.cancelled,
+                    "status": status,
                 })
             }).collect();
             Json(json!({"users": rows})).into_response()
@@ -153,6 +154,51 @@ pub async fn reset_password(State(st): State<AuthState>, Json(req): Json<ResetPa
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", None);
     }
     let _ = store::delete_sessions_except(&conn, req.user_id, None);
+    Json(json!({"ok": true})).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CancelReq { pub user_id: i64, pub cancelled: bool }
+
+pub async fn cancel_user(State(st): State<AuthState>, Json(req): Json<CancelReq>) -> Response {
+    let conn = st.db.lock().unwrap();
+    // 注销启用中的唯一管理员会锁死后台，拒绝。
+    if req.cancelled {
+        if let Ok(Some(u)) = store::find_user_by_id(&conn, req.user_id) {
+            if u.is_admin && !u.disabled && !u.cancelled && store::count_admins(&conn).unwrap_or(0) <= 1 {
+                return json_error(StatusCode::BAD_REQUEST, "last_admin", None);
+            }
+        }
+    }
+    if store::set_cancelled(&conn, req.user_id, req.cancelled).is_err() {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", None);
+    }
+    if req.cancelled {
+        let _ = store::delete_sessions_except(&conn, req.user_id, None); // 立即踢下线
+    }
+    Json(json!({"ok": true})).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct DeleteReq { pub user_id: i64 }
+
+pub async fn delete_user(State(st): State<AuthState>, Json(req): Json<DeleteReq>) -> Response {
+    let mut conn = st.db.lock().unwrap();
+    let u = match store::find_user_by_id(&conn, req.user_id) {
+        Ok(Some(u)) => u,
+        _ => return json_error(StatusCode::NOT_FOUND, "user_not_found", None),
+    };
+    // 末位管理员保护。
+    if u.is_admin && !u.disabled && !u.cancelled && store::count_admins(&conn).unwrap_or(0) <= 1 {
+        return json_error(StatusCode::BAD_REQUEST, "last_admin", None);
+    }
+    // 已激活且未注销 → 必须先注销。
+    if u.expires_at.is_some() && !u.cancelled {
+        return json_error(StatusCode::BAD_REQUEST, "must_cancel_first", None);
+    }
+    if store::delete_user(&mut conn, req.user_id).is_err() {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", None);
+    }
     Json(json!({"ok": true})).into_response()
 }
 
