@@ -134,6 +134,28 @@ pub async fn set_admin(State(st): State<AuthState>, Json(req): Json<SetAdminReq>
     }
 }
 
+#[derive(Deserialize)]
+pub struct ResetPasswordReq { pub user_id: i64, pub new_password: String }
+
+pub async fn reset_password(State(st): State<AuthState>, Json(req): Json<ResetPasswordReq>) -> Response {
+    if req.new_password.chars().count() < 6 {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_password", None);
+    }
+    let new_hash = match super::password::hash(&req.new_password) {
+        Ok(h) => h,
+        Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "hash_failed", None),
+    };
+    let conn = st.db.lock().unwrap();
+    if !matches!(store::find_user_by_id(&conn, req.user_id), Ok(Some(_))) {
+        return json_error(StatusCode::NOT_FOUND, "user_not_found", None);
+    }
+    if store::update_password(&conn, req.user_id, &new_hash).is_err() {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", None);
+    }
+    let _ = store::delete_sessions_except(&conn, req.user_id, None);
+    Json(json!({"ok": true})).into_response()
+}
+
 pub async fn admin_page() -> axum::response::Html<&'static str> {
     axum::response::Html(ADMIN_HTML)
 }
