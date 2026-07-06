@@ -113,6 +113,22 @@ pub fn validate(cfg: &PushConfig) -> Result<()> {
     Ok(())
 }
 
+/// 覆盖用户不可控字段：缓存目录固定为服务端默认，杜绝路径滥用。
+pub fn harden(cfg: &mut PushConfig) {
+    cfg.channel.cache_dir = default_cache_dir();
+}
+
+/// 要求 cron 秒位为固定数字（拒绝 * / 范围 / 列表 / 步进），避免每秒级狂刷。
+pub fn require_fixed_seconds(cron: &str) -> Result<()> {
+    let sec = cron.split_whitespace().next().unwrap_or("");
+    if sec.is_empty() || !sec.chars().all(|c| c.is_ascii_digit()) {
+        return Err(anyhow!(
+            "cron 秒位必须为固定值（不支持 * 或范围），以避免过于频繁的推送，当前为 '{sec}'"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +261,22 @@ webhook = "https://x"
 "#;
         let cfg: PushConfig = toml::from_str(t).unwrap();
         assert!(validate(&cfg).unwrap_err().to_string().contains("至少配置一项"));
+    }
+
+    #[test]
+    fn harden_forces_cache_dir() {
+        let mut c = default_config();
+        c.channel.cache_dir = PathBuf::from("/etc/evil");
+        harden(&mut c);
+        assert_eq!(c.channel.cache_dir, default_cache_dir());
+    }
+
+    #[test]
+    fn fixed_seconds_accepts_and_rejects() {
+        assert!(require_fixed_seconds("0 30 8 * * *").is_ok());
+        assert!(require_fixed_seconds("30 0 12 * * *").is_ok());
+        for bad in ["* 30 8 * * *", "*/5 30 8 * * *", "0-30 0 8 * * *", "1,2 0 8 * * *", ""] {
+            assert!(require_fixed_seconds(bad).is_err(), "应拒绝 {bad}");
+        }
     }
 }
