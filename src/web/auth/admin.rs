@@ -264,13 +264,19 @@ async function ov(){const j=await api('/api/admin/overview');if(j)document.getEl
 async function gen(){const days=+document.getElementById('days').value,count=+document.getElementById('count').value;const j=await api('/api/admin/codes','POST',{days,count});document.getElementById('newcodes').textContent=(j.codes||[]).join('\n');loadCodes('unused');}
 async function loadCodes(f){const j=await api('/api/admin/codes?filter='+f);const tb=document.querySelector('#codes tbody');tb.innerHTML='';(j||[]).forEach(c=>{const st=c.revoked?'已作废':(c.used_by?'已用':'未用');tb.innerHTML+=`<tr><td><code>${c.code}</code></td><td>${c.days}</td><td>${c.used_by||''}</td><td>${st}</td><td>${c.used_by||c.revoked?'':`<button onclick="revoke('${c.code}')">作废</button>`}</td></tr>`;});}
 async function revoke(code){await api('/api/admin/codes/revoke','POST',{code});loadCodes('unused');}
-async function loadUsers(){const j=await api('/api/admin/users');const tb=document.querySelector('#users tbody');tb.innerHTML='';(j.users||[]).forEach(u=>{tb.innerHTML+=`<tr><td>${u.id}</td><td>${u.username}${u.is_admin?' 👑':''}</td><td>${u.status}${u.disabled?' (封禁)':''}</td><td>${u.expires_at||'—'}</td><td>
+async function loadUsers(){const j=await api('/api/admin/users');const tb=document.querySelector('#users tbody');tb.innerHTML='';(j.users||[]).forEach(u=>{tb.innerHTML+=`<tr><td>${u.id}</td><td>${u.username}${u.is_admin?' 👑':''}</td><td>${u.status}${u.disabled?' (封禁)':''}${u.cancelled?' (已注销)':''}</td><td>${u.expires_at||'—'}</td><td>
   <input type="number" value="30" style="width:64px" id="d${u.id}"><button onclick="ext(${u.id})">续期</button>
   <button onclick="dis(${u.id},${!u.disabled})">${u.disabled?'解封':'封禁'}</button>
-  <button onclick="adm(${u.id},${!u.is_admin})">${u.is_admin?'撤管理':'设管理'}</button></td></tr>`;});}
+  <button onclick="adm(${u.id},${!u.is_admin})">${u.is_admin?'撤管理':'设管理'}</button>
+  <button onclick="rst(${u.id})">重置密码</button>
+  <button onclick="cxl(${u.id},${!u.cancelled})">${u.cancelled?'恢复':'注销'}</button>
+  <button onclick="del(${u.id})">删除</button></td></tr>`;});}
 async function ext(id){const days=+document.getElementById('d'+id).value;await api('/api/admin/users/extend','POST',{user_id:id,days});loadUsers();ov();}
 async function dis(id,d){await api('/api/admin/users/disable','POST',{user_id:id,disabled:d});loadUsers();}
 async function adm(id,a){await api('/api/admin/users/set_admin','POST',{user_id:id,is_admin:a});loadUsers();}
+async function rst(id){const p=prompt('输入新密码（至少6位）');if(!p)return;if(p.length<6){alert('至少6位');return;}const j=await api('/api/admin/users/reset_password','POST',{user_id:id,new_password:p});if(j&&j.ok){alert('已重置该用户密码');}else{alert('失败: '+((j&&j.error)||''));}}
+async function cxl(id,c){const j=await api('/api/admin/users/cancel','POST',{user_id:id,cancelled:c});if(j&&j.error==='last_admin'){alert('不能注销唯一管理员');}loadUsers();}
+async function del(id){if(!confirm('确认删除该账号？此操作不可恢复'))return;const j=await api('/api/admin/users/delete','POST',{user_id:id});if(j&&j.error){alert(({must_cancel_first:'请先注销该已激活账号',last_admin:'不能删除唯一管理员',user_not_found:'用户不存在'})[j.error]||('删除失败: '+j.error));}loadUsers();ov();}
 async function loadPushHistory(){const j=await api('/api/admin/push-history');const tb=document.querySelector('#pushhist tbody');tb.innerHTML='';(j||[]).forEach(function(r){tb.innerHTML+=`<tr><td>${r.created_at}</td><td>${r.summary}</td><td><button onclick="showPush(${r.id})">详情</button></td></tr>`;});}
 async function showPush(id){const r=await fetch('/api/admin/push-history/'+id);if(!r.ok){return;}const j=await r.json();const el=document.getElementById('pushdetail');el.style.display='block';el.textContent=JSON.stringify(j,null,2);}
 ov();loadCodes('unused');loadUsers();loadPushHistory();
