@@ -10,11 +10,53 @@ CREATE TABLE IF NOT EXISTS push_configs (
   config_json TEXT NOT NULL,
   updated_at  TEXT NOT NULL
 );
+
+-- 守护进程心跳。单行表（id 恒为 1）。
+--
+-- 为什么需要它：推送守护是**独立进程**（xlh-push 容器，compose 里还是可选 profile）。
+-- 没有它，Web 上改 cron、点保存、看到「已保存」，一切都像正常 —— 但根本没有进程在读配置，
+-- 于是永远不会推送，而用户完全无从知晓。这种静默失败最伤人。
+-- 有了心跳，Web 就能直接告诉他「守护没在跑，配置存了也不会推」。
+CREATE TABLE IF NOT EXISTS push_heartbeat (
+  id      INTEGER PRIMARY KEY CHECK (id = 1),
+  beat_at TEXT NOT NULL
+);
 "#;
 
+/// 心跳超过这个秒数就判定守护已死。守护每 60s 一跳，取 3 倍余量避免误报。
+pub const HEARTBEAT_STALE_SECS: i64 = 180;
+
 pub fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SCHEMA).context("建 push_configs 表失败")?;
+    conn.execute_batch(SCHEMA).context("建 push_configs / push_heartbeat 表失败")?;
     Ok(())
+}
+
+/// 守护进程每轮调用一次，宣告自己还活着。
+pub fn beat(conn: &Connection) -> Result<()> {
+    let now = chrono::Local::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO push_heartbeat (id, beat_at) VALUES (1, ?1)
+         ON CONFLICT(id) DO UPDATE SET beat_at = ?1",
+        rusqlite::params![now],
+    )?;
+    Ok(())
+}
+
+/// 最近一次心跳时刻。守护从未跑过 → `None`。
+pub fn last_beat(conn: &Connection) -> Result<Option<chrono::DateTime<chrono::Local>>> {
+    let s: Option<String> = conn
+        .query_row("SELECT beat_at FROM push_heartbeat WHERE id = 1", [], |r| r.get(0))
+        .optional()?;
+    Ok(s.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|t| t.with_timezone(&chrono::Local)))
+}
+
+/// 守护是否活着（心跳在 `HEARTBEAT_STALE_SECS` 内）。
+pub fn daemon_alive(conn: &Connection, now: chrono::DateTime<chrono::Local>) -> bool {
+    match last_beat(conn) {
+        Ok(Some(t)) => (now - t).num_seconds() <= HEARTBEAT_STALE_SECS,
+        _ => false,
+    }
 }
 
 pub fn upsert(conn: &Connection, user_id: i64, cfg: &PushConfig) -> Result<()> {
@@ -74,6 +116,60 @@ pub fn migrate_legacy_push(conn: &Connection, path: &std::path::Path) -> Result<
         Err(e) => eprintln!("旧 push.toml 解析失败，跳过导入：{e}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+    use chrono::Duration;
+
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        crate::web::auth::store::migrate(&c).unwrap();
+        migrate(&c).unwrap();
+        c
+    }
+
+    /// 守护从未跑过 → 必须判定为「未运行」。
+    ///
+    /// 这是最要命的一种情况：推送守护是可选容器，很多人只部署了 Web。
+    /// 若这里错判成「活着」，用户会继续以为是 cron 不生效，永远找不到真正的原因。
+    #[test]
+    fn never_started_means_dead() {
+        let c = db();
+        assert_eq!(last_beat(&c).unwrap(), None);
+        assert!(!daemon_alive(&c, chrono::Local::now()), "从未心跳过 → 必须判定为未运行");
+    }
+
+    #[test]
+    fn fresh_beat_means_alive() {
+        let c = db();
+        beat(&c).unwrap();
+        let now = chrono::Local::now();
+        assert!(last_beat(&c).unwrap().is_some());
+        assert!(daemon_alive(&c, now));
+    }
+
+    /// 守护挂了（容器被杀 / 崩溃）→ 心跳变陈旧 → 必须判定为已死。
+    #[test]
+    fn stale_beat_means_dead() {
+        let c = db();
+        beat(&c).unwrap();
+        let now = chrono::Local::now();
+        // 守护每 60s 一跳；容忍 180s。刚过阈值 → 死
+        assert!(daemon_alive(&c, now + Duration::seconds(HEARTBEAT_STALE_SECS)), "阈值内仍算活");
+        assert!(!daemon_alive(&c, now + Duration::seconds(HEARTBEAT_STALE_SECS + 1)),
+                "超过 {HEARTBEAT_STALE_SECS}s 无心跳 → 必须判定为已死");
+    }
+
+    /// 心跳是单行表：反复 beat 只更新，不堆积。
+    #[test]
+    fn beat_is_idempotent_single_row() {
+        let c = db();
+        for _ in 0..5 { beat(&c).unwrap(); }
+        let n: i64 = c.query_row("SELECT count(*) FROM push_heartbeat", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "心跳表恒为单行");
+    }
 }
 
 #[cfg(test)]

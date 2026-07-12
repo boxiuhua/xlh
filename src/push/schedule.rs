@@ -41,12 +41,24 @@ fn user_allowed(conn: &Connection, uid: i64, today: chrono::NaiveDate, warn: i64
 }
 
 /// 多租户守护：每 60s 一轮，对窗口内到点且授权放行的用户投递。单用户失败仅记日志。
+///
+/// 每轮都重新 `list_all(conn)` —— 所以在 Web 上改完 cron **无需重启**，下一轮即生效。
+/// （已实测：守护运行期间改 cron，它按新表达式触发。）
+///
+/// 每轮也写一次心跳。这不是锦上添花：推送守护是**独立进程**（可选的 xlh-push 容器），
+/// 没启动时 Web 上一切看着正常（配置能存、提示「已保存」），却永远不会推送。
+/// 心跳让 Web 能明确告诉用户「守护没在跑」，把这个静默失败变成可见的。
 pub fn run_multi(conn: &Connection, warn: i64, grace: i64) -> Result<()> {
     println!("多用户推送守护已启动（Ctrl+C 退出）");
+    // 启动即先跳一次，别让 Web 在头 60 秒里误报「未运行」
+    if let Err(e) = super::store::beat(conn) { eprintln!("写心跳失败：{e}"); }
+
     let mut last_tick = Local::now();
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
         let now = Local::now();
+        if let Err(e) = super::store::beat(conn) { eprintln!("写心跳失败：{e}"); }
+
         let all = super::store::list_all(conn).unwrap_or_default();
         let crons: Vec<(i64, String)> = all.iter().map(|(u, c)| (*u, c.schedule.cron.clone())).collect();
         for uid in due_users(&crons, last_tick, now) {

@@ -309,6 +309,9 @@ xlhMe();
 
   <!-- 推送 -->
   <div class="panel" id="panel-push">
+    <!-- 推送为什么不触发。守护是独立进程（可选容器），没启动时配置能存、能提示「已保存」，
+         但永远不会推 —— 而用户只会以为是 cron 不生效。这里把它挑明。 -->
+    <div id="pu-status" style="margin-bottom:12px"></div>
     <div class="card">
       <div class="row">
         <div class="field"><label>渠道</label>
@@ -1444,8 +1447,8 @@ function puPost(url, okMsg, btn, onOk){
 }
 document.getElementById('pu-add-fund').addEventListener('click', function(){ puFundRow(); });
 document.getElementById('pu-add-stock').addEventListener('click', function(){ puStockRow(); });
-document.getElementById('pu-load').addEventListener('click', loadPushConfig);
-document.getElementById('pu-save').addEventListener('click', function(){ puPost('/api/push/config', '已保存到数据库', this); });
+document.getElementById('pu-load').addEventListener('click', function(){ loadPushConfig(); loadPushStatus(); });
+document.getElementById('pu-save').addEventListener('click', function(){ puPost('/api/push/config', '已保存到数据库', this, function(){ document.getElementById('pu-msg').innerHTML='<span style="color:#1a7f37">已保存到数据库</span>'; loadPushStatus(); }); });
 document.getElementById('pu-preview').addEventListener('click', function(){
   var box=document.getElementById('pu-preview-box'), msg=document.getElementById('pu-msg');
   msg.textContent='组装预览中…（首次联网抓取，请稍候）';
@@ -1461,7 +1464,52 @@ document.getElementById('pu-test').addEventListener('click', function(){
     msg.innerHTML = d.ok ? '<span style="color:#1a7f37">推送成功</span>' : '<span style="color:#c0392b">推送失败：'+esc(d.error||'')+'</span>';
   });
 });
+// ===== 推送状态：把「为什么没推送」直接摆出来 =====
+//
+// 真实踩过的坑：推送守护是独立进程（compose 里是可选 profile）。它没启动时，
+// 改 cron、点保存、看到「已保存」—— 一切都像正常，但根本没有进程在读配置。
+// 用户只会以为是「cron 不生效」，而实际上连读配置的人都没有。
+function renderPushStatus(s){
+  var box = document.getElementById('pu-status');
+  if(!s){ box.innerHTML = ''; return; }
+
+  var head;
+  if(s.daemon_alive){
+    var t = s.last_beat ? new Date(s.last_beat).toLocaleTimeString('zh-CN') : '-';
+    head = '<div style="padding:10px 12px;border-radius:8px;background:#eef7f0;border-left:4px solid #1a7f37;color:#1a5c2a">'
+      + '<strong>✓ 推送守护运行中</strong><span style="color:#5a6a7a"> · 最近心跳 '+esc(t)+'</span>'
+      + (s.next_fire ? '<div style="margin-top:4px;color:#34495e">下次触发：<strong>'
+          + esc(new Date(s.next_fire).toLocaleString('zh-CN')) + '</strong>（cron <code>'+esc(s.cron||'')+'</code>）</div>' : '')
+      + '</div>';
+  } else {
+    head = '<div style="padding:10px 12px;border-radius:8px;background:#fdecea;border-left:4px solid #c0392b;color:#8a2418">'
+      + '<strong>✗ 推送守护未运行 —— 无论 cron 怎么改，都不会推送</strong>'
+      + '<div style="margin-top:6px;color:#5a3028">它是独立进程（可选容器）。配置能存下来，但没有进程去读它。启动：</div>'
+      + '<pre style="margin-top:6px;padding:8px;background:#fff;border-radius:6px;overflow-x:auto;color:#34495e">'
+      + 'docker compose -f docker-compose.prod.yml --profile push up -d</pre>'
+      + '</div>';
+  }
+
+  // 守护活着，但仍有别的静默拦截点（webhook 空 / 仅有新数据时推）
+  var others = (s.blockers||[]).filter(function(b){ return b.indexOf('守护进程未运行') < 0; });
+  var extra = others.length
+    ? '<div style="margin-top:8px;padding:10px 12px;border-radius:8px;background:#fffbf0;border-left:4px solid #b8860b;color:#5a4a1a">'
+      + '<strong>还有这些会让推送不发出：</strong><ul style="margin:6px 0 0 18px;line-height:1.7">'
+      + others.map(function(b){ return '<li>'+esc(b)+'</li>'; }).join('')
+      + '</ul></div>'
+    : '';
+
+  box.innerHTML = head + extra;
+}
+function loadPushStatus(){
+  fetch('/api/push/status')
+    .then(function(r){ return r.ok ? r.json() : null; })
+    .then(renderPushStatus)
+    .catch(function(){ document.getElementById('pu-status').innerHTML = ''; });
+}
+
 loadPushConfig();
+loadPushStatus();
 </script>
 </body>
 </html>

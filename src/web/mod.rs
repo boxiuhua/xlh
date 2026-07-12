@@ -289,6 +289,7 @@ where
 fn push_user_routes() -> Router<auth::AuthState> {
     Router::new()
         .route("/api/push/config", get(push_config_get).post(push_config_save))
+        .route("/api/push/status", get(push_status))
         .route("/api/push/preview", post(push_preview))
         .route("/api/push/test", post(push_test))
 }
@@ -690,6 +691,62 @@ async fn push_config_get(
     }
     .unwrap_or_else(crate::push::config::default_config);
     axum::Json(cfg)
+}
+
+/// 推送为什么可能不触发 —— 把静默失败变成可见的。
+///
+/// 真实踩过的坑：推送守护是**独立进程**（compose 里还是可选 profile）。它没启动时，
+/// Web 上改 cron、点保存、提示「已保存」，一切都像正常 —— 但根本没有进程在读配置，
+/// 于是永远不会推送，而用户完全无从知晓，只会以为「cron 不生效」。
+///
+/// 除守护未运行外，还有两个同样静默的拦截点：webhook 没填、以及
+/// `only_on_new_data=true` 且当天无新行情（周末/节假日的正常行为，但用户会当成故障）。
+/// 这个接口把三者一并说清。
+async fn push_status(
+    axum::extract::State(st): axum::extract::State<auth::AuthState>,
+    axum::Extension(user): axum::Extension<auth::CurrentUser>,
+) -> axum::Json<serde_json::Value> {
+    let now = chrono::Local::now();
+    let conn = st.db.lock().unwrap();
+
+    let alive = crate::push::store::daemon_alive(&conn, now);
+    let last_beat = crate::push::store::last_beat(&conn).ok().flatten()
+        .map(|t| t.to_rfc3339());
+    let cfg = crate::push::store::get(&conn, user.id).ok().flatten();
+
+    let mut blockers: Vec<String> = Vec::new();
+    if !alive {
+        blockers.push(
+            "推送守护进程未运行 —— 配置保存了也不会推送。\
+             启动：docker compose -f docker-compose.prod.yml --profile push up -d".into());
+    }
+    if let Some(c) = &cfg {
+        if c.channel.webhook.trim().is_empty() {
+            blockers.push("未填 webhook / sendkey —— 无处可发。".into());
+        }
+        if c.schedule.only_on_new_data {
+            blockers.push(
+                "已勾选「仅有新数据时推」：当天若无新净值/行情（周末、节假日、或当天已同步过），\
+                 cron 到点也会静默跳过。想每次都推请关掉它。".into());
+        }
+        let next = crate::push::schedule::next_after(&c.schedule.cron, &now)
+            .map(|t| t.to_rfc3339()).ok();
+        return axum::Json(serde_json::json!({
+            "daemon_alive": alive,
+            "last_beat": last_beat,
+            "cron": c.schedule.cron,
+            "next_fire": next,
+            "blockers": blockers,
+        }));
+    }
+
+    axum::Json(serde_json::json!({
+        "daemon_alive": alive,
+        "last_beat": last_beat,
+        "cron": null,
+        "next_fire": null,
+        "blockers": blockers,
+    }))
 }
 
 async fn push_config_save(
