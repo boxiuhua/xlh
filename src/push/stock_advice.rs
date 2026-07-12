@@ -1,8 +1,26 @@
-//! 股票持仓建议：由 stock::diagnose 的技术信号 + 持仓，套用与基金一致的动作/金额启发式。
+//! 股票持仓建议：由 stock::diagnose 的技术信号 + 持仓，套用启发式动作/金额。
+//!
+//! ⚠ 尚未做过前瞻检验。
+//!
+//! 基金侧同款的择时金额已被移除 —— 我们对基金的 ±σ 波动带做了事件研究，发现它在
+//! 每一只测试基金上都跑不赢"随便哪天买"（超额 −0.7% ~ −2.1%），故不再据此给金额
+//! （见 `holdings` 模块文档）。
+//!
+//! 股票侧这套（均线/MACD/RSI 技术信号）**是另一个信号，尚未被同样地检验过**，
+//! 所以这里暂时保留。但它同样没有证据支持，`size_pct` 的 10%~30% 也同样是拍脑袋的
+//! 魔数。在做完同样的前瞻检验之前，不应把这些金额当作有依据的建议。
 use serde::Serialize;
 
-use crate::holdings::{Holding, round_yuan, size_pct};
+use crate::holdings::{Holding, round_yuan};
 use crate::stock::diagnose::StockDiagnosis;
+
+/// 加仓/减仓比例：随信号强度 |z| 放大，clamp 到 [10%, 30%]。
+///
+/// 这几个数字（0.10 起、每 1σ 加 10%、上限 30%）是**经验取值，没有推导也没有回测支撑**。
+/// 原本基金侧也用它，但基金的择时信号已被证伪并移除；此处保留仅因股票信号尚未检验。
+pub fn size_pct(z_abs: f64) -> f64 {
+    (0.10 + 0.10 * z_abs.min(2.0)).clamp(0.10, 0.30)
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StockAdvice {

@@ -209,7 +209,8 @@ mod push_history_tests {
                 generated: "2026-07-05".into(),
                 summary: PortfolioSummary {
                     total_amount: 0.0, total_profit: None, cumulative_profit: None,
-                    holding_count: 0, total_add: 0.0, total_trim: 0.0, concentration_note: String::new(),
+                    holding_count: 0, total_trim: 0.0, concentration_note: String::new(),
+                    timing_disclosure: String::new(),
                 },
                 advices: vec![], skipped: vec![], disclaimer: String::new(),
             },

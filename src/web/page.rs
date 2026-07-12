@@ -132,7 +132,7 @@ xlhMe();
     <button class="tab" data-tab="optimize">寻优</button>
     <button class="tab" data-tab="diagnose">诊断</button>
     <button class="tab" data-tab="recommend">推荐</button>
-    <button class="tab" data-tab="holdings">持仓建议</button>
+    <button class="tab" data-tab="holdings">持仓概览</button>
     <button class="tab" data-tab="push">推送</button>
   </div>
   <div class="tabs" id="tabs-stock" style="display:none">
@@ -283,7 +283,7 @@ xlhMe();
     </div>
   </div>
 
-  <!-- 持仓建议 -->
+  <!-- 持仓概览 -->
   <div class="panel" id="panel-holdings">
     <div class="card">
       <div class="row">
@@ -293,7 +293,7 @@ xlhMe();
       </div>
       <div id="hd-rows" style="margin-top:14px"></div>
       <button class="small" id="hd-add">+ 添加持仓</button>
-      <button class="run" id="run-holdings">生成建议</button>
+      <button class="run" id="run-holdings">生成概览</button>
       <div class="hint" style="margin-top:8px">按你的实际持仓，逐只多策略样本外评估 + 当下择时，给出加仓/持有/减仓/止盈/观望及建议金额。首次联网抓取净值较慢，命中缓存后秒级。</div>
       <div id="hd-result" style="margin-top:14px"></div>
       <div id="hd-save-wrap" style="margin-top:10px;display:none">
@@ -879,9 +879,13 @@ document.getElementById('run-recommend').addEventListener('click', function(){
     .finally(function(){ setBtn(btn, false, '生成推荐'); });
 });
 
-// ===== 持仓建议 =====
+// ===== 持仓概览 =====
+//
+// 这里曾经渲染「加仓 1200 元」这类醒目的红色金额徽章。那些金额完全由诊断页的 ±σ 波动带
+// 驱动，而该信号经前瞻检验在每一只测试基金上都跑不赢「随便哪天买」。故不再渲染择时金额；
+// 唯一还会出现的金额是「减仓(集中度)」—— 那是风险规则，不预测涨跌。
 function money(x){ return (x==null) ? '-' : Number(x).toLocaleString('zh-CN',{maximumFractionDigits:0}); }
-function hdActionColor(a){ if(a==='加仓') return '#c0392b'; if(a==='减仓'||a==='止盈') return '#27ae60'; return '#7f8c8d'; }
+function hdActionColor(a){ return (a && a.indexOf('减仓')>=0) ? '#27ae60' : '#7f8c8d'; }
 function hdTimingLines(a){
   var p = a.regime && a.regime.plan;
   if(!p) return '';
@@ -890,13 +894,25 @@ function hdTimingLines(a){
 function hdCard(a){
   var ac = hdActionColor(a.action);
   var b = a.best_strategy || {};
-  var amtTxt = a.suggest_amount>0 ? ' '+money(a.suggest_amount)+' 元' : '';
+  var amtTxt = (a.suggest_amount!=null && a.suggest_amount>0) ? ' '+money(a.suggest_amount)+' 元' : '';
+  // 该基金那条线的历史超额：为负则红字点明「没跑赢随便买」
+  var edge = a.timing_edge;
+  var edgeHtml = (edge==null)
+    ? '<div style="margin-top:6px;color:#5a6a7a">'+esc(a.timing_note||'')+'</div>'
+    : '<div style="margin-top:6px;padding:6px 8px;border-radius:6px;background:'
+      + (edge<=0 ? '#fdecea' : '#fffbf0') + ';color:'+(edge<=0 ? '#c0392b' : '#5a4a1a')+'">'
+      + '低吸线历史超额 <strong>'+(edge>=0?'+':'')+edge.toFixed(2)+'%</strong>'
+      + (edge<=0 ? '（没跑赢「随便哪天买」）' : '')
+      + '<div style="margin-top:2px;font-size:.88rem">'+esc(a.timing_note||'')+'</div></div>';
+
   return '<div class="card" style="border-left:4px solid '+ac+'">'
     + '<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">'
     + '<span style="font-size:1.1rem;font-weight:700">'+esc(a.name)+'</span><span style="color:#7f8c8d">'+esc(a.code)+'</span>'
-    + '<span style="margin-left:auto;font-size:1.05rem;font-weight:700;background:#fdecea;color:'+ac+';padding:2px 12px;border-radius:12px">'+esc(a.action)+amtTxt+'</span></div>'
+    + '<span style="margin-left:auto;font-size:1.05rem;font-weight:700;background:#f0f2f5;color:'+ac+';padding:2px 12px;border-radius:12px">'+esc(a.action)+amtTxt+'</span></div>'
     + '<div style="margin-top:8px;color:#34495e">持仓 '+money(a.amount)+' 元 · 收益 '+money(a.profit)+' 元 · 权重 '+(a.weight*100).toFixed(1)+'%</div>'
-    + '<div style="margin-top:6px;color:#34495e">择时：<strong style="color:'+ac+'">'+esc(a.signal||'-')+'</strong> · 形态 '+esc((a.regime&&a.regime.regime)||'-')+hdTimingLines(a)+'</div>'
+    + '<div style="margin-top:6px;color:#34495e">形态 '+esc((a.regime&&a.regime.regime)||'-')
+    +   '｜波动带信号 <span style="color:#7f8c8d">'+esc(a.signal||'-')+'（仅描述，不驱动金额）</span>'+hdTimingLines(a)+'</div>'
+    + edgeHtml
     + '<div style="margin-top:6px;color:#34495e">最优策略：<strong>'+esc(b.name||'-')+'</strong> · 样本外 收益 '+pct(b.oos_return||0)+' · 夏普 '+(b.oos_sharpe||0).toFixed(2)+' · 回撤 '+pct(b.oos_mdd||0)+'</div>'
     + '<div style="margin-top:6px;color:#5a6a7a">'+esc(a.rationale)+'</div></div>';
 }
@@ -909,8 +925,13 @@ function renderHoldings(rep){
   if(s.cumulative_profit!=null) sumLine += ' · 累计收益 '+money(s.cumulative_profit)+' 元';
   parts.push('<div class="card" style="margin-top:0"><div style="font-size:1.1rem;font-weight:600">组合汇总</div>'
     + '<div style="margin-top:8px;color:#34495e">'+esc(sumLine)+'</div>'
-    + '<div style="margin-top:6px;color:#34495e">合计建议：加仓 <strong style="color:#c0392b">'+money(s.total_add)+'</strong> 元 · 减仓/止盈 <strong style="color:#27ae60">'+money(s.total_trim)+'</strong> 元</div>'
+    + (s.total_trim>0
+        ? '<div style="margin-top:6px;color:#34495e">集中度减仓合计 <strong style="color:#27ae60">'+money(s.total_trim)+'</strong> 元<span style="color:#7f8c8d">（风险规则，非择时）</span></div>'
+        : '')
     + (s.concentration_note ? '<div style="margin-top:6px;color:#c0392b">'+esc(s.concentration_note)+'</div>' : '')
+    // 不说清为什么没有「加仓 X 元」了，用户会以为功能坏了
+    + '<div style="margin-top:10px;padding:8px 10px;background:#fffbf0;border-left:4px solid #b8860b;color:#5a4a1a;font-size:.9rem">'
+    +   esc(s.timing_disclosure||'') + '</div>'
     + '</div>');
   if(!rep.advices.length){
     var sk = (rep.skipped&&rep.skipped.length) ? '（跳过 '+rep.skipped.length+' 只：'+esc(rep.skipped.join(', '))+'）' : '';
@@ -952,7 +973,7 @@ document.getElementById('run-holdings').addEventListener('click', function(){
   var t = document.getElementById('hd-total').value.trim(); if(t!=='') payload.total_amount = Number(t);
   var pf = document.getElementById('hd-profit').value.trim(); if(pf!=='') payload.total_profit = Number(pf);
   var cu = document.getElementById('hd-cum').value.trim(); if(cu!=='') payload.cumulative_profit = Number(cu);
-  setBtn(btn, true, '生成建议');
+  setBtn(btn, true, '生成概览');
   document.getElementById('hd-result').textContent = '分析中…（首次联网抓取，请稍候）';
   fetch('/api/holdings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)})
     .then(function(res){ if(!res.ok) return res.text().then(function(x){ throw new Error(x); }); return res.json(); })
@@ -963,7 +984,7 @@ document.getElementById('run-holdings').addEventListener('click', function(){
       document.getElementById('hd-save-msg').textContent = '';
     })
     .catch(function(e){ document.getElementById('hd-result').innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
-    .finally(function(){ setBtn(btn, false, '生成建议'); });
+    .finally(function(){ setBtn(btn, false, '生成概览'); });
 });
 
 document.getElementById('hd-save').addEventListener('click', function(){

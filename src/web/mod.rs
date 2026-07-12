@@ -1235,7 +1235,7 @@ mod tests {
             .await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
-        for m in ["data-tab=\"holdings\"", "持仓建议", "id=\"panel-holdings\"", "id=\"run-holdings\"",
+        for m in ["data-tab=\"holdings\"", "持仓概览", "id=\"panel-holdings\"", "id=\"run-holdings\"",
                   "/api/holdings", "renderHoldings"] {
             assert!(body.contains(m), "首页应含 {m}");
         }

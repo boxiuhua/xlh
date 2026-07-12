@@ -60,21 +60,29 @@ pub fn compose(
 ) -> String {
     let mut s = String::new();
 
-    // 基金持仓建议
-    s.push_str("## 基金持仓建议\n");
+    // 基金持仓概览
+    s.push_str("## 基金持仓概览\n");
     let sm = &fund.summary;
     s.push_str(&format!("**组合汇总**：总持仓 {} 元 · 持仓 {} 只", fmt0(sm.total_amount), sm.holding_count));
     if let Some(p) = sm.total_profit { s.push_str(&format!(" · 持有收益 {} 元", fmt0(p))); }
     if let Some(p) = sm.cumulative_profit { s.push_str(&format!(" · 累计收益 {} 元", fmt0(p))); }
     s.push('\n');
-    s.push_str(&format!("合计建议：加仓 {} 元 · 减仓/止盈 {} 元\n", fmt0(sm.total_add), fmt0(sm.total_trim)));
+    if sm.total_trim > 0.0 {
+        s.push_str(&format!("集中度减仓合计：{} 元（风险规则，非择时）\n", fmt0(sm.total_trim)));
+    }
     if !sm.concentration_note.is_empty() { s.push_str(&format!("> {}\n", sm.concentration_note)); }
+    // 为什么不再给择时金额 —— 不说清楚，用户会以为功能坏了
+    s.push_str(&format!("> {}\n", sm.timing_disclosure));
     s.push('\n');
     for a in &fund.advices {
-        let amt = if a.suggest_amount > 0.0 { format!(" {} 元", fmt0(a.suggest_amount)) } else { String::new() };
+        let amt = match a.suggest_amount {
+            Some(v) if v > 0.0 => format!(" {} 元", fmt0(v)),
+            _ => String::new(),
+        };
         s.push_str(&format!("**{} {}** — **{}{}**\n", a.name, a.code, a.action, amt));
         s.push_str(&format!("- 持仓 {} 元 · 收益 {} 元 · 权重 {:.1}%\n", fmt0(a.amount), fmt0(a.profit), a.weight * 100.0));
-        s.push_str(&format!("- 择时：{} · 形态 {}{}\n", a.signal, a.regime.regime, timing_line(&a.regime)));
+        s.push_str(&format!("- 形态 {}｜波动带信号 {}（仅描述）{}\n", a.regime.regime, a.signal, timing_line(&a.regime)));
+        s.push_str(&format!("- {}\n", a.timing_note));
         let b = &a.best_strategy;
         s.push_str(&format!("- 最优策略 {}：样本外 收益 {:.1}% · 夏普 {:.2} · 回撤 {:.1}%\n\n",
             b.name, b.oos_return * 100.0, b.oos_sharpe, b.oos_mdd * 100.0));
@@ -225,7 +233,7 @@ mod tests {
             &Holding { code: "600519".into(), amount: 20000.0, profit: 1500.0 }, &stock_diag())];
         let sync = vec![SyncNote { code: "000001".into(), added: 3, latest: Some("2026-07-01".into()), error: None }];
         let md = compose(&rep, &[], &adv, &[stock_diag()], None, &sync);
-        assert!(md.contains("## 基金持仓建议"));
+        assert!(md.contains("## 基金持仓概览"));
         assert!(md.contains("## 股票持仓建议"));
         assert!(md.contains("贵州茅台"));
         assert!(md.contains("## 股票诊断"));
