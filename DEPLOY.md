@@ -115,6 +115,39 @@ WITH_PUSH=1 scripts/deploy.sh user@host
 
 ---
 
+## 从旧版本升级（数据在部署目录里的那种）
+
+旧版把数据放在部署目录内（`/opt/xlh/data`）。新版挪到了 `$XLH_STATE_DIR`（`/srv/xlh-state`）。
+
+**不迁移的话，服务能正常起来，但所有账号都登不上** —— 因为新目录是空的，容器建了个全新的空库。
+数据没丢，只是没人去读它。这种「看起来是数据丢了、其实是读错了地方」的失败最难排查。
+
+`scripts/deploy.sh` 会自动检测并询问是否迁移。手工迁移：
+
+```bash
+# 服务器上
+cd /opt/xlh
+docker compose -f docker-compose.prod.yml down
+
+mkdir -p /srv/xlh-state/{data,cache,output,backups}
+
+# 必须用 .backup，不能 cp —— 库在 WAL 模式下，数据可能几乎全在 -wal 里
+sqlite3 /opt/xlh/data/xlh.db ".backup '/srv/xlh-state/data/xlh.db'"
+
+# 缓存可再生，但重抓很慢，一并搬
+cp -r /opt/xlh/.cache/. /srv/xlh-state/cache/
+
+# 校验：用户都在吗？
+sqlite3 /srv/xlh-state/data/xlh.db "select id,username from users;"
+
+# 旧目录改名而非删除，留条回头路
+mv /opt/xlh/data /opt/xlh/data.migrated
+
+docker compose -f docker-compose.prod.yml up -d
+```
+
+---
+
 ## 坑
 
 **别同时用原生二进制和容器跑同一个 data 目录。** SQLite 的 WAL 需要共享内存段（`-shm`），
