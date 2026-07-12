@@ -294,7 +294,7 @@ xlhMe();
       <div id="hd-rows" style="margin-top:14px"></div>
       <button class="small" id="hd-add">+ 添加持仓</button>
       <button class="run" id="run-holdings">生成概览</button>
-      <div class="hint" style="margin-top:8px">按你的实际持仓，逐只多策略样本外评估 + 当下择时，给出加仓/持有/减仓/止盈/观望及建议金额。首次联网抓取净值较慢，命中缓存后秒级。</div>
+      <div class="hint" style="margin-top:8px">按你的实际持仓，逐只做多策略样本外评估，并给出组合层面的风险提示。<strong>不给择时下单金额</strong> —— 原先的「加仓 X 元」由 ±σ 波动带驱动，而该信号经前瞻检验跑不赢「随便哪天买」（见下方说明）。唯一会给出的金额是「集中度减仓」，那是风险规则、不预测涨跌。首次联网抓取净值较慢，命中缓存后秒级。</div>
       <div id="hd-result" style="margin-top:14px"></div>
       <div id="hd-save-wrap" style="margin-top:10px;display:none">
         <button class="small" id="hd-save">保存到历史</button>
