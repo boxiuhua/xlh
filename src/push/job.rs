@@ -98,7 +98,7 @@ pub fn build_message_full(cfg: &PushConfig) -> Result<BuiltMessage> {
     for h in &cfg.stocks {
         if h.code.trim().is_empty() { continue; }
         if let Ok(bars) = stock_cache::load_or_fetch(&h.code, &stock_dir, start, end) {
-            if let Ok(diag) = stock_diagnose::diagnose(h.code.clone(), stock_name_of(&h.code), &bars, &dp) {
+            if let Ok(diag) = stock_diagnose::diagnose_with_evidence(h.code.clone(), stock_name_of(&h.code), &bars, &dp) {
                 stock_adv.push(stock_advice::advise(h, &diag));
             }
         }
@@ -107,7 +107,7 @@ pub fn build_message_full(cfg: &PushConfig) -> Result<BuiltMessage> {
     for code in &cfg.diagnose_stocks {
         if code.trim().is_empty() { continue; }
         if let Ok(bars) = stock_cache::load_or_fetch(code, &stock_dir, start, end) {
-            if let Ok(diag) = stock_diagnose::diagnose(code.clone(), stock_name_of(code), &bars, &dp) {
+            if let Ok(diag) = stock_diagnose::diagnose_with_evidence(code.clone(), stock_name_of(code), &bars, &dp) {
                 stock_diags.push(diag);
             }
         }

@@ -49,6 +49,34 @@ fn evidence_line(r: &RegimeReport) -> String {
         e.horizon_days, e.buy_signals)
 }
 
+/// 股票技术信号的前瞻检验结果。
+///
+/// 与基金侧不同：这套信号（布林+RSI+MACD）**未被证伪**（5 只 A 股实测超额 −0.67% ~ +3.06%，
+/// 3 正 2 负），但也远谈不上被证实（样本仅 2.6 年、只数少、样本内）。
+/// 金额因此保留，但逐只的超额必须跟着一起推出去。
+fn stock_evidence_line(d: &StockDiagnosis) -> String {
+    let Some(e) = &d.evidence else {
+        return "- ⚠ K线历史不足，无法检验该信号是否有效 —— 上面的买卖信号没有证据支持\n".into();
+    };
+    let (Some(b), Some(base)) = (e.buy_mean_forward, e.baseline_mean_forward) else {
+        return String::new();
+    };
+    match e.buy_edge {
+        Some(edge) => {
+            let tail = if edge <= 0.0 {
+                "没跑赢「随便哪天买」，这只股票上它不提供择时价值"
+            } else {
+                "（样本内统计，未经样本外检验；仓位比例仍是无依据的经验取值）"
+            };
+            format!(
+                "- 信号有效性（{} 日前瞻）：买入触发 {} 次，其后平均 {b:+.2}%；\
+                 基准（随便哪天买）{base:+.2}% → 超额 **{edge:+.2}%** {tail}\n",
+                e.horizon_days, e.buy_signals)
+        }
+        None => format!("- ⚠ 买入信号历史仅触发 {} 次，样本不足以判断其有效性\n", e.buy_signals),
+    }
+}
+
 /// 组装完整推送消息。
 pub fn compose(
     fund: &HoldingsReport,
@@ -123,6 +151,7 @@ pub fn compose(
         for d in stock_diags {
             s.push_str(&format!("**{} {}** — 形态 {} · {}\n", d.name, d.code, d.trend, d.signal));
             s.push_str(&format!("- 价 {:.3} · RSI {:.1} · 布林z {:.2}\n", d.price, d.rsi, d.boll_z));
+            s.push_str(&stock_evidence_line(d));
             s.push_str(&format!("- {}\n\n", d.rationale));
         }
     }
@@ -297,6 +326,39 @@ mod tests {
         for banned in ["推荐买入", "目标价", "强烈看好"] {
             assert!(!md.contains(banned), "推送不得出现 `{banned}`");
         }
+    }
+
+    /// 股票侧仍然给「加仓 X 元」（信号未被证伪，不同于基金的波动带），
+    /// 但**证据必须跟着金额一起走**。谁把证据从推送里拿掉，这个测试必须炸。
+    #[test]
+    fn stock_signal_amounts_must_travel_with_their_evidence() {
+        use crate::stock::evidence::SignalEvidence;
+
+        let mut d = stock_diag();
+        d.evidence = Some(SignalEvidence {
+            horizon_days: 20, sample_days: 560,
+            buy_signals: 274, buy_win_rate: Some(41.0), buy_mean_forward: Some(-1.61),
+            sell_signals: 180, sell_win_rate: Some(50.0), sell_mean_forward: Some(0.4),
+            baseline_mean_forward: Some(-1.25), baseline_win_rate: Some(45.0),
+            buy_edge: Some(-0.36),                       // 负超额
+            verdict: "该买入信号没有跑赢「随便哪天买」。".into(),
+        });
+
+        let md = compose(&sample_report(), &[], &[], &[d], None, &[]);
+        assert!(md.contains("## 股票诊断"));
+        assert!(md.contains("信号有效性"), "证据必须出现在推送里");
+        assert!(md.contains("超额"), "必须给出相对基准的超额");
+        assert!(md.contains("没跑赢"), "负超额必须直说");
+        assert!(md.contains("基准（随便哪天买）"), "必须给出基准，否则平均收益是句废话");
+    }
+
+    /// 没有证据时也不能默不作声 —— 必须明说"这个信号没有证据支持"。
+    #[test]
+    fn missing_stock_evidence_is_disclosed_not_hidden() {
+        let d = stock_diag();                 // evidence: None
+        let md = compose(&sample_report(), &[], &[], &[d], None, &[]);
+        assert!(md.contains("无法检验"), "缺证据时须明说，不能静默");
+        assert!(md.contains("没有证据支持"));
     }
 
     #[test]

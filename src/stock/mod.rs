@@ -4,6 +4,7 @@ pub mod trade_stats;
 pub mod backtest;
 pub mod indicators;
 pub mod diagnose;
+pub mod evidence;
 pub mod recommend;
 pub mod screen;
 pub mod attribution;

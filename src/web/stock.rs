@@ -58,7 +58,8 @@ fn diagnose_blocking(q: DiagnoseQuery) -> Result<StockDiagnosis> {
     let start = end - chrono::Duration::days(800);
     let bars = cache::load_or_fetch(&q.code, stock_cache(), start, end)
         .map_err(|e| anyhow!("加载行情失败: {e}"))?;
-    diagnose::diagnose(q.code.clone(), q.code.clone(), &bars, &DiagnoseParams::default())
+    // 对外展示必须带证据：给了「买入」就得说清这个信号到底有没有用
+    diagnose::diagnose_with_evidence(q.code.clone(), q.code.clone(), &bars, &DiagnoseParams::default())
 }
 
 #[derive(Debug, Deserialize)]

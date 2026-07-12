@@ -38,6 +38,13 @@ pub struct StockDiagnosis {
     pub score: i32,
     pub rationale: String,
     pub caveat: String,
+    /// 这套信号在该股自身历史上到底有没有用（前瞻检验，无未来函数）。
+    ///
+    /// `diagnose()` 恒为 `None` —— 它必须保持纯粹，因为 `evidence::evaluate_signals`
+    /// 会反过来调用它（每个时点重跑一遍），若在此处算证据就会无限递归。
+    /// 要带证据请用 `diagnose_with_evidence()`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<crate::stock::evidence::SignalEvidence>,
 }
 
 /// 对单股 OHLCV 做技术诊断（基于后复权价）。纯函数。
@@ -100,7 +107,25 @@ pub fn diagnose(code: String, name: String, bars: &[StockBar], p: &DiagnoseParam
         score,
         rationale,
         caveat,
+        evidence: None,   // 见字段文档：此处算证据会与 evaluate_signals 无限递归
     })
+}
+
+/// 诊断 + 该信号在这只股票自身历史上的前瞻检验。
+///
+/// 对外展示（Web / 推送）一律走这个，而不是裸 `diagnose()` ——
+/// 给出「买入」并据此报出「加仓 1200 元」，就必须同时给出这个信号到底有没有用。
+///
+/// 实测（5 只 A 股，2.6 年 K线）：超额 −0.67% ~ +3.06%，**3 正 2 负**。
+/// 既没被证伪（不同于基金的 ±σ 波动带，那个是一边倒的负超额、金额已移除），
+/// 也远谈不上被证实：样本短、只数少、样本内、均值几乎全靠宁德时代一只撑着。
+/// 所以金额保留，但必须把逐只的超额摆在用户面前，由他自己判断。
+pub fn diagnose_with_evidence(
+    code: String, name: String, bars: &[StockBar], p: &DiagnoseParams,
+) -> Result<StockDiagnosis> {
+    let mut d = diagnose(code, name, bars, p)?;
+    d.evidence = crate::stock::evidence::evaluate_signals(bars, p, crate::stock::evidence::HORIZON);
+    Ok(d)
 }
 
 #[cfg(test)]

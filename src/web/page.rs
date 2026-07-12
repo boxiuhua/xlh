@@ -1070,7 +1070,56 @@ function renderStockDiag(d){
     + '<div style="margin-top:8px;color:#34495e">价 '+d.price.toFixed(3)+'（后复权 '+d.adj_price.toFixed(3)+'）· '+esc(d.ma_relation)+' · MA短 '+d.ma_short.toFixed(2)+' / 长 '+d.ma_long.toFixed(2)+'</div>'
     + '<div style="margin-top:6px;color:#34495e">布林 z '+d.boll_z.toFixed(2)+'（下 '+d.boll_lower.toFixed(2)+' / 中 '+d.boll_mid.toFixed(2)+' / 上 '+d.boll_upper.toFixed(2)+'）· RSI '+d.rsi.toFixed(1)+' · MACD柱 '+d.macd_hist.toFixed(3)+'</div>'
     + '<div style="margin-top:8px;color:#5a6a7a">'+esc(d.rationale)+'</div>'
+    + sigEvidenceHtml(d.evidence)
     + '<div style="margin-top:8px;padding:8px 10px;background:#f3f7ff;border-radius:6px;color:#34495e">'+esc(d.caveat)+'</div>';
+}
+
+// 这套技术信号（布林+RSI+MACD 打分）到底有没有用。
+//
+// 与基金侧的 ±σ 波动带不同：那条线被前瞻检验一边倒地证伪了（每只基金都跑不赢「随便哪天买」），
+// 择时金额已因此移除。股票这套是另一个信号 —— 实测 5 只 A 股超额 -0.67% ~ +3.06%，3 正 2 负，
+// **既没被证伪、也远谈不上被证实**（样本仅 2.6 年、只数少、样本内、均值几乎全靠一只撑着）。
+// 所以金额保留，但必须把逐只的超额摆在用户面前。
+function sigEvidenceHtml(e){
+  if(!e){
+    return '<div style="margin-top:8px;padding:8px 10px;background:#fffbf0;border-left:4px solid #b8860b;color:#5a4a1a">'
+      + '⚠ K线历史不足，<strong>无法检验这个信号是否有效</strong>。上面的买卖信号没有任何证据支持。</div>';
+  }
+  var n = function(x,d){ return (x==null||!isFinite(x)) ? '—' : Number(x).toFixed(d==null?2:d); };
+  var edge = e.buy_edge;
+  var bad = (edge!=null && edge <= 0);
+  var color = bad ? '#c0392b' : '#b8860b';
+  var bg = bad ? '#fdecea' : '#fffbf0';
+
+  return '<div style="margin-top:8px;padding:10px;background:'+bg+';border-left:4px solid '+color+';color:#34495e">'
+    + '<div style="font-weight:600;color:#1a252f">这个信号有用吗？（'+e.horizon_days+' 日前瞻 · 逐时点重算 · 无未来函数）</div>'
+    + '<table style="margin-top:6px;border-collapse:collapse;width:100%;font-size:.9rem">'
+    +   '<tr style="color:#7f8c8d;text-align:left"><th style="padding:3px 6px"></th>'
+    +     '<th style="padding:3px 6px;text-align:right">次数</th>'
+    +     '<th style="padding:3px 6px;text-align:right">其后平均收益</th>'
+    +     '<th style="padding:3px 6px;text-align:right">胜率</th></tr>'
+    +   '<tr><td style="padding:3px 6px">买入信号</td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+e.buy_signals+'</td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+n(e.buy_mean_forward)+'%</td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+n(e.buy_win_rate,1)+'%</td></tr>'
+    +   '<tr><td style="padding:3px 6px">卖出信号</td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+e.sell_signals+'</td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+n(e.sell_mean_forward)+'%</td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+n(e.sell_win_rate,1)+'%</td></tr>'
+    +   '<tr style="border-top:1px solid #e0d8c0"><td style="padding:3px 6px"><strong>基准</strong>（随便哪天买）</td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+e.sample_days+'</td>'
+    +     '<td style="padding:3px 6px;text-align:right"><strong>'+n(e.baseline_mean_forward)+'%</strong></td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+n(e.baseline_win_rate,1)+'%</td></tr>'
+    + '</table>'
+    + (edge!=null
+        ? '<div style="margin-top:6px;font-weight:600;color:'+color+'">买入信号相对基准的超额：'
+          + (edge>=0?'+':'')+n(edge)+'%'
+          + (bad ? ' —— 没跑赢「随便哪天买」，这只股票上它不提供择时价值。' : '')
+          + '</div>'
+        : '')
+    + '<div style="margin-top:6px;font-size:.88rem;color:#5a6a7a">'+esc(e.verdict)+'</div>'
+    + '<div style="margin-top:6px;font-size:.85rem;color:#7f8c8d">注：诊断页给出的「加仓 X 元」金额，其仓位比例（10%~30% 分档）是<strong>没有依据的经验取值</strong> —— 即使信号有效，这个金额也未经验证。</div>'
+    + '</div>';
 }
 function renderStockRun(o){
   var box = document.getElementById('sb-result');
