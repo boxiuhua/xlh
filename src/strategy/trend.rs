@@ -25,9 +25,9 @@ impl Strategy for Trend {
         let mut out = Vec::new();
         if let Some(prev) = self.prev_short_above {
             if above && !prev {
-                out.push(SignalEvent { date: ctx.today.date, direction: Direction::Buy, amount: SignalAmount::Cash(self.amount) });
+                out.push(SignalEvent { date: ctx.today, direction: Direction::Buy, amount: SignalAmount::Cash(self.amount) });
             } else if !above && prev && ctx.shares > 1e-9 {
-                out.push(SignalEvent { date: ctx.today.date, direction: Direction::Sell, amount: SignalAmount::AllOut });
+                out.push(SignalEvent { date: ctx.today, direction: Direction::Sell, amount: SignalAmount::AllOut });
             }
         }
         self.prev_short_above = Some(above);
@@ -49,7 +49,7 @@ mod tests {
             .map(|(i,p)| MarketEvent{date:d(2024,1,(i+1) as u32),nav:*p,adj_nav:*p}).collect();
         let mut out = Vec::new();
         for i in 0..bars.len() {
-            let ctx = StrategyContext{today:&bars[i], history:&bars[..=i], shares: if i>0 {100.0} else {0.0}, avg_cost:1.0, cash:0.0};
+            let ctx = StrategyContext{today: bars[i].date, history:&bars[..i], shares: if i>0 {100.0} else {0.0}, avg_cost:1.0, cash:0.0};
             out.extend(s.on_market(&ctx));
         }
         out

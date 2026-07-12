@@ -16,15 +16,16 @@ impl SmartDca {
 
 impl Strategy for SmartDca {
     fn on_market(&mut self, ctx: &StrategyContext) -> Vec<SignalEvent> {
-        if !self.schedule.due(ctx.today.date) { return Vec::new(); }
-        let amount = match moving_average(ctx.history, self.ma_window) {
-            Some(ma) if ma > 0.0 => {
-                let dev = ctx.today.adj_nav / ma - 1.0;       // 低于均线为负
+        if !self.schedule.due(ctx.today) { return Vec::new(); }
+        // 偏离度用**最近已公布净值(T-1)**，不是当日净值 —— 下单时今天的净值还没出来。
+        let amount = match (moving_average(ctx.history, self.ma_window), ctx.last_nav()) {
+            (Some(ma), Some(last)) if ma > 0.0 => {
+                let dev = last / ma - 1.0;                    // 低于均线为负
                 (self.base * (1.0 - self.k * dev)).clamp(self.base * 0.5, self.base * 2.0)
             }
             _ => self.base,
         };
-        vec![SignalEvent { date: ctx.today.date, direction: Direction::Buy, amount: SignalAmount::Cash(amount) }]
+        vec![SignalEvent { date: ctx.today, direction: Direction::Buy, amount: SignalAmount::Cash(amount) }]
     }
 }
 
@@ -47,7 +48,7 @@ mod tests {
         let hist = bars(&[1.2, 1.0, 0.8]); // ma=1.0, 当前0.8, dev=-0.2 → 1000*(1+0.2)=1200
         let today = hist.last().unwrap().clone();
         // 把定投日设到当天(1月3日? day=1 已在1月触发? 用首个bar触发)。改用 day=1, 当月首bar即触发
-        let ctx = StrategyContext{today:&today, history:&hist, shares:0.0, avg_cost:0.0, cash:0.0};
+        let ctx = StrategyContext{today: today.date, history:&hist, shares:0.0, avg_cost:0.0, cash:0.0};
         let sigs = s.on_market(&ctx);
         assert_eq!(sigs.len(), 1);
         if let SignalAmount::Cash(amt) = sigs[0].amount {
@@ -61,7 +62,7 @@ mod tests {
         let mut s = SmartDca::new(Period::Monthly, 1, 1000.0, 250, 1.0);
         let hist = bars(&[1.0]);
         let today = hist.last().unwrap().clone();
-        let ctx = StrategyContext{today:&today, history:&hist, shares:0.0, avg_cost:0.0, cash:0.0};
+        let ctx = StrategyContext{today: today.date, history:&hist, shares:0.0, avg_cost:0.0, cash:0.0};
         let sigs = s.on_market(&ctx);
         assert_eq!(sigs[0].amount, SignalAmount::Cash(1000.0));
     }

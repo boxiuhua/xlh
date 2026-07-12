@@ -8,13 +8,39 @@ pub mod rsi;
 pub mod adaptive;
 pub mod rules;
 
-/// 策略每日可见的上下文（历史只到当日，防偷看未来）。
+/// 策略在决策日 T 可见的上下文。
+///
+/// ## 为什么 `today` 只有日期、没有净值
+///
+/// 场外基金的 T 日净值要**收盘后**才公布，而申购/赎回的下单截止时间是**当日 15:00**。
+/// 也就是说：下单的那一刻，你不可能知道今天的净值。
+/// 「看到今天净值跌破均线 → 按今天的净值买入」在现实中物理上做不到。
+///
+/// 早先的实现把当日 `MarketEvent`（含 `adj_nav`）直接交给策略，且 `history` 也**含当日**，
+/// 于是 `smart_dca`/`trend`/`rsi`/`adaptive`/止盈止损 全都在用「今天的收盘净值」做今天的决策 ——
+/// 一天的未来函数。它不会让回测崩溃，只会**持续单向地美化所有择时策略**：
+/// 信号总是在已经知道今天涨跌之后才触发。而纯日历触发的 `dca` 不受影响 ——
+/// 结果是「5 个策略选最优」那场比赛里，4 个选手作弊、1 个不作弊。
+///
+/// 现在从结构上杜绝：**当日净值根本不出现在上下文里**，策略拿不到就无从偷看。
+/// 决策只能基于 `history`（截止 T-1 的已公布净值），成交则发生在 T 日净值上 ——
+/// 这正是真实的申赎流程：T 日 15:00 前提交，按 T 日净值确认。
 pub struct StrategyContext<'a> {
-    pub today: &'a MarketEvent,
+    /// 决策日 T。**只有日期** —— T 日净值此刻尚未公布。
+    pub today: NaiveDate,
+    /// 已公布的历史净值，**截止 T-1**（不含当日）。
     pub history: &'a [MarketEvent],
     pub shares: f64,
     pub avg_cost: f64,
     pub cash: f64,
+}
+
+impl StrategyContext<'_> {
+    /// 最近一个**已公布**的复权净值（T-1）。策略要用价格做决策，只能用这个。
+    /// 首个交易日无历史 → `None`。
+    pub fn last_nav(&self) -> Option<f64> {
+        self.history.last().map(|b| b.adj_nav)
+    }
 }
 
 pub trait Strategy {
@@ -56,7 +82,9 @@ impl Schedule {
     }
 }
 
-/// 最近 window 根 bar 的复权净值均线（含当日）。
+/// 最近 window 根 bar 的复权净值均线。
+///
+/// 传入的 `history` 已截止 T-1（见 `StrategyContext`），故此均线**不含当日**。
 pub fn moving_average(history: &[MarketEvent], window: usize) -> Option<f64> {
     if window == 0 || history.len() < window { return None; }
     let slice = &history[history.len() - window..];

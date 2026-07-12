@@ -38,7 +38,14 @@ pub fn expand_grid(grid: &toml::Table) -> Result<Vec<toml::Value>> {
 pub struct OptOutcome {
     pub params: toml::Value,
     pub label: String,
+    /// 训练段回测。**参数就是在这段上挑出来的**，所以这里的绩效是 argmax 的结果 ——
+    /// 它是选择偏差的上界，不是任何意义上的预期收益。别拿它做决策。
     pub outcome: RunOutcome,
+    /// 检验段回测：拿训练段选出的这组参数，在**没见过的数据**上实测。
+    /// 数据不足以切分时为 `None`。
+    ///
+    /// 训练段与检验段的落差就是过拟合的量度。落差越大，这组"最优参数"越不可外推。
+    pub oos: Option<RunOutcome>,
 }
 
 pub struct OptReport {
@@ -47,6 +54,13 @@ pub struct OptReport {
     pub top_n: usize,
     pub ranked: Vec<OptOutcome>,
     pub param_keys: Vec<String>,
+    /// 训练段占比；`None` 表示数据不足、未能切分（此时全部为 in-sample）
+    pub split_ratio: Option<f64>,
+    /// 参数组合总数。组合越多，argmax 出来的"最优"越可能只是噪声。
+    pub combos: usize,
+    /// 过拟合警示。**必带**，且必须渲染给用户 —— 这个 tab 的产出天然会被
+    /// 当成"可用的最优参数"，不警示就是误导。
+    pub caveat: String,
 }
 
 impl std::fmt::Debug for OptReport {
@@ -85,6 +99,20 @@ fn make_label(combo: &toml::Value, varying: &[String], idx: usize) -> String {
         .join(",")
 }
 
+/// 训练段占比。与 `recommend.rs` 的默认切分保持一致。
+pub const SPLIT_RATIO: f64 = 0.70;
+
+/// 网格寻优。
+///
+/// ## 这里曾经是纯粹的数据窥探
+///
+/// 旧实现把**整段**数据交给每个参数组合，按指标 argmax，然后把那个最大值当绩效报出来 ——
+/// 没有训练/检验切分、没有 walk-forward、报告里连一句过拟合警示都没有。
+/// 讽刺的是 `recommend.rs` 早就做了 70/30 切分，注释还写着"不逐基金寻优，降低过拟合"——
+/// 而寻优 tab 干的正是它刻意避免的事。
+///
+/// 现在：**在训练段选参数，在检验段实测**。两组数字并排给出，落差即过拟合的量度。
+/// 数据不足以切分时不再假装无事发生，而是在 `caveat` 里明说这批数字全是 in-sample。
 pub fn run_optimize(
     cfg: &OptimizeCfg,
     fund_code: &str,
@@ -96,24 +124,36 @@ pub fn run_optimize(
         return Err(anyhow!("未知排序 metric: {}，合法取值: {:?}", cfg.metric, METRICS));
     }
     let combos = expand_grid(&cfg.grid)?;
-    if combos.len() > 200 {
-        eprintln!("⚠ 参数组合数 {} 较多，回测可能较慢", combos.len());
-    }
+    let n_combos = combos.len();
     let param_keys: Vec<String> = cfg.grid.keys().cloned().collect();
     let varying: Vec<String> = param_keys.iter()
         .filter(|k| matches!(cfg.grid.get(k.as_str()), Some(toml::Value::Array(a)) if a.len() > 1))
         .cloned()
         .collect();
 
-    let mut ranked = Vec::with_capacity(combos.len());
+    // 切分：训练段选参数，检验段实测。切不动就退回全段 in-sample，但必须在 caveat 里说清。
+    let split = crate::recommend::split_history(points, SPLIT_RATIO);
+    let (train, test) = match split {
+        Some((tr, te)) => (tr, Some(te)),
+        None => (points, None),
+    };
+
+    let mut ranked = Vec::with_capacity(n_combos);
     for (i, combo) in combos.into_iter().enumerate() {
         let label = make_label(&combo, &varying, i);
-        let strategy = build_strategy_from(&cfg.strategy, &Some(combo.clone()), &cfg.rules)
-            .map_err(|e| anyhow!("组合 [{label}] 构建策略失败: {e}"))?;
-        let outcome = run_one(label.clone(), fund_code.to_string(), points.to_vec(), strategy, fee.clone(), initial_cash);
-        ranked.push(OptOutcome { params: combo, label, outcome });
+        let mk = || build_strategy_from(&cfg.strategy, &Some(combo.clone()), &cfg.rules)
+            .map_err(|e| anyhow!("组合 [{label}] 构建策略失败: {e}"));
+
+        let outcome = run_one(label.clone(), fund_code.to_string(), train.to_vec(),
+                              mk()?, fee.clone(), initial_cash);
+        // 检验段用**同一组参数**重跑一遍（策略是有状态的，必须重新构建）
+        let oos = test.map(|te| run_one(label.clone(), fund_code.to_string(), te.to_vec(),
+                                        mk().expect("参数已校验"), fee.clone(), initial_cash));
+        ranked.push(OptOutcome { params: combo, label, outcome, oos });
     }
 
+    // 排序用**训练段**指标 —— 这正是真实的参数选择过程：挑参数时你看不到检验段。
+    // 若改用检验段排序，就等于在检验集上挑赢家，检验段的成绩也就不再无偏（winner's curse）。
     let descending = cfg.metric != "max_drawdown";
     ranked.sort_by(|a, b| {
         let (va, vb) = (metric_value(&a.outcome.summary, &cfg.metric), metric_value(&b.outcome.summary, &cfg.metric));
@@ -124,9 +164,142 @@ pub fn run_optimize(
         strategy: cfg.strategy.clone(),
         metric: cfg.metric.clone(),
         top_n: cfg.top_n,
+        caveat: build_caveat(n_combos, test.is_some(), &ranked, &cfg.metric),
+        split_ratio: test.map(|_| SPLIT_RATIO),
+        combos: n_combos,
         ranked,
         param_keys,
     })
+}
+
+/// 过拟合警示。内容随实际结果变化 —— 尤其是把训练/检验的落差算出来摆在用户面前。
+fn build_caveat(n_combos: usize, has_oos: bool, ranked: &[OptOutcome], metric: &str) -> String {
+    let mut s = String::new();
+
+    if !has_oos {
+        s.push_str(&format!(
+            "⚠ 数据不足以切分训练/检验段（需训练≥{} 且检验≥{} 个净值点）。\
+             下列全部为「in-sample（样本内）」结果：参数是在这同一段数据上挑出来的，\
+             绩效也是在这同一段上算的 —— 这是纯粹的数据窥探，那个\"最优\"值是 {} 个组合里\
+             argmax 出来的最大值，不可外推、不代表任何预期收益。请拉长时间区间后重试。",
+            crate::recommend::MIN_TRAIN, crate::recommend::MIN_TEST, n_combos));
+        return s;
+    }
+
+    s.push_str(&format!(
+        "参数在「训练段」（前 {:.0}%）上从 {} 个组合里选出，绩效在「检验段」（后 {:.0}%，\
+         选参数时未见过）上实测。请只看检验段的数字做判断。",
+        SPLIT_RATIO * 100.0, n_combos, (1.0 - SPLIT_RATIO) * 100.0));
+
+    // 把过拟合的量级直接算给用户看
+    if let Some(best) = ranked.first() {
+        if let Some(oos) = &best.oos {
+            let is_v = metric_value(&best.outcome.summary, metric);
+            let oos_v = metric_value(&oos.summary, metric);
+            s.push_str(&format!(
+                "\n本次最优组合 [{}] 的 {metric}：训练段 {:.3} → 检验段 {:.3}。",
+                best.label, is_v, oos_v));
+            // max_drawdown 越小越好，方向相反
+            let degraded = if metric == "max_drawdown" { oos_v > is_v } else { oos_v < is_v };
+            if degraded {
+                s.push_str("训练段明显更好看 —— 这个落差就是过拟合的量度，是挑参数这个动作本身造出来的。");
+            }
+        }
+    }
+
+    if n_combos > 50 {
+        s.push_str(&format!(
+            "\n⚠ 你搜了 {n_combos} 个组合。组合越多，仅靠运气就能在训练段跑出漂亮数字的\
+             概率越高（多重比较问题）—— 训练段的\"最优\"很可能只是噪声。"));
+    }
+    s
+}
+
+#[cfg(test)]
+mod overfit_guard_tests {
+    use super::*;
+    use crate::config::OptimizeCfg;
+    use crate::broker::SellTier;
+    use chrono::NaiveDate;
+
+    fn pts(n: usize) -> Vec<NavPoint> {
+        (0..n).map(|i| {
+            let nav = 1.0 + (i as f64) * 0.001;
+            NavPoint {
+                date: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap() + chrono::Duration::days(i as i64),
+                nav, acc_nav: nav,
+            }
+        }).collect()
+    }
+
+    fn cfg(values: Vec<i64>) -> OptimizeCfg {
+        let mut grid = toml::Table::new();
+        // smart_dca 的必填参数（固定值放单元素数组，只让 ma_window 变化）
+        grid.insert("period".into(), toml::Value::Array(vec![toml::Value::String("monthly".into())]));
+        grid.insert("day".into(), toml::Value::Array(vec![toml::Value::Integer(1)]));
+        grid.insert("base_amount".into(), toml::Value::Array(vec![toml::Value::Float(1000.0)]));
+        grid.insert("k".into(), toml::Value::Array(vec![toml::Value::Float(1.0)]));
+        grid.insert("ma_window".into(),
+                    toml::Value::Array(values.into_iter().map(toml::Value::Integer).collect()));
+        OptimizeCfg {
+            strategy: "smart_dca".into(),
+            metric: "total_return".into(),
+            top_n: 5,
+            grid,
+            rules: Default::default(),
+        }
+    }
+
+    fn fee() -> FeeModel {
+        FeeModel { buy_rate: 0.0, sell_tiers: vec![SellTier { max_days: 0, rate: 0.0 }] }
+    }
+
+    /// 寻优必须在训练段选参数、在检验段实测 —— 而不是在同一段上既选又报。
+    #[test]
+    fn splits_train_and_test_instead_of_reporting_in_sample_argmax() {
+        let r = run_optimize(&cfg(vec![10, 20, 30]), "161725", &pts(400), fee(), 0.0).unwrap();
+
+        assert_eq!(r.split_ratio, Some(SPLIT_RATIO), "数据充足时必须切分");
+        assert_eq!(r.combos, 3);
+        assert!(r.ranked.iter().all(|o| o.oos.is_some()), "每个组合都要有检验段实测");
+
+        // 检验段绝不能与训练段是同一段数据（否则切分形同虚设）
+        let best = &r.ranked[0];
+        let tr_days = best.outcome.daily.len();
+        let te_days = best.oos.as_ref().unwrap().daily.len();
+        assert!(tr_days > te_days && te_days > 0, "训练 {tr_days} 天 / 检验 {te_days} 天");
+        assert!((tr_days + te_days).abs_diff(400) <= 1, "两段合起来应覆盖全样本");
+    }
+
+    /// 警示是这个 tab 的核心产出之一 —— 它天然会被当成"可用的最优参数"，不警示就是误导。
+    #[test]
+    fn always_carries_an_overfit_caveat() {
+        let r = run_optimize(&cfg(vec![10, 20, 30]), "161725", &pts(400), fee(), 0.0).unwrap();
+        assert!(!r.caveat.is_empty());
+        assert!(r.caveat.contains("训练段"), "须说明参数是在训练段挑的");
+        assert!(r.caveat.contains("检验段"), "须指引用户看检验段");
+    }
+
+    /// 组合数多 → 多重比较问题，必须额外点名。
+    #[test]
+    fn warns_louder_when_the_grid_is_large() {
+        let many: Vec<i64> = (5..=60).collect();      // 56 个组合
+        let r = run_optimize(&cfg(many), "161725", &pts(400), fee(), 0.0).unwrap();
+        assert!(r.combos > 50);
+        assert!(r.caveat.contains("多重比较"), "大网格须点名多重比较问题");
+    }
+
+    /// 数据不足以切分时，不许假装无事发生 —— 必须明说这批数字全是样本内。
+    #[test]
+    fn admits_when_results_are_pure_in_sample() {
+        let r = run_optimize(&cfg(vec![10, 20]), "161725", &pts(100), fee(), 0.0).unwrap();
+        assert_eq!(r.split_ratio, None);
+        assert!(r.ranked.iter().all(|o| o.oos.is_none()));
+        assert!(r.caveat.contains("in-sample") || r.caveat.contains("样本内"),
+                "须明说是样本内: {}", r.caveat);
+        assert!(r.caveat.contains("数据窥探") || r.caveat.contains("不可外推"),
+                "须说清后果: {}", r.caveat);
+    }
 }
 
 #[cfg(test)]

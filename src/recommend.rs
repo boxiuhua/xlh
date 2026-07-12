@@ -12,8 +12,8 @@ use crate::runner;
 pub const DISCLAIMER: &str =
     "基于历史净值的统计回测与启发式规则，不预测未来走势，不构成任何投资建议。";
 
-const MIN_TRAIN: usize = 120;
-const MIN_TEST: usize = 30;
+pub const MIN_TRAIN: usize = 120;
+pub const MIN_TEST: usize = 30;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ScoreWeights {
@@ -83,7 +83,10 @@ fn zscores(xs: &[f64]) -> Vec<f64> {
 }
 
 /// 按比例切训练/检验段；任一段不足最小阈值返回 None。
-fn split_history(points: &[NavPoint], split_ratio: f64) -> Option<(&[NavPoint], &[NavPoint])> {
+///
+/// `optimize.rs` 也复用它 —— 寻优此前在**同一段数据**上既选参数又报绩效（纯 in-sample
+/// argmax），而本模块早就做了 70/30 切分。同一个项目不该有两套标准。
+pub fn split_history(points: &[NavPoint], split_ratio: f64) -> Option<(&[NavPoint], &[NavPoint])> {
     let cut = (points.len() as f64 * split_ratio).floor() as usize;
     let (train, test) = points.split_at(cut);
     if train.len() >= MIN_TRAIN && test.len() >= MIN_TEST { Some((train, test)) } else { None }

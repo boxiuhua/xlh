@@ -30,7 +30,13 @@ pub fn compute_adjusted(points: &[NavPoint]) -> Vec<f64> {
 pub trait DataHandler {
     /// 推进到下一交易日；数据耗尽返回 None。
     fn next_bar(&mut self) -> Option<MarketEvent>;
-    /// 截至当前已发出 bar 的历史窗口（只含过去与当日，绝不含未来）。
+
+    /// 决策日 T 可见的历史窗口：**截止 T-1，不含当日**。
+    ///
+    /// 曾经这里含当日（`bars[..cursor]`，而 `cursor` 在 `next_bar` 中已自增）——
+    /// 于是策略能用「今天的收盘净值」做今天的决策，再按今天的净值成交。
+    /// 对场外基金这是不可能的：T 日净值收盘后才公布，而申赎 15:00 截单。
+    /// 详见 `strategy::StrategyContext` 的说明。
     fn history(&self, lookback: usize) -> &[MarketEvent];
 }
 
@@ -58,7 +64,8 @@ impl DataHandler for InMemoryData {
         } else { None }
     }
     fn history(&self, lookback: usize) -> &[MarketEvent] {
-        let end = self.cursor;
+        // cursor 在 next_bar() 中已自增，故 cursor-1 才是当日；end 取 cursor-1 → 截止 T-1。
+        let end = self.cursor.saturating_sub(1);
         let start = end.saturating_sub(lookback);
         &self.bars[start..end]
     }
@@ -108,19 +115,35 @@ mod tests {
             "量纲不一致时复权因子应等于真实涨幅 1.10，实际 {factor:.4}");
     }
 
+    /// history 必须**截止 T-1**，绝不含当日。
+    ///
+    /// 这里曾经断言 `history(10).len() == 1`（含当日）—— 那正是那个一天的未来函数：
+    /// 策略拿到今天的净值做今天的决策，再按今天的净值成交。对场外基金这不可能：
+    /// T 日净值收盘后才公布，而申赎 15:00 截单。
     #[test]
-    fn history_never_returns_future() {
+    fn history_never_returns_future_nor_today() {
         let pts = vec![
             NavPoint { date: d(2024,1,1), nav: 1.0, acc_nav: 1.0 },
             NavPoint { date: d(2024,1,2), nav: 1.1, acc_nav: 1.1 },
             NavPoint { date: d(2024,1,3), nav: 1.2, acc_nav: 1.2 },
         ];
         let mut h = InMemoryData::new(pts);
+
         let b1 = h.next_bar().unwrap();
         assert_eq!(b1.date, d(2024,1,1));
-        assert_eq!(h.history(10).len(), 1); // 只含已发出的当日
-        h.next_bar();
-        assert_eq!(h.history(10).len(), 2);
-        assert_eq!(h.history(1).len(), 1); // lookback 截断
+        assert!(h.history(10).is_empty(), "首日无「昨天」，history 必须为空");
+
+        let b2 = h.next_bar().unwrap();
+        assert_eq!(b2.date, d(2024,1,2));
+        let h2 = h.history(10);
+        assert_eq!(h2.len(), 1, "第二日只应看到第一日");
+        assert_eq!(h2[0].date, d(2024,1,1));
+        assert!(h2.iter().all(|b| b.date < b2.date), "history 不得含当日或未来");
+
+        let b3 = h.next_bar().unwrap();
+        let h3 = h.history(10);
+        assert_eq!(h3.len(), 2);
+        assert!(h3.iter().all(|b| b.date < b3.date));
+        assert_eq!(h.history(1).len(), 1, "lookback 截断");
     }
 }

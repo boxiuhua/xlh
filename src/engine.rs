@@ -33,9 +33,10 @@ impl<D: DataHandler, S: Strategy> Engine<D, S> {
                 match ev {
                     Event::Market(m) => {
                         let pos = self.broker.position();
+                        // history 截止 T-1；ctx 只给日期，不给当日净值 —— 决策不可能偷看今天。
                         let history = self.data.history(self.lookback);
                         let ctx = StrategyContext {
-                            today: &m,
+                            today: m.date,
                             history,
                             shares: pos.shares,
                             avg_cost: pos.avg_cost,
@@ -180,6 +181,37 @@ mod tests {
             (pf.total_contributed - 1000.0).abs() < 1e-6,
             "expected 1000 contributed, got {}", pf.total_contributed
         );
+    }
+
+    /// 回归测试：择时策略**不得**用当日净值做当日决策。
+    ///
+    /// 曾经 `history` 含当日、且成交也用当日净值，于是「今天暴跌 → 今天按暴跌后的净值抄底」
+    /// 这种现实中不可能的操作会被回测当成合法收益，持续单向美化所有择时策略。
+    ///
+    /// 场景：1/1 净值 1.0 → 1/2 暴跌到 0.5。止盈止损里的 StopLoss(20%) 在 1/2 当天
+    /// 只能看到 1/1 的净值（未跌），因此**不能**在 1/2 触发；要到 1/3 才看得到这根暴跌，
+    /// 并按 1/3 的净值成交。
+    #[test]
+    fn timing_rules_cannot_act_on_the_same_day_nav() {
+        use crate::strategy::rules::{Rule, RuleLayer};
+        let points = vec![
+            NavPoint{date:d(2024,1,1), nav:1.0, acc_nav:1.0},   // 建仓
+            NavPoint{date:d(2024,1,2), nav:0.5, acc_nav:0.5},   // 暴跌 -50%
+            NavPoint{date:d(2024,1,3), nav:0.5, acc_nav:0.5},
+        ];
+        let inner = Dca::new(Period::Monthly, 1, 1000.0);       // 1/1 买入 1000
+        let strat = RuleLayer::new(Box::new(inner), vec![Rule::StopLoss { max_drawdown: 0.2 }]);
+        let mut engine = Engine::new(InMemoryData::new(points), strat,
+                                     Broker::new(no_fee()), Portfolio::new(0.0));
+        engine.run();
+
+        let sells: Vec<_> = engine.trades().iter()
+            .filter(|t| t.direction == Direction::Sell).collect();
+        assert_eq!(sells.len(), 1, "应恰好止损清仓一次");
+        // 关键断言：卖出发生在 1/3，不是 1/2。
+        // 若 history 含当日（旧的错误契约），1/2 当天就会看到暴跌并在 1/2 卖出。
+        assert_eq!(sells[0].date, d(2024,1,3),
+                   "止损只能在看到 T-1 的暴跌后、于次日成交；在暴跌当天卖出即是未来函数");
     }
 
     #[test]

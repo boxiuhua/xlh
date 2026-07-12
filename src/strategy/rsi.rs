@@ -43,9 +43,9 @@ impl Strategy for Rsi {
         let mut out = Vec::new();
         if let Some(prev) = self.prev_rsi {
             if prev >= self.oversold && cur < self.oversold {
-                out.push(SignalEvent { date: ctx.today.date, direction: Direction::Buy, amount: SignalAmount::Cash(self.amount) });
+                out.push(SignalEvent { date: ctx.today, direction: Direction::Buy, amount: SignalAmount::Cash(self.amount) });
             } else if prev <= self.overbought && cur > self.overbought && ctx.shares > 1e-9 {
-                out.push(SignalEvent { date: ctx.today.date, direction: Direction::Sell, amount: SignalAmount::AllOut });
+                out.push(SignalEvent { date: ctx.today, direction: Direction::Sell, amount: SignalAmount::AllOut });
             }
         }
         self.prev_rsi = Some(cur);
@@ -80,7 +80,7 @@ mod tests {
         let bs = bars(prices);
         let mut out = Vec::new();
         for i in 0..bs.len() {
-            let ctx = StrategyContext { today: &bs[i], history: &bs[..=i], shares: if i > 0 { 100.0 } else { 0.0 }, avg_cost: 1.0, cash: 0.0 };
+            let ctx = StrategyContext { today: bs[i].date, history: &bs[..i], shares: if i > 0 { 100.0 } else { 0.0 }, avg_cost: 1.0, cash: 0.0 };
             out.extend(s.on_market(&ctx));
         }
         out

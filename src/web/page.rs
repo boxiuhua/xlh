@@ -234,6 +234,12 @@ xlhMe();
       <div class="row" id="opt-grid" style="margin-top:14px"></div>
       <button class="run" id="run-optimize">运行寻优</button>
       <div class="hint">参数填逗号分隔的多个候选值，如 均线窗口 = 120,250,500。取笛卡尔积。</div>
+      <div class="hint" style="margin-top:6px;background:#fffbf0;border-left:4px solid #b8860b;padding:8px 10px;color:#5a4a1a">
+        <strong>⚠ 关于「最优参数」</strong>：参数在<strong>训练段</strong>（前 70%）上从所有组合里选出，
+        绩效在<strong>检验段</strong>（后 30%，选参数时未见过）上实测 —— 报告里两组数字并排给出，
+        <strong>请只看检验段</strong>。训练段的数字是从 N 个组合里 argmax 出来的最大值，必然好看，
+        它是选择偏差的上界，不代表任何预期收益。组合搜得越多，训练段的「最优」越可能只是噪声。
+      </div>
     </div>
   </div>
 
@@ -260,7 +266,9 @@ xlhMe();
         <summary style="cursor:pointer;font-weight:600;color:#1a252f">算法说明（点击展开/收起）</summary>
         <div style="margin-top:10px;color:#34495e;font-size:.9rem;line-height:1.7">
           <div>1) <strong>综合评分</strong>：score = 0.4·z(收益) + 0.4·z(夏普) − 0.2·z(最大回撤)，对池内各基金做标准化（z 分数），回撤为负向。</div>
-          <div>2) <strong>样本外验证</strong>：历史按 70/30 切分；训练段（前 70%）从 5 个策略里按综合评分选最优，检验段（后 30%）实测该策略表现；<strong>Top5 排名用检验段指标</strong>，抑制过拟合。</div>
+          <div>2) <strong>样本外验证</strong>：历史按 70/30 切分；训练段（前 70%）从 5 个策略里按综合评分选最优，检验段（后 30%）实测该策略表现。</div>
+          <div style="color:#b8860b">2b) <strong>⚠ 这里有一个已知偏差，别被 Top5 的数字骗了</strong>：Top5 的<strong>排名</strong>用的就是检验段指标，而展示给你的"样本外收益/夏普"<strong>正是同一批被用来排序的数字</strong>。在检验集上挑赢家、又把检验集的成绩当作无偏估计报出来，这叫 winner's curse —— Top5 的样本外数字会<strong>系统性偏高</strong>。真正无偏需要第三段数据（挑选段 / 检验段分离），本项目尚未实现。</div>
+          <div style="color:#b8860b">2c) <strong>⚠ 池子是人工挑的</strong>：预设池注明含"口碑主动"基金 —— 这是<strong>用今天的声誉去挑基金、再回测它们过去 8 年</strong>。今天有口碑的基金过去当然表现好，这是后视选择偏差，会让所有策略的历史绩效凭空变好。清盘/合并的基金取不到数据，也不在池中。</div>
           <div>3) <strong>候选策略（固定参数）</strong>：普通定投 / 智能定投(MA250) / 均线择时(20·60) / RSI(14·30·70) / 自适应。</div>
           <div>4) <strong>当前择时</strong>：用近段净值的均线 ±σ 波动带——低吸线≈中轴−σ、高抛线≈中轴+σ，结合形态（上涨红 / 下跌绿 / 震荡灰）给出当下信号。</div>
           <div style="color:#c0392b;margin-top:6px">5) 免责声明：基于历史净值的统计回测与启发式规则，不预测未来走势，不构成任何投资建议。</div>

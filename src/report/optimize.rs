@@ -79,6 +79,8 @@ fn build_html(meta: &OptMeta, report: &OptReport, data_json: &str) -> String {
     // 排序所依指标对应的列名（用于整列高亮 class）
     let metric_col = report.metric.as_str();
 
+    let has_oos = report.split_ratio.is_some();
+
     let rows: String = report.ranked.iter().enumerate().map(|(i, o)| {
         let s = &o.outcome.summary;
         let t = o.params.as_table();
@@ -87,28 +89,52 @@ fn build_html(meta: &OptMeta, report: &OptReport, data_json: &str) -> String {
             .collect();
         let rank_best = if i == 0 { " best" } else { "" };
         let hl = |col: &str| if col == metric_col { " best" } else { "" };
+
+        // 检验段列。训练段是 argmax 出来的（必然好看），检验段才是没见过的数据 ——
+        // 故这里刻意给检验段加底色高亮，让用户先看它。
+        let oos_tds = match &o.oos {
+            Some(oo) => {
+                let os = &oo.summary;
+                format!(
+                    "<td class=\"oos {c1}\">{r1}</td><td class=\"oos\">{s1:.2}</td><td class=\"oos neg\">{m1}</td>",
+                    c1 = sign_class(os.total_return), r1 = fmt_pct(os.total_return),
+                    s1 = os.sharpe, m1 = fmt_pct(os.max_drawdown))
+            }
+            None => "<td class=\"oos\" colspan=\"3\">—（数据不足，无检验段）</td>".to_string(),
+        };
+
         format!(
             "<tr>\
 <td class=\"{rank_best}\">{rank}</td>\
 {params}\
 <td class=\"{cret}{h_ret}\">{ret}</td>\
-<td class=\"{cann}{h_ann}\">{ann}</td>\
-<td class=\"neg{h_mdd}\">{mdd}</td>\
 <td class=\"{h_sharpe}\">{sharpe:.2}</td>\
-<td>{eq:.2}</td>\
+<td class=\"neg{h_mdd}\">{mdd}</td>\
+{oos_tds}\
 <td>{tc}</td>\
 </tr>\n",
             rank_best = rank_best,
             rank = i + 1,
             params = param_tds,
             cret = sign_class(s.total_return), h_ret = hl("total_return"), ret = fmt_pct(s.total_return),
-            cann = sign_class(s.annualized), h_ann = hl("annualized"), ann = fmt_pct(s.annualized),
-            h_mdd = hl("max_drawdown"), mdd = fmt_pct(s.max_drawdown),
             h_sharpe = hl("sharpe"), sharpe = s.sharpe,
-            eq = s.final_equity,
+            h_mdd = hl("max_drawdown"), mdd = fmt_pct(s.max_drawdown),
+            oos_tds = oos_tds,
             tc = s.trade_count,
         )
     }).collect();
+
+    let n_params = report.param_keys.len().max(1);
+    let split_desc = match report.split_ratio {
+        Some(r) => format!("训练段 前{:.0}% / 检验段 后{:.0}%", r * 100.0, (1.0 - r) * 100.0),
+        None => "未切分（全部为样本内）".to_string(),
+    };
+    let caveat_html = crate::report::html_escape(&report.caveat).replace('\n', "<br/>");
+    let oos_group_th = if has_oos {
+        "<th class=\"oos\" colspan=\"3\">检验段（样本外 · 请看这里）</th>"
+    } else {
+        "<th class=\"oos\" colspan=\"3\">检验段（无）</th>"
+    };
 
     format!(r#"<!DOCTYPE html>
 <html lang="zh-CN">
@@ -134,20 +160,31 @@ td{{padding:7px 10px;border-bottom:1px solid #f0f2f5}}
 tr:last-child td{{border-bottom:none}}
 .best{{font-weight:700;background:#fffbe6}}
 .scrollable{{overflow-x:auto}}
+.oos{{background:#eef7f0}}
+.caveat{{background:#fffbf0;border-left:4px solid #b8860b;color:#5a4a1a}}
+.caveat h2{{color:#8a6d1a;border-bottom-color:#e8d9a8}}
 </style>
 </head>
 <body>
 <div class="container">
 <header>
   <h1>参数寻优报告</h1>
-  <div class="subtitle">基金 {fund} &nbsp;|&nbsp; 策略 {strat} &nbsp;|&nbsp; 区间 {start} ~ {end} &nbsp;|&nbsp; 排序指标 {metric} &nbsp;|&nbsp; 共 {total} 组合（图示 Top {top_n}）</div>
+  <div class="subtitle">基金 {fund} &nbsp;|&nbsp; 策略 {strat} &nbsp;|&nbsp; 区间 {start} ~ {end} &nbsp;|&nbsp; 排序指标 {metric} &nbsp;|&nbsp; 共 {total} 组合（图示 Top {top_n}）&nbsp;|&nbsp; {split_desc}</div>
 </header>
+
+<div class="card caveat">
+  <h2>⚠ 关于「最优参数」，先读这段</h2>
+  <div>{caveat_html}</div>
+</div>
 
 <div class="card">
   <h2>组合排名</h2>
   <div class="scrollable">
   <table>
-    <thead><tr><th>排名</th>{param_th}<th>总收益</th><th>年化</th><th>最大回撤</th><th>夏普</th><th>期末市值</th><th>交易次数</th></tr></thead>
+    <thead>
+      <tr><th rowspan="2">排名</th><th colspan="{n_params}">参数</th><th colspan="3">训练段（选参数用 · 必然好看）</th>{oos_group_th}<th rowspan="2">交易次数</th></tr>
+      <tr>{param_th}<th>总收益</th><th>夏普</th><th>最大回撤</th><th class="oos">总收益</th><th class="oos">夏普</th><th class="oos">最大回撤</th></tr>
+    </thead>
     <tbody>
 {rows}    </tbody>
   </table>
@@ -234,18 +271,25 @@ mod tests {
         ]
     }
 
+    fn run(label: &str, total_return: f64) -> RunOutcome {
+        RunOutcome {
+            name: label.to_string(),
+            fund_code: "161725".to_string(),
+            summary: Summary { total_contributed: 1000.0, final_equity: 2000.0, total_return, annualized: 0.4, max_drawdown: 0.1, sharpe: 1.2, trade_count: 1 },
+            daily: daily(),
+        }
+    }
+
+    /// 训练段 total_return 传 `total_return`，检验段固定给一个明显更差的值 ——
+    /// 报告必须把这个落差呈现出来。
     fn outcome(label: &str, total_return: f64, ma: i64) -> OptOutcome {
         let mut params = toml::Table::new();
         params.insert("ma_window".into(), toml::Value::Integer(ma));
         OptOutcome {
             params: toml::Value::Table(params),
             label: label.to_string(),
-            outcome: RunOutcome {
-                name: label.to_string(),
-                fund_code: "161725".to_string(),
-                summary: Summary { total_contributed: 1000.0, final_equity: 2000.0, total_return, annualized: 0.4, max_drawdown: 0.1, sharpe: 1.2, trade_count: 1 },
-                daily: daily(),
-            },
+            outcome: run(label, total_return),
+            oos: Some(run(label, total_return * 0.2)),   // 样本外大幅衰减
         }
     }
 
@@ -255,6 +299,8 @@ mod tests {
             strategy: "smart_dca".to_string(), metric: "total_return".to_string(), top_n: 5,
             ranked: vec![outcome("ma_window=250", 1.0, 250)],
             param_keys: vec!["ma_window".to_string()],
+            split_ratio: Some(0.70), combos: 1,
+            caveat: "参数在训练段上选出，请只看检验段的数字。".to_string(),
         };
         let meta = OptMeta { start: d(2024,1,1), end: d(2024,2,15), fund_code: "161725".to_string() };
         let html = render_optimize_html(&meta, &report);
@@ -271,6 +317,8 @@ mod tests {
             top_n: 5,
             ranked: vec![outcome("ma_window=250", 1.0, 250), outcome("ma_window=120", 0.5, 120)],
             param_keys: vec!["ma_window".to_string()],
+            split_ratio: Some(0.70), combos: 2,
+            caveat: "参数在训练段上选出，请只看检验段的数字。".to_string(),
         };
         let meta = OptMeta { start: d(2024, 1, 1), end: d(2024, 2, 15), fund_code: "161725".to_string() };
         let tmp = std::env::temp_dir().join("xlh_optimize_test");

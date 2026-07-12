@@ -116,14 +116,23 @@ fn run_cli(config: &std::path::Path) -> Result<()> {
         let fee = config::build_fee(&cfg);
         let report = xlh::optimize::run_optimize(opt, &cfg.data.fund_code, &points, fee, cfg.portfolio.initial_cash)?;
         let show = report.top_n.min(report.ranked.len());
-        println!("== 寻优 Top {} （按 {}）==", show, report.metric);
+        println!("== 寻优 Top {} （按训练段 {} 排序）==", show, report.metric);
         for (i, o) in report.ranked.iter().take(show).enumerate() {
-            println!("  {}. {}  总收益 {:.2}%  夏普 {:.2}  最大回撤 {:.2}%",
+            let t = &o.outcome.summary;
+            print!("  {}. {}\n     训练段(选参数用): 收益 {:.2}%  夏普 {:.2}  回撤 {:.2}%\n",
                 i + 1, o.label,
-                o.outcome.summary.total_return * 100.0,
-                o.outcome.summary.sharpe,
-                o.outcome.summary.max_drawdown * 100.0);
+                t.total_return * 100.0, t.sharpe, t.max_drawdown * 100.0);
+            match &o.oos {
+                Some(oo) => {
+                    let s = &oo.summary;
+                    println!("     检验段(样本外·看这个): 收益 {:.2}%  夏普 {:.2}  回撤 {:.2}%",
+                        s.total_return * 100.0, s.sharpe, s.max_drawdown * 100.0);
+                }
+                None => println!("     检验段: 无（数据不足）"),
+            }
         }
+        // 警示必须打出来 —— 只写在 struct 里没人看见的警示等于没有
+        println!("\n{}\n", report.caveat);
         let meta = xlh::report::optimize::OptMeta {
             start: cfg.data.start, end: cfg.data.end, fund_code: cfg.data.fund_code.clone(),
         };

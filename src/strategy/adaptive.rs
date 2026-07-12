@@ -54,7 +54,7 @@ fn rsi(history: &[MarketEvent], window: usize) -> Option<f64> {
 
 impl Strategy for Adaptive {
     fn on_market(&mut self, ctx: &StrategyContext) -> Vec<SignalEvent> {
-        let today = ctx.today.date;
+        let today = ctx.today;
         let cur_rsi = rsi(ctx.history, self.rsi_window);
         let mas = moving_average(ctx.history, self.ma_short);
         let mal = moving_average(ctx.history, self.ma_long);
@@ -117,7 +117,7 @@ mod tests {
         let bs = bars(navs);
         let mut out = Vec::new();
         for i in 0..bs.len() {
-            let ctx = StrategyContext { today: &bs[i], history: &bs[..=i], shares: if i > 0 { shares } else { 0.0 }, avg_cost: 1.0, cash: 0.0 };
+            let ctx = StrategyContext { today: bs[i].date, history: &bs[..i], shares: if i > 0 { shares } else { 0.0 }, avg_cost: 1.0, cash: 0.0 };
             out.extend(s.on_market(&ctx));
         }
         out
