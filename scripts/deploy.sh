@@ -8,8 +8,9 @@
 # ## 数据安全的核心约定
 #
 # 部署目录（/opt/xlh）会被**覆盖**：镜像、compose、config 都是每次重发的。
-# 状态目录（XLH_STATE_DIR，默认 /srv/xlh-state）在**部署目录之外**，本脚本**绝不触碰**。
-# 所以：重新部署不会丢数据。
+# 状态目录（XLH_STATE_DIR，默认 = 部署目录 /opt/xlh）：数据在 /opt/xlh/data。
+# 本脚本只 scp 具体文件进部署目录，**从不 rm -rf、从不整目录覆盖** —— 所以重新部署不会丢数据。
+# 想彻底免疫手工误删，可把 XLH_STATE_DIR 指到部署目录之外（如 /srv/xlh-state）。
 #
 # 脚本会在部署前后各查一次 xlh.db 的用户数并比对 —— 数据没了会立刻报错，而不是等你发现。
 set -euo pipefail
@@ -17,12 +18,12 @@ set -euo pipefail
 TARGET="${1:-}"
 REMOTE_DIR="${2:-/opt/xlh}"
 IMAGE="${XLH_IMAGE:-xlh:latest}"
-STATE_DIR="${XLH_STATE_DIR:-/srv/xlh-state}"
+STATE_DIR="${XLH_STATE_DIR:-$REMOTE_DIR}"   # 默认 = 部署目录 → 数据在 /opt/xlh/data
 TARBALL="xlh-latest.tar.gz"
 
 if [[ -z "$TARGET" ]]; then
   echo "用法: $0 user@host [部署目录]   （默认 /opt/xlh）" >&2
-  echo "     状态目录由 XLH_STATE_DIR 决定（默认 /srv/xlh-state），须在部署目录之外" >&2
+  echo "     状态目录由 XLH_STATE_DIR 决定（默认 = 部署目录，数据在 <部署目录>/data）" >&2
   exit 1
 fi
 
@@ -30,11 +31,21 @@ case "$STATE_DIR" in
   /*) ;;
   *) echo "✗ XLH_STATE_DIR 必须是绝对路径，当前: $STATE_DIR" >&2; exit 1;;
 esac
-# 状态目录若落在部署目录里面，就失去了「部署不丢数据」的全部意义
+
+# 状态目录落在部署目录内部（如 /opt/xlh，数据即 /opt/xlh/data）。
+#
+# 本脚本**不会**删除部署目录 —— 它只 scp 几个具体文件（镜像包、compose、config）进去，
+# 从不 rm -rf、从不 rsync --delete。所以这么放是可行的，也是默认配置。
+#
+# 但风险是真实的、且不在本脚本的控制范围内：任何一次手工的 `rm -rf /opt/xlh`、
+# 整目录覆盖、或换用别的部署工具（rsync --delete / ansible copy），都会连数据一起抹掉。
+# 想彻底免疫这类事故，把 XLH_STATE_DIR 指到部署目录之外（如 /srv/xlh-state）。
 if [[ "$STATE_DIR" == "$REMOTE_DIR"/* || "$STATE_DIR" == "$REMOTE_DIR" ]]; then
-  echo "✗ XLH_STATE_DIR ($STATE_DIR) 在部署目录 ($REMOTE_DIR) 内部。" >&2
-  echo "  部署会覆盖部署目录 —— 状态放在里面迟早会被抹掉。请换到外面，如 /srv/xlh-state" >&2
-  exit 1
+  echo "ℹ 状态目录在部署目录内：$STATE_DIR/data"
+  echo "  本脚本不会删除它（只 scp 具体文件，不做整目录覆盖）。"
+  echo "  但要留意：手工 rm -rf $REMOTE_DIR 或用 rsync --delete 覆盖，会连数据一起没。"
+  echo "  每次部署前会自动备份到 $STATE_DIR/backups/。"
+  echo ""
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -201,7 +212,12 @@ fi
 
 echo ""
 echo "✅ 部署完成"
-echo "   数据目录：$STATE_DIR（在部署目录之外，重新部署不会动它）"
+echo "   数据    ：$STATE_DIR/data/xlh.db"
+if [[ "$STATE_DIR" == "$REMOTE_DIR" || "$STATE_DIR" == "$REMOTE_DIR"/* ]]; then
+  echo "             （在部署目录内。本脚本不会删它，但手工 rm -rf $REMOTE_DIR 会连它一起没）"
+else
+  echo "             （在部署目录之外，任何部署动作都碰不到）"
+fi
 echo "   备份    ：$STATE_DIR/backups/（每次部署前自动备份，保留最近 10 份）"
 echo "   日志    ：ssh $TARGET 'cd $REMOTE_DIR && docker compose -f docker-compose.prod.yml logs -f'"
 echo "   Web 绑在 127.0.0.1:8080，请在其前面配 Nginx/Caddy 反代 + HTTPS 后再对外访问。"

@@ -21,7 +21,7 @@
 # 实在没有 sqlite3 时，cp 必须把 -wal / -shm 一起带上。
 set -euo pipefail
 
-STATE_DIR="${XLH_STATE_DIR:-/srv/xlh-state}"
+STATE_DIR="${XLH_STATE_DIR:-/opt/xlh}"
 DB="$STATE_DIR/data/xlh.db"
 BACKUP_DIR="$STATE_DIR/backups"
 KEEP=20

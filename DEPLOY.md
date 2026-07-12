@@ -3,35 +3,57 @@
 ## TL;DR
 
 ```bash
-# 服务器上（一次性）
-sudo mkdir -p /srv/xlh-state
-
 # 本机
 docker build -t xlh:latest .
 scripts/deploy.sh user@your-server            # 仅 Web
 WITH_PUSH=1 scripts/deploy.sh user@your-server # 同时起定时推送守护
 ```
 
-数据在服务器的 `/srv/xlh-state/`，**在部署目录之外**。重新部署不会碰它。
+数据在服务器的 **`/opt/xlh/data/xlh.db`**。
+
+`deploy.sh` 只 scp 具体文件进部署目录（镜像包、compose、config），**从不 `rm -rf`、
+从不整目录覆盖** —— 所以重新部署不会丢数据，每次部署前还会自动备份一份。
+
+想彻底免疫手工误删（`rm -rf /opt/xlh`、`rsync --delete`、换别的部署工具），
+把状态目录指到部署目录之外：
+
+```bash
+XLH_STATE_DIR=/srv/xlh-state scripts/deploy.sh user@your-server
+```
 
 ---
 
 ## 数据在哪，为什么这么放
 
+`XLH_STATE_DIR` 默认 `/opt/xlh`（即部署目录）。
+
 | 路径 | 内容 | 丢了会怎样 |
 |---|---|---|
-| `$XLH_STATE_DIR/data/xlh.db` | 用户、授权码、会话、推送配置、建议历史 | **不可再生。全没了。** |
-| `$XLH_STATE_DIR/cache/` | 净值 / K线 / 财报 / 估值缓存 | 可再生，但全量重抓要很久 |
-| `$XLH_STATE_DIR/output/` | 回测报告 HTML | 无所谓 |
+| `/opt/xlh/data/xlh.db` | 用户、授权码、会话、推送配置、建议历史 | **不可再生。全没了。** |
+| `/opt/xlh/cache/` | 净值 / K线 / 财报 / 估值缓存 | 可再生，但全量重抓要很久 |
+| `/opt/xlh/output/` | 回测报告 HTML | 无所谓 |
+| `/opt/xlh/backups/` | 自动备份（每次部署前一份，留最近 10 份） | — |
 
-`XLH_STATE_DIR` 默认 `/srv/xlh-state`，**必须在部署目录（`/opt/xlh`）之外**。
+### 放在部署目录里安全吗
 
-这一条是整个部署方案的核心。部署会覆盖部署目录里的镜像、compose、config —— 如果状态也放在
-里面（比如 `/opt/xlh/data`），任何一次「换目录 / 清空重建 / 解包覆盖 / rsync --delete」都会
-把数据一起抹掉。`scripts/deploy.sh` 会主动拒绝把 `XLH_STATE_DIR` 设在部署目录内。
+`deploy.sh` **只 scp 具体文件**进部署目录（`xlh-latest.tar.gz`、`docker-compose.prod.yml`、
+`config.toml`），从不 `rm -rf`、从不整目录覆盖。所以**它自己不会弄丢数据**。
 
-`docker-compose.prod.yml` 也不给 `XLH_STATE_DIR` 设默认值 —— 没设就**直接报错**。
-静默回退到 `./data` 正是要杜绝的那种失败方式：它看起来能跑，直到某天你发现数据没了。
+风险在脚本之外：手工 `rm -rf /opt/xlh`、`rsync --delete` 同步、或换用别的部署工具
+（ansible copy 之类），都会连数据一起抹掉。要免疫这类事故，把状态指到部署目录之外：
+
+```bash
+XLH_STATE_DIR=/srv/xlh-state scripts/deploy.sh user@your-server
+```
+
+`deploy.sh` 会自动检测旧位置的数据并询问是否迁移。
+
+### 一个刻意的设计
+
+`docker-compose.prod.yml` **不给 `XLH_STATE_DIR` 设默认值** —— 没设就直接报错启动失败。
+
+静默回退（比如悄悄用 `./data`）是最危险的失败方式：服务照常起来、页面照常打开，
+但读的是一个空库，**所有账号都登不上**，看起来像"数据丢了"。宁可起不来，也不要这样。
 
 ---
 

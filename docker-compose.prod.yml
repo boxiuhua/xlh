@@ -5,13 +5,19 @@
 #
 # ## 数据在哪
 #
-# 全部持久状态都在宿主机的 ${XLH_STATE_DIR}（默认 /srv/xlh-state），**在部署目录之外**。
-# 部署会替换镜像与 compose 文件，但绝不触碰这个目录 —— 所以重新部署不会丢数据。
+# 全部持久状态都在宿主机的 ${XLH_STATE_DIR}（部署时由 deploy.sh 写进 .env，默认 /opt/xlh）：
 #
 #   ${XLH_STATE_DIR}/data/xlh.db   ← 用户、授权码、会话、推送配置、建议历史
 #                                     这是唯一不可再生的数据，务必备份（scripts/backup.sh）
 #   ${XLH_STATE_DIR}/cache/        ← 净值/K线/财报/估值缓存。可再生，但全量重抓要很久
 #   ${XLH_STATE_DIR}/output/       ← 回测报告 HTML。可随时丢弃
+#
+# deploy.sh 只 scp 具体文件进部署目录，从不 rm -rf、从不整目录覆盖 —— 所以重新部署不丢数据。
+# 想彻底免疫手工误删（rm -rf /opt/xlh、rsync --delete），把 XLH_STATE_DIR 指到部署目录之外。
+#
+# 这里刻意**不给 XLH_STATE_DIR 默认值**：没设就直接报错。
+# 静默回退（比如悄悄用 ./data）正是最危险的失败方式 —— 服务照常起来、页面照常打开，
+# 但读的是一个空库，所有账号都登不上，看起来像"数据丢了"。宁可起不来，也不要这样。
 
 services:
   xlh-web:
