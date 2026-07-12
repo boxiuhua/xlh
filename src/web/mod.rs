@@ -1183,10 +1183,42 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         for m in ["data-tab=\"s-diagnose\"", "data-tab=\"s-backtest\"", "data-tab=\"s-screen\"",
+                  "data-tab=\"s-quality\"", "data-tab=\"s-attrib\"",
                   "/api/stock/diagnose", "/api/stock/run", "/api/stock/recommend", "/api/stock/search",
-                  "id=\"sd-result\"", "id=\"sb-result\"", "id=\"ss-result\"", "attachStockCombobox"] {
+                  "/api/stock/screen", "/api/stock/attribution",
+                  "id=\"sd-result\"", "id=\"sb-result\"", "id=\"ss-result\"",
+                  "id=\"sq-result\"", "id=\"sa-result\"", "attachStockCombobox"] {
             assert!(body.contains(m), "首页应含 {m}");
         }
+    }
+
+    /// 前端的护栏必须和后端一样硬：
+    /// 质量筛选一节若不显示基础发生率，它就会被读成「翻倍名单」；
+    /// 若渲染出一个总分，它就变回了它刻意不想成为的那种选股推荐器。
+    #[tokio::test]
+    async fn quality_and_attribution_ui_keep_their_guardrails() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let resp = super::core_router()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // 筛选：必须渲染基础发生率，且自我否定「推荐」含义
+        assert!(body.contains("base_rate"), "筛选结果须渲染基础发生率");
+        assert!(body.contains("这不是选股推荐器"), "面板须自我否定「推荐」含义");
+        assert!(body.contains("排除明细"), "排除项须与通过名单一样显眼");
+
+        // 归因：两种口径必须分开呈现，不得把裸价格说成总回报
+        assert!(body.contains("含分红再投资"));
+        assert!(body.contains("不含分红"));
+        // 亏损区间拒绝给占比的理由须对用户可见
+        assert!(body.contains("翻号误导"));
+
+        // 推送配置须能开关筛选章节
+        assert!(body.contains("id=\"pu-screen-codes\""));
     }
 
     #[tokio::test]

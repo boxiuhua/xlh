@@ -139,6 +139,8 @@ xlhMe();
     <button class="tab" data-tab="s-diagnose">股诊断</button>
     <button class="tab" data-tab="s-backtest">股回测</button>
     <button class="tab" data-tab="s-screen">股选股</button>
+    <button class="tab" data-tab="s-quality">质量筛选</button>
+    <button class="tab" data-tab="s-attrib">归因分解</button>
   </div>
 
   <!-- 单次 -->
@@ -333,6 +335,13 @@ xlhMe();
         <div class="field" style="flex:1;min-width:240px"><label>额外诊断·股票(逗号分隔)</label><input id="pu-diag-stock" placeholder="如 600519,000001"/></div>
       </div>
 
+      <div style="margin-top:14px;font-weight:600;color:#1a252f">质量筛选（可选）</div>
+      <div class="row">
+        <div class="field" style="flex:1;min-width:240px"><label>待筛股票(逗号分隔，留空=不推送该章节)</label><input id="pu-screen-codes" placeholder="如 600519,300750,600036"/></div>
+        <div class="field"><label>取 Top-N</label><input type="number" id="pu-screen-topn" value="10"/></div>
+      </div>
+      <div class="hint">推送里会多出「质量筛选（排除法，非推荐）」一节：只列排除结果与可核验事实，并强制附带历史基础发生率。</div>
+
       <div style="margin-top:14px">
         <button class="small" id="pu-load">读取当前配置</button>
         <button class="small" id="pu-save">保存</button>
@@ -391,6 +400,40 @@ xlhMe();
       </div>
       <div class="hint" style="margin-top:8px">对预设股票池逐只多策略样本外评分 + 技术诊断后排名；首次联网抓取较慢，命中缓存后秒级。不构成任何投资建议。</div>
       <div id="ss-result" style="margin-top:14px"></div>
+    </div>
+  </div>
+
+  <!-- 质量筛选（排除法，非推荐）-->
+  <div class="panel" id="panel-s-quality">
+    <div class="card">
+      <div class="row">
+        <div class="field" style="flex:1;min-width:280px"><label>股票代码(逗号分隔，留空用预设池)</label><input id="sq-codes" placeholder="如 600519,300750,600036"/></div>
+        <div class="field"><label>取 Top-N</label><input type="number" id="sq-topn" value="20"/></div>
+        <button class="run" id="run-s-quality">筛选</button>
+      </div>
+      <div class="hint" style="margin-top:8px">
+        <strong>这不是选股推荐器。</strong>它只做「排除」（近四季度亏损 / ST退市PT壳股 / 财报历史过短 / 市值过小），
+        不给评分、不给买卖信号 —— 因为「百倍股事前特征」那类量化阈值经不起检验（详见下方基础发生率）。
+        筛选的价值在于挡住明确的坏标的，而不是挑出未来的赢家。首次联网抓财报较慢，命中缓存后秒级。
+      </div>
+      <div id="sq-result" style="margin-top:14px"></div>
+    </div>
+  </div>
+
+  <!-- 归因分解 -->
+  <div class="panel" id="panel-s-attrib">
+    <div class="card">
+      <div class="row">
+        <div class="field" style="flex:1;min-width:220px"><label>股票代码(仅沪深A股)</label><input id="sa-code" placeholder="如 600519"/></div>
+        <div class="field"><label>起始日(选填)</label><input type="date" id="sa-start"/></div>
+        <button class="run" id="run-s-attrib">分解</button>
+      </div>
+      <div class="hint" style="margin-top:8px">
+        把「涨了多少倍」拆成 <strong>盈利增长 × 估值扩张 × 分红再投资</strong>。
+        同样是上涨，靠盈利增长和靠估值修复是两回事 —— 不拆开看不出来。
+        起始日留空则用数据覆盖的最早日期；归因窗口受行情源的后复权覆盖范围限制。
+      </div>
+      <div id="sa-result" style="margin-top:14px"></div>
     </div>
   </div>
 
@@ -984,6 +1027,154 @@ function renderStockScreen(rep){
   box.innerHTML = head + cards + foot;
 }
 
+// ---- 质量筛选（排除法）----
+function n1(x){ return (x==null || !isFinite(x)) ? '—' : Number(x).toFixed(1); }
+function n2(x){ return (x==null || !isFinite(x)) ? '—' : Number(x).toFixed(2); }
+function pctOf(x){ return (x==null || !isFinite(x)) ? '—' : (x*100).toFixed(0)+'%'; }
+function yi(x){ return (x==null || !isFinite(x)) ? '—' : (x/1e8).toFixed(0)+'亿'; }
+
+function qCard(p){
+  // 刻意不渲染任何「评分」「信号」——后端也不返回这些字段。
+  // 一旦这里出现一个总分，这份清单就会被读成买入名单。
+  var pePct = p.pe_percentile;
+  var peTxt = p.pe_ttm==null ? '—' : n2(p.pe_ttm);
+  var pctTxt = pePct==null ? '（历史样本不足）' : '（自身历史 '+pctOf(pePct)+' 分位）';
+  return '<div class="card" style="border-left:4px solid #7f8c8d">'
+    + '<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">'
+    + '<span style="font-size:1.1rem;font-weight:600">'+esc(p.name)+'</span>'
+    + '<span style="color:#7f8c8d">'+esc(p.code)+'</span>'
+    + '<span style="margin-left:auto;color:#5a6a7a">市值 '+yi(p.market_cap)+'</span></div>'
+    + '<div style="margin-top:8px;color:#34495e">'
+    +   p.years+' 年年报 · ROE中位数 '+n1(p.roe_median)+'% · ROE连续≥15%：<strong>'+p.roe_streak+' 年</strong></div>'
+    + '<div style="margin-top:6px;color:#34495e">'
+    +   '净利5年CAGR '+n1(p.profit_cagr)+'% · 营收5年CAGR '+n1(p.revenue_cagr)+'%'
+    +   (p.gross_margin==null ? '' : ' · 毛利率 '+n1(p.gross_margin)+'%')+'</div>'
+    + '<div style="margin-top:6px;color:#34495e">PE(TTM) '+peTxt+' <span style="color:#5a6a7a">'+esc(pctTxt)+'</span></div>'
+    + '<div style="margin-top:6px;color:#5a6a7a;font-size:.9rem">'+esc(p.note)+'</div></div>';
+}
+
+function renderQuality(rep){
+  var box = document.getElementById('sq-result');
+  if(!rep || !Array.isArray(rep.top)){ box.innerHTML = '<span style="color:#c0392b">筛选失败</span>'; return; }
+
+  var head = '<div style="color:#5a6a7a;margin-bottom:10px">交易日 '+esc(rep.trade_date)
+           + ' · 池 '+rep.pool_size+' 只 · 通过 '+rep.passed+' 只</div>';
+
+  var cards = rep.top.length
+    ? rep.top.map(qCard).join('')
+    : '<div style="color:#c0392b">本轮无标的通过筛选。</div>';
+
+  // 「排除了什么」必须和「筛出了什么」一样显眼 —— 否则读者无从判断这份清单可不可信
+  var exc = '';
+  if((rep.excluded||[]).length){
+    exc = '<div class="card" style="border-left:4px solid #c0392b">'
+        + '<div style="font-weight:600;color:#1a252f">排除明细</div>'
+        + rep.excluded.map(function(e){
+            return '<div style="margin-top:6px;color:#34495e"><strong>'+e[1]+' 只</strong> · '+esc(e[0])+'</div>';
+          }).join('')
+        + '</div>';
+  }
+
+  // 基础发生率：没有它，一份「优质股清单」天然会被读成「翻倍名单」。
+  // 后端强制返回，前端强制显示 —— 两头都堵死。
+  var br = rep.base_rate || {};
+  var rates = '<div class="card" style="border-left:4px solid #b8860b;background:#fffbf0">'
+    + '<div style="font-weight:600;color:#1a252f">'+esc(br.headline||'')+'</div>'
+    + '<ul style="margin:8px 0 0 18px;padding:0;color:#34495e;line-height:1.7">'
+    + (br.facts||[]).map(function(f){ return '<li>'+esc(f)+'</li>'; }).join('')
+    + '</ul></div>';
+
+  var foot = '<div class="hint" style="margin-top:6px;color:#c0392b">'+esc(rep.disclaimer||'')+'</div>';
+  box.innerHTML = head + cards + exc + rates + foot;
+}
+
+document.getElementById('run-s-quality').addEventListener('click', function(){
+  var btn = this, box = document.getElementById('sq-result');
+  var codes = document.getElementById('sq-codes').value.trim();
+  var topn = document.getElementById('sq-topn').value || 20;
+  setBtn(btn, true, '筛选'); box.textContent = '筛选中…（首次需联网抓财报，请稍候）';
+  var url = '/api/stock/screen?top_n=' + encodeURIComponent(topn)
+          + (codes ? '&codes=' + encodeURIComponent(codes) : '');
+  fetch(url)
+    .then(function(res){ if(!res.ok) return res.text().then(function(x){ throw new Error(x); }); return res.json(); })
+    .then(renderQuality)
+    .catch(function(e){ box.innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
+    .finally(function(){ setBtn(btn, false, '筛选'); });
+});
+
+// ---- 归因分解 ----
+function renderAttrib(a){
+  var box = document.getElementById('sa-result');
+  if(!a){ box.innerHTML = '<span style="color:#c0392b">归因失败</span>'; return; }
+
+  var gain = (a.total_multiple!=null ? a.total_multiple : a.price_multiple) > 1;
+  var accent = gain ? '#1a7f37' : '#c0392b';
+
+  // 口径必须写在脸上：没有后复权数据时，绝不能把裸价格说成「总回报」。
+  var headline;
+  if(a.total_multiple!=null){
+    headline = '<div style="font-size:1.25rem;font-weight:700;color:'+accent+'">总回报 '+n2(a.total_multiple)+' 倍'
+             + '<span style="font-size:.85rem;font-weight:400;color:#5a6a7a">（含分红再投资）</span></div>'
+             + '<div style="margin-top:6px;color:#34495e">裸价格 '+n2(a.price_multiple)+' 倍 · '
+             + '分红再投资贡献 '+n2(a.dividend_multiple)+' 倍</div>';
+  } else {
+    headline = '<div style="font-size:1.25rem;font-weight:700;color:'+accent+'">裸价格 '+n2(a.price_multiple)+' 倍'
+             + '<span style="font-size:.85rem;font-weight:400;color:#c0392b">（无后复权数据，<strong>不含分红</strong>）</span></div>';
+  }
+
+  // 亏损区间不给占比：ln(回报)<0 会让分母翻号，算出「盈利贡献 -67%、估值 +230%」这种
+  // 读起来像「盈利增长害你亏钱」的数字。后端返回 null，前端就得用人话讲。
+  var split;
+  if(a.earnings_share!=null){
+    var eS = a.earnings_share*100, vS = a.valuation_share*100;
+    var barE = Math.max(0, Math.min(100, eS));
+    split = '<div style="margin-top:12px;color:#34495e">'
+          + '盈利增长 <strong>'+n2(a.earnings_multiple)+' 倍</strong>（占 '+eS.toFixed(0)+'%）'
+          + ' × 估值'+(a.valuation_multiple>=1?'扩张':'收缩')+' <strong>'+n2(a.valuation_multiple)+' 倍</strong>'
+          + '（占 '+vS.toFixed(0)+'%）</div>'
+          + '<div style="margin-top:8px;height:14px;border-radius:7px;overflow:hidden;background:#e8ecef;display:flex">'
+          + '<div style="width:'+barE+'%;background:#1a7f37" title="盈利增长"></div>'
+          + '<div style="flex:1;background:#b8860b" title="估值 + 分红"></div></div>'
+          + '<div style="margin-top:4px;color:#5a6a7a;font-size:.85rem">绿=盈利增长 · 金=估值与分红</div>'
+          + (eS > 100 ? '<div style="margin-top:8px;color:#5a6a7a">盈利占比超过 100%，是因为估值收缩在拖后腿 —— 涨幅全靠盈利增长扛出来。</div>' : '');
+  } else {
+    split = '<div style="margin-top:12px;color:#34495e">'
+          + '盈利增长 <strong>'+n2(a.earnings_multiple)+' 倍</strong>（正贡献），'
+          + '但估值'+(a.valuation_multiple>=1?'扩张':'收缩')+'至 <strong>'+n2(a.valuation_multiple)+' 倍</strong>，'
+          + (a.earnings_multiple>1 ? '把盈利增长吃光还倒贴。' : '进一步放大了亏损。')
+          + '</div>'
+          + '<div style="margin-top:6px;color:#5a6a7a">这段区间是亏损的。「各项占比」在亏损下会翻号误导（会算出「盈利贡献为负」这种荒谬结论），故不给出。</div>';
+  }
+
+  var meta = '<div style="margin-top:12px;color:#5a6a7a">'
+    + esc(a.start_date)+' → '+esc(a.end_date)+'（'+n1(a.years)+' 年）· 年化 '+n1(a.annualized)+'%'
+    + ' · 起点PE '+n2(a.start_pe)+' → 终点PE '+n2(a.end_pe)
+    + (a.start_pe_percentile!=null ? ' · 起点处自身历史 '+pctOf(a.start_pe_percentile)+' 分位' : '')
+    + '</div>';
+
+  var cav = a.caveat
+    ? '<div class="card" style="border-left:4px solid #b8860b;background:#fffbf0;margin-top:12px">'
+      + a.caveat.split('\n').map(function(c){ return '<div style="color:#34495e;margin-top:4px">⚠️ '+esc(c)+'</div>'; }).join('')
+      + '</div>'
+    : '';
+
+  box.innerHTML = '<div class="card" style="border-left:4px solid '+accent+'">'
+    + headline + split + meta + '</div>' + cav;
+}
+
+document.getElementById('run-s-attrib').addEventListener('click', function(){
+  var btn = this, box = document.getElementById('sa-result');
+  var code = document.getElementById('sa-code').value.trim();
+  if(!code){ box.innerHTML = '<span style="color:#c0392b">请先填股票代码</span>'; return; }
+  var start = document.getElementById('sa-start').value;
+  setBtn(btn, true, '分解'); box.textContent = '分解中…（首次需联网抓估值历史，请稍候）';
+  fetch('/api/stock/attribution?code=' + encodeURIComponent(code) + (start ? '&start='+encodeURIComponent(start) : ''))
+    .then(function(res){ if(!res.ok) return res.text().then(function(x){ throw new Error(x); }); return res.json(); })
+    .then(renderAttrib)
+    .catch(function(e){ box.innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
+    .finally(function(){ setBtn(btn, false, '分解'); });
+});
+
 // 股回测参数组（复用 ROW_FIELDS）
 var sbStrat = document.getElementById('sb-strat');
 function buildSbParams(){
@@ -996,6 +1187,7 @@ sbStrat.addEventListener('change', buildSbParams); buildSbParams();
 attachStockCombobox(document.getElementById('sd-code'));
 attachStockCombobox(document.getElementById('sb-code'));
 attachStockCombobox(document.getElementById('s-sync-code'));
+attachStockCombobox(document.getElementById('sa-code'));
 
 // 股票数据同步（复用 /api/stock/sync，响应结构同基金 SyncOutcome）
 document.getElementById('s-sync-all').addEventListener('click', function(){
@@ -1076,10 +1268,16 @@ function collectPushConfig(){
   var t=puNum('pu-total'); if(t!=null) portfolio.total_amount=t;
   var pf2=puNum('pu-profit'); if(pf2!=null) portfolio.total_profit=pf2;
   var cu=puNum('pu-cum'); if(cu!=null) portfolio.cumulative_profit=cu;
+  // 代码留空 → screen 为 null，推送里不出现该章节（后端 Option<ScreenCfg>）
+  var scodes = puCsv('pu-screen-codes');
+  var screen = scodes.length
+    ? { codes: scodes, top_n: Number(document.getElementById('pu-screen-topn').value) || 10 }
+    : null;
   return {
     schedule:{ cron:document.getElementById('pu-cron').value.trim(), only_on_new_data: document.getElementById('pu-onlynew').value==='true' },
     channel:{ kind:document.getElementById('pu-kind').value, webhook:document.getElementById('pu-webhook').value.trim(), secret:document.getElementById('pu-secret').value.trim(), cache_dir:'.cache' },
     portfolio: portfolio,
+    screen: screen,
     holdings: holdings,
     diagnose: puCsv('pu-diag-fund'),
     stocks: stocks,
@@ -1105,6 +1303,9 @@ function loadPushConfig(){
     if(!(c.stocks||[]).length) puStockRow();
     document.getElementById('pu-diag-fund').value = (c.diagnose||[]).join(',');
     document.getElementById('pu-diag-stock').value = (c.diagnose_stocks||[]).join(',');
+    var sc = c.screen || {};
+    document.getElementById('pu-screen-codes').value = (sc.codes||[]).join(',');
+    document.getElementById('pu-screen-topn').value = sc.top_n!=null ? sc.top_n : 10;
   }).catch(function(){ puFundRow(); puStockRow(); });
 }
 function puPost(url, okMsg, btn, onOk){
