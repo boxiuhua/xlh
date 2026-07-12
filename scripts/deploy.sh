@@ -183,18 +183,48 @@ EOF
     echo '    .env 已存在，保持不动'
   fi"
 
+# xlh-push 在 compose 里是可选 profile。不带 --profile push 时，`docker compose up -d`
+# **完全不管这个服务** —— 已存在的 xlh-push 容器不会被重建、不会被停、连看都不看一眼。
+#
+# 真实踩过的坑：服务器上的 xlh-push 是用老 compose 建的（command 还是 `push --file push.toml`，
+# 而 --file 早已被移除），于是 clap 参数解析失败、退出码 2、无限崩溃重启。每次部署它都被
+# 跳过，永远修不好 —— 而用户只看到「推送不生效」，还以为是 cron 的问题。
+#
+# 所以：只要服务器上**已经有** xlh-push 容器，就一律带上 profile 去接管它，不管 WITH_PUSH。
 PROFILE_ARGS=""
-[[ "${WITH_PUSH:-0}" == "1" ]] && PROFILE_ARGS="--profile push"
+if [[ "${WITH_PUSH:-0}" == "1" ]]; then
+  PROFILE_ARGS="--profile push"
+elif ssh "$TARGET" "docker ps -a --filter name=xlh-push --format '{{.Names}}' | grep -q xlh-push"; then
+  PROFILE_ARGS="--profile push"
+  echo "    检测到已有 xlh-push 容器 → 一并重建（否则它会带着旧命令烂在那儿）"
+fi
+
 ssh "$TARGET" "set -e; cd '$REMOTE_DIR'; \
   gunzip -c '$TARBALL' | docker load; \
-  docker compose -f docker-compose.prod.yml $PROFILE_ARGS up -d; \
+  docker compose -f docker-compose.prod.yml $PROFILE_ARGS up -d --force-recreate --remove-orphans; \
   rm -f '$TARBALL'; \
-  docker compose -f docker-compose.prod.yml ps"
+  docker compose -f docker-compose.prod.yml $PROFILE_ARGS ps"
 
-echo "==> 7/7 校验数据仍在"
-sleep 2
-AFTER="$(count_users)"
+echo "==> 7/7 校验数据仍在 + 容器真的健康"
+sleep 8   # 崩溃循环的容器需要几秒才会显露出 Restarting 状态
 rm -f "$TARBALL"
+
+# 「起来了」不等于「活着」。崩溃循环的容器在 `ps` 里也有一行，只是状态是 Restarting ——
+# 这次就是这么被忽略了整整 4 小时。所以要显式检查。
+UNHEALTHY="$(ssh "$TARGET" "docker ps -a --filter name=xlh- --format '{{.Names}} {{.Status}}' \
+  | grep -Ei 'restarting|exited' || true")"
+if [[ -n "$UNHEALTHY" ]]; then
+  echo "" >&2
+  echo "✗ 有容器处于崩溃/退出状态：" >&2
+  echo "$UNHEALTHY" | sed 's/^/    /' >&2
+  echo "" >&2
+  echo "  看日志定位：" >&2
+  echo "  ssh $TARGET 'docker logs --tail 30 \$(echo \"$UNHEALTHY\" | head -1 | cut -d\" \" -f1)'" >&2
+  exit 1
+fi
+echo "    ✓ 所有容器运行正常"
+
+AFTER="$(count_users)"
 
 if [[ "$BEFORE" =~ ^[0-9]+$ ]]; then
   if [[ "$AFTER" =~ ^[0-9]+$ ]] && [[ "$AFTER" -ge "$BEFORE" ]]; then
