@@ -44,6 +44,47 @@ pub struct CurrentRead {
     pub next_hint: String,
 }
 
+/// 触发线的历史前瞻检验。
+///
+/// ## 为什么需要它
+///
+/// 「低吸线 1.2345 · 买入 1000 元」是一条**精确到 4 位小数的价格点位 + 具体下单指令**。
+/// 而此前展示给用户的唯一"证据"是**穿越次数**（"窗口内触发：低吸 12 次"）——
+/// 这个数字由构造决定必然会发生若干次，它**完全不告诉你按这条线操作是否赚钱**。
+///
+/// 更糟的是那个计数本身也有未来函数：它拿**最终的**波动带（由最后 60 天算出）
+/// 去回扫整个窗口，而当时根本不可能知道这条线在哪。
+///
+/// 这里改成正经的事件研究：**滚动**计算波动带（每个时点只用它之前的数据），
+/// 记录每次触发，统计其后 `horizon_days` 的前瞻收益，并与"随便哪天买入持有同样长度"
+/// 的无条件基准对比。**低吸信号若跑不赢基准，它就没有价值** —— 这个结论必须让用户看到。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TriggerEvidence {
+    /// 前瞻窗口（交易日）
+    pub horizon_days: usize,
+    /// 可用于检验的样本量（需 band_window + horizon 之后才有第一个可检验点）
+    pub sample_days: usize,
+
+    pub buy_signals: usize,
+    /// 低吸触发后 horizon 内上涨的比例
+    pub buy_win_rate: Option<f64>,
+    /// 低吸触发后 horizon 的平均收益 %
+    pub buy_mean_forward: Option<f64>,
+
+    pub sell_signals: usize,
+    /// 高抛触发后 horizon 内**下跌**的比例（跌了才算"躲对了"）
+    pub sell_win_rate: Option<f64>,
+    pub sell_mean_forward: Option<f64>,
+
+    /// 无条件基准：任意一天买入、持有 horizon 的平均收益 %。
+    /// 低吸信号的前瞻收益必须显著高于它，这条线才算有用。
+    pub baseline_mean_forward: Option<f64>,
+    pub baseline_win_rate: Option<f64>,
+
+    /// 人话结论。证据不支持时必须直说。
+    pub verdict: String,
+}
+
 /// 高抛低吸行动计划：均线 ±k·σ 波动带 + 分档仓位 + 当下指引 + 形态修正。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ActionPlan {
@@ -58,6 +99,8 @@ pub struct ActionPlan {
     pub current: CurrentRead,
     pub buy_hits: usize,
     pub sell_hits: usize,
+    /// 这条线到底有没有用 —— 数据不足时为 `None`。
+    pub evidence: Option<TriggerEvidence>,
     pub caveat: String,
 }
 
@@ -72,6 +115,123 @@ impl Default for PlanParams {
     fn default() -> Self {
         Self { band_window: 60, base_amount: 1000.0, sell_pct: 0.20 }
     }
+}
+
+/// 前瞻检验窗口：20 个交易日 ≈ 1 个月。
+const EVIDENCE_HORIZON: usize = 20;
+
+/// 对触发线做无未来函数的事件研究。
+///
+/// 在每个时点 t，波动带**只用 t 之前的 `band_window` 个点**计算 —— 这正是当时真能拿到的信息。
+/// 若 nav[t] 下穿低吸线，就记一次低吸触发，并测 t → t+horizon 的收益。高抛同理。
+/// 同时统计无条件基准（每一个可检验的 t 都算一次），用来回答那个真正的问题：
+/// **这条线挑出来的时点，比随便挑一天更好吗？**
+pub fn evaluate_triggers(points: &[NavPoint], band_window: usize, horizon: usize) -> Option<TriggerEvidence> {
+    // 需要 band_window 个点建带 + 至少一个可测的前瞻窗口
+    if points.len() < band_window + horizon + 2 { return None; }
+
+    let navs: Vec<f64> = points.iter().map(|p| p.acc_nav).collect();
+    let fwd = |t: usize| -> Option<f64> {
+        let (a, b) = (navs[t], *navs.get(t + horizon)?);
+        if a > 0.0 { Some((b / a - 1.0) * 100.0) } else { None }
+    };
+
+    let (mut buy_f, mut sell_f, mut base_f) = (Vec::new(), Vec::new(), Vec::new());
+
+    // t 从 band_window 起（前面不足以建带），到 len-horizon-1 止（再往后测不到前瞻收益）
+    for t in band_window..navs.len().saturating_sub(horizon) {
+        let win = &navs[t - band_window..t];          // 严格是 t 之前的数据，不含 t
+        let ma = win.iter().sum::<f64>() / band_window as f64;
+        let sigma = stdev(win);
+        if sigma <= 0.0 { continue; }
+
+        let Some(r) = fwd(t) else { continue };
+        base_f.push(r);                                // 无条件基准：每个可检验点都计入
+
+        let (prev, cur) = (navs[t - 1], navs[t]);
+        let (buy_line, sell_line) = (ma - sigma, ma + sigma);
+        // 下穿低吸线 / 上穿高抛线（穿越事件，不是"停留在线下"）
+        if prev > buy_line && cur <= buy_line { buy_f.push(r); }
+        if prev < sell_line && cur >= sell_line { sell_f.push(r); }
+    }
+
+    if base_f.is_empty() { return None; }
+
+    let mean = |v: &[f64]| if v.is_empty() { None } else { Some(v.iter().sum::<f64>() / v.len() as f64) };
+    let win_up = |v: &[f64]| if v.is_empty() { None } else {
+        Some(v.iter().filter(|x| **x > 0.0).count() as f64 / v.len() as f64 * 100.0)
+    };
+    let win_down = |v: &[f64]| if v.is_empty() { None } else {
+        Some(v.iter().filter(|x| **x < 0.0).count() as f64 / v.len() as f64 * 100.0)
+    };
+
+    let buy_mean = mean(&buy_f);
+    let base_mean = mean(&base_f);
+    let verdict = build_verdict(buy_f.len(), buy_mean, sell_f.len(), mean(&sell_f), base_mean, horizon);
+
+    Some(TriggerEvidence {
+        horizon_days: horizon,
+        sample_days: base_f.len(),
+        buy_signals: buy_f.len(),
+        buy_win_rate: win_up(&buy_f),
+        buy_mean_forward: buy_mean,
+        sell_signals: sell_f.len(),
+        sell_win_rate: win_down(&sell_f),   // 高抛后下跌才算"躲对了"
+        sell_mean_forward: mean(&sell_f),
+        baseline_mean_forward: base_mean,
+        baseline_win_rate: win_up(&base_f),
+        verdict,
+    })
+}
+
+/// 结论措辞。证据不支持这条线时必须直说 —— 用户正拿着它下单。
+fn build_verdict(
+    n_buy: usize, buy_mean: Option<f64>,
+    n_sell: usize, sell_mean: Option<f64>,
+    base_mean: Option<f64>, horizon: usize,
+) -> String {
+    let Some(base) = base_mean else { return "样本不足，无法检验这条线是否有效。".into() };
+
+    // 样本太少时任何结论都是噪声，不许硬下判断
+    const MIN_SIGNALS: usize = 10;
+    let mut parts = vec![format!(
+        "基准：任意一天买入、持有 {horizon} 个交易日，平均收益 {base:+.2}%。"
+    )];
+
+    match (buy_mean, n_buy >= MIN_SIGNALS) {
+        (Some(b), true) => {
+            let edge = b - base;
+            parts.push(format!(
+                "低吸线触发 {n_buy} 次，其后 {horizon} 日平均 {b:+.2}%，\
+                 相对基准的超额为 {edge:+.2}%。"));
+            if edge <= 0.0 {
+                parts.push("这条低吸线没有跑赢「随便哪天买」—— 按现有历史，它不提供择时价值。".into());
+            } else if edge < 0.5 {
+                parts.push("超额很小，与噪声难以区分；不宜据此加大仓位。".into());
+            } else {
+                parts.push("历史上有正超额，但这是单只基金的样本内统计，未经样本外检验，不保证延续。".into());
+            }
+        }
+        (Some(b), false) => parts.push(format!(
+            "低吸线仅触发 {n_buy} 次（其后平均 {b:+.2}%），样本量不足 {MIN_SIGNALS} 次，\
+             无法据此判断这条线是否有效。")),
+        _ => parts.push("低吸线在历史上从未触发，无从检验。".into()),
+    }
+
+    match (sell_mean, n_sell >= MIN_SIGNALS) {
+        (Some(s), true) => {
+            parts.push(format!(
+                "高抛线触发 {n_sell} 次，其后 {horizon} 日平均 {s:+.2}%（为负才说明躲对了下跌）。"));
+            if s > 0.0 {
+                parts.push("高抛线之后平均还在涨 —— 按现有历史，照它减仓会错过后续上涨。".into());
+            }
+        }
+        (Some(_), false) => parts.push(format!("高抛线仅触发 {n_sell} 次，样本不足以判断。")),
+        _ => {}
+    }
+
+    parts.push("以上为该基金自身历史的统计，非预测；这条线的窗口(60日)与阈值(±1σ/±2σ)是经验取值，未经寻优验证。".into());
+    parts.join(" ")
 }
 
 pub struct RegimeParams {
@@ -227,7 +387,12 @@ pub fn build_action_plan(
             sell_strong, unit_of(sell_strong), pct_to(sell_strong))
     };
 
-    // 结合历史：窗口内净值下穿低吸线/上穿高抛线的次数。
+    // 窗口内净值下穿低吸线/上穿高抛线的次数。
+    //
+    // ⚠ 注意这个计数本身带未来函数：它拿**最终的**波动带（由最后 60 天算出）回扫整个窗口，
+    // 而当时根本不可能知道这条线画在哪。它只能当作"这条线大致多久碰一次"的粗略描述，
+    // **不能当作这条线有效的证据** —— 真正的证据在 `evidence`（滚动重算、无未来函数、
+    // 并与"随便哪天买"的基准对比）。
     let mut buy_hits = 0usize;
     let mut sell_hits = 0usize;
     for w in slice.windows(2) {
@@ -235,6 +400,9 @@ pub fn build_action_plan(
         if a > buy && b <= buy { buy_hits += 1; }
         if a < sell && b >= sell { sell_hits += 1; }
     }
+
+    // 这条线到底有没有用 —— 用**全部**历史做无未来函数的事件研究（不只是最后 60 天）
+    let evidence = evaluate_triggers(points, n, EVIDENCE_HORIZON);
 
     let caveat = match report.regime.as_str() {
         "上涨趋势" => "上涨趋势：顺势持有，低吸照做、高抛减半执行，勿过早下车。",
@@ -250,7 +418,7 @@ pub fn build_action_plan(
             nav, unit_nav: unit, date: last.date.to_string(), z,
             signal: signal.to_string(), action, next_hint,
         },
-        buy_hits, sell_hits, caveat,
+        buy_hits, sell_hits, evidence, caveat,
     })
 }
 
@@ -264,6 +432,91 @@ pub fn detect_regime_with_plan(
     let plan = build_action_plan(points, &report, pp)?;
     report.plan = Some(plan);
     Ok(report)
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn pts(navs: &[f64]) -> Vec<NavPoint> {
+        navs.iter().enumerate().map(|(i, v)| NavPoint {
+            date: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap() + chrono::Duration::days(i as i64),
+            nav: *v, acc_nav: *v,
+        }).collect()
+    }
+
+    /// 纯随机游走：低吸线不该有任何超额。证据必须**如实报告它没用**。
+    #[test]
+    fn reports_no_edge_when_the_line_has_none() {
+        // 确定性伪随机（不用 rand，保证可复现）
+        let mut x = 12345u64;
+        let mut nav = 1.0;
+        let navs: Vec<f64> = (0..800).map(|_| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let u = ((x >> 33) as f64 / (1u64 << 31) as f64) - 1.0;   // ≈ [-1,1)
+            nav *= 1.0 + u * 0.01;
+            nav
+        }).collect();
+
+        let e = evaluate_triggers(&pts(&navs), 60, 20).expect("样本足够");
+        assert!(e.sample_days > 500);
+        assert!(e.baseline_mean_forward.is_some(), "必须给出无条件基准");
+
+        // 有基准可比才是关键 —— 没有基准，"低吸后平均涨 1%" 是句废话
+        // （因为随便哪天买可能也涨 1%）
+        if e.buy_signals >= 10 {
+            let edge = e.buy_mean_forward.unwrap() - e.baseline_mean_forward.unwrap();
+            // 随机游走上不该有稳定超额；无论正负，verdict 都必须把超额算出来摆明
+            assert!(e.verdict.contains("超额") || e.verdict.contains("样本量不足"),
+                    "必须给出相对基准的超额: {}", e.verdict);
+            assert!(edge.abs() < 5.0, "随机游走不该出现巨大超额: {edge}");
+        }
+        assert!(e.verdict.contains("基准"), "结论必须提到基准");
+    }
+
+    /// 事件研究**绝不能有未来函数**：波动带只能用触发时点之前的数据算。
+    #[test]
+    fn band_is_recomputed_from_past_data_only() {
+        // 前 300 天窄幅震荡，之后突然放大波动。
+        // 若用最终（宽）的带回扫前段，前段几乎不会触发；
+        // 若逐点用当时的（窄）带，前段会正常触发 —— 以此区分两种实现。
+        let mut navs: Vec<f64> = (0..300).map(|i| 1.0 + ((i % 10) as f64 - 4.5) * 0.002).collect();
+        navs.extend((0..300).map(|i| 1.0 + ((i % 10) as f64 - 4.5) * 0.05));
+
+        let e = evaluate_triggers(&pts(&navs), 60, 20).expect("样本足够");
+        assert!(e.buy_signals > 0,
+                "用当时的窄带，前段的小幅回落就该触发；若为 0 说明用了最终的宽带（未来函数）");
+    }
+
+    /// 样本太少时不许硬下结论。
+    #[test]
+    fn refuses_to_conclude_on_thin_samples() {
+        let navs: Vec<f64> = (0..100).map(|i| 1.0 + i as f64 * 0.001).collect();
+        let e = evaluate_triggers(&pts(&navs), 60, 20);
+        // 100 点：60 建带 + 20 前瞻 → 仅约 20 个可检验点，触发次数必然很少
+        if let Some(ev) = e {
+            if ev.buy_signals < 10 && ev.buy_signals > 0 {
+                assert!(ev.verdict.contains("样本量不足") || ev.verdict.contains("样本不足"),
+                        "样本少时须明说不能判断: {}", ev.verdict);
+            }
+        }
+    }
+
+    #[test]
+    fn none_when_history_too_short() {
+        let navs: Vec<f64> = (0..50).map(|i| 1.0 + i as f64 * 0.001).collect();
+        assert!(evaluate_triggers(&pts(&navs), 60, 20).is_none(), "不足以建带 → None");
+    }
+
+    /// 结论里必须点明这些参数是拍脑袋的，没经过寻优验证。
+    #[test]
+    fn verdict_admits_the_thresholds_are_arbitrary() {
+        let navs: Vec<f64> = (0..800).map(|i| 1.0 + ((i % 40) as f64 - 20.0) * 0.003).collect();
+        let e = evaluate_triggers(&pts(&navs), 60, 20).unwrap();
+        assert!(e.verdict.contains("经验取值") && e.verdict.contains("未经寻优验证"),
+                "须承认 60日/±1σ 是拍脑袋的: {}", e.verdict);
+    }
 }
 
 #[cfg(test)]

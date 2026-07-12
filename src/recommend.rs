@@ -134,10 +134,18 @@ fn default_params(kind: &str) -> toml::Value {
     toml::Value::Table(t)
 }
 
-/// 评分用费率：买入 0、卖出标准阶梯。
+/// 申购费率。0.15% 是各代销渠道打一折后的常见档位，与 Web 表单默认值一致。
+///
+/// 这里曾经是 **0**。后果不是"少算了一点钱"，而是**扭曲了策略之间的比较**：
+/// 5 个候选里 `trend`/`rsi`/`adaptive` 会频繁进出（几十上百笔），`dca`/`smart_dca`
+/// 每月一笔 —— 申购费按笔收，免掉它等于系统性补贴高换手策略。
+/// 而"哪个策略最优"正是推荐 tab 的核心产出。
+pub const REC_BUY_RATE: f64 = 0.0015;
+
+/// 评分用费率：申购 0.15% + 卖出标准阶梯（<7日 1.5% 惩罚性赎回费是监管强制的）。
 fn rec_fee() -> FeeModel {
     FeeModel {
-        buy_rate: 0.0,
+        buy_rate: REC_BUY_RATE,
         sell_tiers: vec![
             SellTier { max_days: 7, rate: 0.015 },
             SellTier { max_days: 365, rate: 0.005 },

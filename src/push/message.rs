@@ -24,6 +24,31 @@ fn timing_line(r: &RegimeReport) -> String {
     }
 }
 
+/// 低吸线相对「随便哪天买」的超额。推送里给出精确点位和具体金额，
+/// 就必须同时给出这条线到底有没有用 —— 否则是在诱导人照着一个没有证据的数字下单。
+fn evidence_line(r: &RegimeReport) -> String {
+    let Some(p) = &r.plan else { return String::new() };
+    let Some(e) = &p.evidence else {
+        return "\n- ⚠ 历史数据不足，无法检验低吸/高抛线是否有效 —— 上面的点位没有证据支持\n".into();
+    };
+    let (Some(buy), Some(base)) = (e.buy_mean_forward, e.baseline_mean_forward) else {
+        return String::new();
+    };
+    if e.buy_signals < 10 {
+        return format!("\n- ⚠ 低吸线历史仅触发 {} 次，样本不足以判断它是否有效\n", e.buy_signals);
+    }
+    let edge = buy - base;
+    let tail = if edge <= 0.0 {
+        "**没跑赢「随便哪天买」，这条线不提供择时价值**"
+    } else {
+        "（单只基金的样本内统计，未经样本外检验）"
+    };
+    format!(
+        "\n- 线的有效性（{} 日前瞻）：低吸触发 {} 次，其后平均 {buy:+.2}%；基准（随便哪天买）{base:+.2}% \
+         → 超额 **{edge:+.2}%** {tail}\n",
+        e.horizon_days, e.buy_signals)
+}
+
 /// 组装完整推送消息。
 pub fn compose(
     fund: &HoldingsReport,
@@ -78,6 +103,8 @@ pub fn compose(
             if let Some(pl) = &r.plan {
                 s.push_str(&format!("- 当下：{}（{}）· {}\n", pl.current.signal, pl.current.action, pl.current.next_hint));
             }
+            // 给了点位和金额，就必须同时给出这条线到底有没有用
+            s.push_str(&evidence_line(r));
             s.push_str(&format!("- {}\n\n", r.rationale));
         }
     }

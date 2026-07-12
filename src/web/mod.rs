@@ -535,9 +535,13 @@ fn regime_blocking(q: RegimeQuery) -> Result<crate::analyze::RegimeReport> {
     let default_plan = crate::analyze::PlanParams::default();
     let band_window = q.band_window.unwrap_or(default_plan.band_window);
     let end = chrono::Local::now().date_naive();
-    // 多取数据以覆盖 window、均线与波动带窗口
-    let lookback = (window.max(band_window) as i64) * 2 + 120;
-    let start = end - chrono::Duration::days(lookback);
+    // 取尽可能长的历史（8 年）。
+    //
+    // 形态判定与波动带只看**尾部**（detect_regime 取 points[len-window..]，
+    // 波动带取最后 band_window 个点），所以多喂历史不会改变它们的结论。
+    // 但触发线的有效性检验（ActionPlan::evidence）需要**全部**历史：
+    // 旧的回溯只有约 360 天 → 低吸线只触发 3~9 次，任何结论都是噪声。
+    let start = end - chrono::Duration::days(8 * 365);
     let points = crate::data::cache::load_or_fetch(
         &q.fund_code, std::path::Path::new(".cache"), start, end)
         .map_err(|e| anyhow!("加载净值失败: {e}"))?;

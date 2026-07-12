@@ -735,8 +735,56 @@ function renderPlan(p){
     + '<th style="padding:4px 8px;text-align:right">触发累计净值</th>'
     + '<th style="padding:4px 8px;text-align:right">≈单位净值</th><th style="padding:4px 8px">操作</th></tr>'
     + rows + '</table>'
-    + '<div style="margin-top:8px;color:#5a6a7a">历史窗口内触发：低吸 '+p.buy_hits+' 次 · 高抛 '+p.sell_hits+' 次</div>'
+    + '<div style="margin-top:8px;color:#5a6a7a">窗口内触发次数：低吸 '+p.buy_hits+' 次 · 高抛 '+p.sell_hits+' 次'
+    +   '<span style="color:#95a5a6"> —— 这只说明这条线多久碰一次，<strong>不说明照它操作能否赚钱</strong>。</span></div>'
+    + evidenceHtml(p.evidence)
     + '<div style="margin-top:8px;padding:8px 10px;background:#f3f7ff;border-radius:6px;color:#34495e">'+esc(p.caveat)+'</div>';
+}
+
+// 触发线到底有没有用：无未来函数的事件研究 + 无条件基准对比。
+// 这一块是「低吸线 1.2345 / 买入 1000 元」这类具体指令的唯一真凭证 ——
+// 缺了它，用户看到的就只是一个精确到 4 位小数的、没有证据的价格点位。
+function evidenceHtml(e){
+  if(!e){
+    return '<div style="margin-top:8px;padding:8px 10px;background:#fffbf0;border-left:4px solid #b8860b;color:#5a4a1a">'
+      + '⚠ 历史数据不足，<strong>无法检验这条线是否有效</strong>。上面的点位与金额仅是按 ±σ 机械计算的结果，没有任何证据支持。</div>';
+  }
+  var num = function(x, d){ return (x==null||!isFinite(x)) ? '—' : Number(x).toFixed(d==null?2:d); };
+  var base = e.baseline_mean_forward;
+  var edge = (e.buy_mean_forward!=null && base!=null) ? (e.buy_mean_forward - base) : null;
+  // 超额 ≤ 0 → 这条线没跑赢"随便哪天买"，红色示警；否则中性
+  var bad = (edge!=null && edge <= 0);
+  var color = bad ? '#c0392b' : '#b8860b';
+  var bg = bad ? '#fdecea' : '#fffbf0';
+
+  return '<div style="margin-top:8px;padding:10px;background:'+bg+';border-left:4px solid '+color+';color:#34495e">'
+    + '<div style="font-weight:600;color:#1a252f">这条线有用吗？（' + e.horizon_days + ' 日前瞻检验 · 滚动重算 · 无未来函数）</div>'
+    + '<table style="margin-top:6px;border-collapse:collapse;width:100%;font-size:.9rem">'
+    +   '<tr style="color:#7f8c8d;text-align:left"><th style="padding:3px 6px"></th>'
+    +     '<th style="padding:3px 6px;text-align:right">触发次数</th>'
+    +     '<th style="padding:3px 6px;text-align:right">其后平均收益</th>'
+    +     '<th style="padding:3px 6px;text-align:right">胜率</th></tr>'
+    +   '<tr><td style="padding:3px 6px">低吸线</td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+e.buy_signals+'</td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+num(e.buy_mean_forward)+'%</td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+num(e.buy_win_rate,1)+'%</td></tr>'
+    +   '<tr><td style="padding:3px 6px">高抛线</td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+e.sell_signals+'</td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+num(e.sell_mean_forward)+'%</td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+num(e.sell_win_rate,1)+'%</td></tr>'
+    +   '<tr style="border-top:1px solid #e0d8c0"><td style="padding:3px 6px"><strong>基准</strong>（随便哪天买）</td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+e.sample_days+'</td>'
+    +     '<td style="padding:3px 6px;text-align:right"><strong>'+num(base)+'%</strong></td>'
+    +     '<td style="padding:3px 6px;text-align:right">'+num(e.baseline_win_rate,1)+'%</td></tr>'
+    + '</table>'
+    + (edge!=null
+        ? '<div style="margin-top:6px;font-weight:600;color:'+color+'">低吸线相对基准的超额：'
+          + (edge>=0?'+':'') + num(edge) + '%'
+          + (bad ? ' —— 没跑赢「随便哪天买」，这条线不提供择时价值。' : '')
+          + '</div>'
+        : '')
+    + '<div style="margin-top:6px;font-size:.88rem;color:#5a6a7a">'+esc(e.verdict)+'</div>'
+    + '</div>';
 }
 function renderDiag(r){
   var box = document.getElementById('diag-result');
