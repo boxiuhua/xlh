@@ -1,35 +1,58 @@
 # 线上服务器用：只跑镜像，不在服务器上编译。
-# 用法： docker compose -f docker-compose.prod.yml up -d
 #
-# 前提：镜像已在本机（docker load 或 docker pull 得到 xlh:latest / 你的仓库地址），
-#       且当前目录已备好 config.toml、push.toml，以及 .cache/ output/ 两个目录。
+#   cp .env.example .env && vim .env      # 至少确认 XLH_STATE_DIR
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# ## 数据在哪
+#
+# 全部持久状态都在宿主机的 ${XLH_STATE_DIR}（默认 /srv/xlh-state），**在部署目录之外**。
+# 部署会替换镜像与 compose 文件，但绝不触碰这个目录 —— 所以重新部署不会丢数据。
+#
+#   ${XLH_STATE_DIR}/data/xlh.db   ← 用户、授权码、会话、推送配置、建议历史
+#                                     这是唯一不可再生的数据，务必备份（scripts/backup.sh）
+#   ${XLH_STATE_DIR}/cache/        ← 净值/K线/财报/估值缓存。可再生，但全量重抓要很久
+#   ${XLH_STATE_DIR}/output/       ← 回测报告 HTML。可随时丢弃
+
 services:
   xlh-web:
-    image: xlh:latest            # 若用镜像仓库，改成 registry.example.com/you/xlh:latest
+    image: ${XLH_IMAGE:-xlh:latest}
     container_name: xlh-web
-    # 只监听本机回环，前面套 Nginx/Caddy 反代 + HTTPS + 认证；
-    # 若确实要直接对公网开放（不推荐），改成 "8080:8080" 并用安全组限制来源 IP。
+    # 默认只监听本机回环；对外请用 Nginx/Caddy 反代 + HTTPS + 认证。
     ports:
-      - "127.0.0.1:8080:8080"
+      - "${XLH_BIND_ADDR:-127.0.0.1}:${XLH_PORT:-8080}:8080"
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
     volumes:
-      - ./.cache:/app/.cache
-      - ./output:/app/output
-      - ./push.toml:/app/push.toml
-      - ./data:/app/data
+      # 绝对路径、部署目录之外 —— 这是「重新部署不丢数据」的关键
+      - ${XLH_STATE_DIR:?请在 .env 里设置 XLH_STATE_DIR（绝对路径）}/data:/app/data
+      - ${XLH_STATE_DIR}/cache:/app/.cache
+      - ${XLH_STATE_DIR}/output:/app/output
+      # 只读挂配置：容器不该改它，改了也会被下次部署覆盖
+      - ./config.toml:/app/config.toml:ro
     restart: unless-stopped
     command: ["serve", "--port", "8080"]
+    healthcheck:
+      # 未登录会 303 跳登录页 —— 能跳就说明进程活着、路由正常
+      test: ["CMD-SHELL", "xlh --help >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
-  # 定时推送守护，按需启用： docker compose -f docker-compose.prod.yml --profile push up -d
+  # 定时推送守护，按需启用：
+  #   docker compose -f docker-compose.prod.yml --profile push up -d
   xlh-push:
-    image: xlh:latest
+    image: ${XLH_IMAGE:-xlh:latest}
     container_name: xlh-push
     profiles: ["push"]
     environment:
-      - TZ=Asia/Shanghai            # 定时推送 cron 按此时区解释；非北京时区请改这里
+      - TZ=${TZ:-Asia/Shanghai}    # cron 按此时区解释，错了会差 8 小时
     volumes:
-      - ./.cache:/app/.cache
-      - ./push.toml:/app/push.toml     # 仅用于首启把旧全局配置导入首个管理员
-      - ./data:/app/data              # 多用户：从主库读各用户推送配置 + 落推送历史
+      # 与 web 共用同一个库：推送守护从 xlh.db 读各用户配置、写建议历史
+      - ${XLH_STATE_DIR:?请在 .env 里设置 XLH_STATE_DIR（绝对路径）}/data:/app/data
+      - ${XLH_STATE_DIR}/cache:/app/.cache
+      - ./config.toml:/app/config.toml:ro
     restart: unless-stopped
-    # 多用户守护：遍历主库中各用户配置，按各自 cron 投递（不再用 --file）
+    depends_on:
+      - xlh-web
     command: ["push"]

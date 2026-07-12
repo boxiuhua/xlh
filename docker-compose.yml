@@ -1,32 +1,37 @@
+# 本地开发：在本机构建并运行。 docker compose up -d --build
+#
+# 状态默认落在 ./state/（已在 .gitignore 里）。生产请用 docker-compose.prod.yml，
+# 它要求 XLH_STATE_DIR 指向部署目录之外的绝对路径 —— 那才是「重新部署不丢数据」的关键。
+
 services:
-  # Web 回测界面： http://localhost:8080
+  # Web 界面： http://localhost:8080
   xlh-web:
     build: .
-    image: xlh:latest
+    image: ${XLH_IMAGE:-xlh:latest}
     container_name: xlh-web
     ports:
-      - "8080:8080"
+      - "${XLH_PORT:-8080}:8080"
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
     volumes:
-      - ./.cache:/app/.cache          # 净值/基金列表缓存，持久化避免重复抓取
-      - ./output:/app/output          # 回测报告输出
-      - ./push.toml:/app/push.toml     # Web 推送配置 Tab 读写此文件
-      - ./data:/app/data              # 授权库、会话数据持久化
+      - ${XLH_STATE_DIR:-./state}/data:/app/data      # xlh.db：用户/授权/推送配置/历史
+      - ${XLH_STATE_DIR:-./state}/cache:/app/.cache   # 净值/K线/财报/估值缓存
+      - ${XLH_STATE_DIR:-./state}/output:/app/output  # 回测报告
+      - ./config.toml:/app/config.toml:ro
     restart: unless-stopped
     command: ["serve", "--port", "8080"]
 
-  # 定时推送守护（钉钉/飞书/企业微信/Server酱）——按需启用：
-  #   docker compose --profile push up -d xlh-push
+  # 定时推送守护：docker compose --profile push up -d
   xlh-push:
     build: .
-    image: xlh:latest
+    image: ${XLH_IMAGE:-xlh:latest}
     container_name: xlh-push
     profiles: ["push"]
     environment:
-      - TZ=Asia/Shanghai            # 定时推送 cron 按此时区解释；非北京时区请改这里
+      - TZ=${TZ:-Asia/Shanghai}    # cron 按此时区解释，错了会差 8 小时
     volumes:
-      - ./.cache:/app/.cache
-      - ./push.toml:/app/push.toml     # 仅用于首启把旧全局配置导入首个管理员
-      - ./data:/app/data              # 多用户：从主库读各用户推送配置 + 落推送历史
+      - ${XLH_STATE_DIR:-./state}/data:/app/data
+      - ${XLH_STATE_DIR:-./state}/cache:/app/.cache
+      - ./config.toml:/app/config.toml:ro
     restart: unless-stopped
-    # 多用户守护：遍历主库中各用户配置，按各自 cron 投递（不再用 --file）
     command: ["push"]

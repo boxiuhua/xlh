@@ -1,0 +1,9 @@
+# 在 Windows 上开发、部署到 Linux。若让 Git 把这些文件转成 CRLF，服务器上会直接失败：
+#   bash: /opt/xlh/deploy.sh: /usr/bin/env: bad interpreter: No such file or directory
+# （真正的原因是行尾的 \r，报错信息完全看不出来）
+# 所以强制这些文件在工作区也保持 LF。
+*.sh            text eol=lf
+Dockerfile      text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+.env.example    text eol=lf

@@ -358,7 +358,7 @@ xlhMe();
       </div>
       <div id="pu-msg" class="hint" style="margin-top:8px"></div>
       <pre id="pu-preview-box" style="margin-top:10px;white-space:pre-wrap;background:#fafbfc;border:1px solid #eaecef;border-radius:8px;padding:12px;display:none"></pre>
-      <div class="hint" style="margin-top:8px">保存写入项目根 <code>push.toml</code>；后台 <code>xlh push</code> 守护进程需<strong>重启后生效</strong>（不热重载）。仅本机监听，secret 原样读写。</div>
+      <div class="hint" style="margin-top:8px">保存写入数据库 <code>data/xlh.db</code>（按用户隔离）；<code>push.toml</code> 只是首次启动时的一次性导入，已不再是存储位置。后台 <code>xlh push</code> 守护进程每分钟重读配置，<strong>无需重启</strong>。secret 原样读写。</div>
     </div>
   </div>
 
@@ -1445,7 +1445,7 @@ function puPost(url, okMsg, btn, onOk){
 document.getElementById('pu-add-fund').addEventListener('click', function(){ puFundRow(); });
 document.getElementById('pu-add-stock').addEventListener('click', function(){ puStockRow(); });
 document.getElementById('pu-load').addEventListener('click', loadPushConfig);
-document.getElementById('pu-save').addEventListener('click', function(){ puPost('/api/push/config', '已保存到 push.toml', this); });
+document.getElementById('pu-save').addEventListener('click', function(){ puPost('/api/push/config', '已保存到数据库', this); });
 document.getElementById('pu-preview').addEventListener('click', function(){
   var box=document.getElementById('pu-preview-box'), msg=document.getElementById('pu-msg');
   msg.textContent='组装预览中…（首次联网抓取，请稍候）';
