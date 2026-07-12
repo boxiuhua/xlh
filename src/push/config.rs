@@ -26,7 +26,27 @@ pub struct PushConfig {
     /// 额外只诊断、不持有的股票代码。
     #[serde(default)]
     pub diagnose_stocks: Vec<String>,
+    /// 质量筛选（可选）。`#[serde(default)]` 保证向后兼容 ——
+    /// push_configs 存的是 JSON，老配置读出来这里就是 None，无需 DB 迁移。
+    #[serde(default)]
+    pub screen: Option<ScreenCfg>,
 }
+
+/// 质量筛选推送配置。
+///
+/// 注意这**不是**「选股推荐」：它只做排除（亏损/ST退市/历史过短），
+/// 并在推送里附带历史基础发生率。详见 `stock::screen` 的模块文档。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenCfg {
+    /// 待筛的股票代码。留空则不推送筛选章节。
+    #[serde(default)]
+    pub codes: Vec<String>,
+    /// 输出条数上限
+    #[serde(default = "default_screen_top_n")]
+    pub top_n: usize,
+}
+
+fn default_screen_top_n() -> usize { 10 }
 
 fn default_true() -> bool { true }
 
@@ -73,6 +93,7 @@ pub fn default_config() -> PushConfig {
         diagnose: Vec::new(),
         stocks: Vec::new(),
         diagnose_stocks: Vec::new(),
+        screen: None,
     }
 }
 
