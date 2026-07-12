@@ -280,6 +280,8 @@ where
         .route("/api/stock/diagnose", get(stock::diagnose_handler))
         .route("/api/stock/run", get(stock::run_handler))
         .route("/api/stock/recommend", get(stock::recommend_handler))
+        .route("/api/stock/screen", get(stock::screen_handler))
+        .route("/api/stock/attribution", get(stock::attribution_handler))
         .route("/api/stock/sync", post(stock::sync_handler))
 }
 

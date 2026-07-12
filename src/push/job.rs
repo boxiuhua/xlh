@@ -7,8 +7,9 @@ use crate::analyze::{self, PlanParams, RegimeParams, RegimeReport};
 use crate::data::{self, cache};
 use crate::holdings::{self, HoldingsInput};
 use crate::recommend::RecommendParams;
-use crate::stock::data::{cache as stock_cache, sync as stock_sync};
+use crate::stock::data::{cache as stock_cache, fundamentals, sync as stock_sync, universe, valuation};
 use crate::stock::diagnose::{self as stock_diagnose, DiagnoseParams, StockDiagnosis};
+use crate::stock::screen::{self, ScreenParams, ScreenReport};
 
 use super::config::PushConfig;
 use super::message::{self, SyncNote};
@@ -82,13 +83,22 @@ pub fn build_message_full(cfg: &PushConfig) -> Result<BuiltMessage> {
         }
     }
 
+    // ---- 股票中文名（best-effort）----
+    // 项目此前拿不到股票名，一直把 code 当 name 用（推送里显示的是「600519 600519」）。
+    // 全市场清单顺带解决了这个问题；抓不到就退回用 code，不影响主流程。
+    let stock_names: HashMap<String, String> = universe::latest_trade_date()
+        .and_then(|d| universe::load_or_fetch(cache_dir, d))
+        .map(|rows| universe::name_map(&rows))
+        .unwrap_or_default();
+    let stock_name_of = |c: &str| stock_names.get(c).cloned().unwrap_or_else(|| c.to_string());
+
     // ---- 股票持仓建议 + 诊断 ----
     let dp = DiagnoseParams::default();
     let mut stock_adv: Vec<StockAdvice> = Vec::new();
     for h in &cfg.stocks {
         if h.code.trim().is_empty() { continue; }
         if let Ok(bars) = stock_cache::load_or_fetch(&h.code, &stock_dir, start, end) {
-            if let Ok(diag) = stock_diagnose::diagnose(h.code.clone(), h.code.clone(), &bars, &dp) {
+            if let Ok(diag) = stock_diagnose::diagnose(h.code.clone(), stock_name_of(&h.code), &bars, &dp) {
                 stock_adv.push(stock_advice::advise(h, &diag));
             }
         }
@@ -97,18 +107,52 @@ pub fn build_message_full(cfg: &PushConfig) -> Result<BuiltMessage> {
     for code in &cfg.diagnose_stocks {
         if code.trim().is_empty() { continue; }
         if let Ok(bars) = stock_cache::load_or_fetch(code, &stock_dir, start, end) {
-            if let Ok(diag) = stock_diagnose::diagnose(code.clone(), code.clone(), &bars, &dp) {
+            if let Ok(diag) = stock_diagnose::diagnose(code.clone(), stock_name_of(code), &bars, &dp) {
                 stock_diags.push(diag);
             }
         }
     }
 
+    // ---- 质量筛选（可选）----
+    let screen_report = build_screen(cfg, cache_dir, end);
+
     // ---- 同步简报 ----
     let mut sync: Vec<SyncNote> = fund_sync.iter().map(note_fund).collect();
     sync.extend(stock_sync_out.iter().map(note_stock));
 
-    let md = message::compose(&report, &fund_diags, &stock_adv, &stock_diags, &sync);
+    let md = message::compose(&report, &fund_diags, &stock_adv, &stock_diags,
+                              screen_report.as_ref(), &sync);
     Ok(BuiltMessage { md, has_new, fund_input: input, fund_report: report })
+}
+
+/// 质量筛选章节（可选）。任何一步失败都返回 None —— 筛选是增值项，
+/// 不该因为它挂掉而让整条持仓推送发不出去。
+fn build_screen(cfg: &PushConfig, cache_dir: &std::path::Path, today: chrono::NaiveDate)
+    -> Option<ScreenReport>
+{
+    let sc = cfg.screen.as_ref()?;
+    let codes: Vec<String> = sc.codes.iter()
+        .map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
+    if codes.is_empty() { return None; }
+
+    let date = universe::latest_trade_date().ok()?;
+    let all = universe::load_or_fetch(cache_dir, date).ok()?;
+    let pool: Vec<universe::Listing> = all.into_iter()
+        .filter(|l| codes.iter().any(|c| c == &l.code))
+        .collect();
+    if pool.is_empty() { return None; }
+
+    let fund_dir = cache_dir.join("fundamentals");
+    let val_dir = cache_dir.join("valuation");
+    let params = ScreenParams { top_n: sc.top_n, ..Default::default() };
+
+    Some(screen::build_report(&pool, &date.to_string(), &today.to_string(), &params, |l| {
+        // 财报每季度才变，30 天缓存足够新鲜
+        let reports = fundamentals::load_or_fetch(&l.code, &fund_dir, 30, today)?;
+        // 港股无估值历史 → 空序列，分位因子自动降级为 None（而不是报错整只跳过）
+        let vals = valuation::load_or_fetch(&l.code, &val_dir, date).unwrap_or_default();
+        Ok((reports, vals))
+    }))
 }
 
 /// 兼容既有调用点：只取 markdown 与 has_new。

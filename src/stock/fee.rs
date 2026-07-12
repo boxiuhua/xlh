@@ -15,7 +15,7 @@ impl StockFee {
     pub fn for_market(market: u16) -> Self {
         match market {
             116 => Self::hk(),
-            105 | 106 | 107 => Self::us(),
+            105..=107 => Self::us(),
             _ => Self::a_share(),
         }
     }

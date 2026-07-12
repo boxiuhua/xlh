@@ -8,11 +8,13 @@ use axum::extract::Query;
 use axum::response::Json;
 
 use super::{AppError, StrategyFields, build_strategy_from_fields};
-use crate::stock::data::{self, cache, search, sync};
+use crate::stock::data::{self, cache, fundamentals, search, sync, universe, valuation};
 use crate::stock::fee::StockFee;
 use crate::stock::diagnose::{self, DiagnoseParams, StockDiagnosis};
 use crate::stock::backtest::{self, StockRunOutcome};
 use crate::stock::recommend::{self, RecommendParams, StockRecommendReport};
+use crate::stock::screen::{self, ScreenParams, ScreenReport};
+use crate::stock::attribution::{self, Attribution};
 
 fn stock_cache() -> &'static Path { Path::new(".cache/stock") }
 
@@ -119,6 +121,102 @@ fn recommend_blocking(q: RecommendQuery) -> StockRecommendReport {
     let start = end - chrono::Duration::days(8 * 365);
     recommend::build_report(STOCK_POOL, &names, &end.to_string(), &params,
         |code| cache::load_or_fetch(code, stock_cache(), start, end))
+}
+
+// ---- 质量筛选 ----
+
+fn fundamentals_cache() -> &'static Path { Path::new(".cache/fundamentals") }
+fn valuation_cache() -> &'static Path { Path::new(".cache/valuation") }
+fn universe_cache() -> &'static Path { Path::new(".cache") }
+
+/// 财报缓存有效期（天）。财报每季度才更新一次，30 天足够新鲜。
+const FUNDAMENTALS_MAX_AGE: i64 = 30;
+
+#[derive(Debug, Deserialize)]
+pub struct ScreenQuery {
+    #[serde(default)] pub top_n: Option<usize>,
+    /// 只筛这些代码（逗号分隔）。留空则筛全市场 —— 全市场要逐只抓财报，
+    /// 5000+ 次请求会跑很久且极易被限流，故默认走预设池。
+    #[serde(default)] pub codes: Option<String>,
+}
+
+pub async fn screen_handler(Query(q): Query<ScreenQuery>) -> std::result::Result<Json<ScreenReport>, AppError> {
+    let rep = tokio::task::spawn_blocking(move || screen_blocking(q))
+        .await.map_err(|e| AppError(anyhow!("任务执行失败: {e}")))??;
+    Ok(Json(rep))
+}
+
+fn screen_blocking(q: ScreenQuery) -> Result<ScreenReport> {
+    let params = ScreenParams { top_n: q.top_n.unwrap_or(20), ..Default::default() };
+
+    let date = universe::latest_trade_date().map_err(|e| anyhow!("探测交易日失败: {e}"))?;
+    let all = universe::load_or_fetch(universe_cache(), date)
+        .map_err(|e| anyhow!("加载全市场清单失败: {e}"))?;
+
+    // 默认只筛预设池：全市场逐只抓财报是 5000+ 次请求，会跑很久且极易触发东财限流。
+    // 想筛全市场应走离线批处理，而不是一个 HTTP 请求。
+    let wanted: Vec<String> = match q.codes.as_deref() {
+        Some(s) if !s.trim().is_empty() => {
+            let codes: Vec<String> = s.split(',').map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty()).collect();
+            for c in &codes { validate_stock_code(c)?; }
+            codes
+        }
+        _ => STOCK_POOL.iter().map(|s| s.to_string()).collect(),
+    };
+    let pool: Vec<universe::Listing> = all.into_iter()
+        .filter(|l| wanted.iter().any(|w| w == &l.code))
+        .collect();
+
+    let today = chrono::Local::now().date_naive();
+    Ok(screen::build_report(&pool, &date.to_string(), &today.to_string(), &params, |l| {
+        let reports = fundamentals::load_or_fetch(
+            &l.code, fundamentals_cache(), FUNDAMENTALS_MAX_AGE, today)?;
+        // 港股无估值历史（datacenter 没有对应表）→ 空序列，分位因子自动降级为 None
+        let vals = valuation::load_or_fetch(&l.code, valuation_cache(), date).unwrap_or_default();
+        Ok((reports, vals))
+    }))
+}
+
+// ---- 回报归因 ----
+
+#[derive(Debug, Deserialize)]
+pub struct AttributionQuery {
+    pub code: String,
+    /// 起始日 YYYY-MM-DD。留空则用数据覆盖的最早日期。
+    #[serde(default)] pub start: Option<String>,
+}
+
+pub async fn attribution_handler(Query(q): Query<AttributionQuery>) -> std::result::Result<Json<Attribution>, AppError> {
+    let a = tokio::task::spawn_blocking(move || attribution_blocking(q))
+        .await.map_err(|e| AppError(anyhow!("任务执行失败: {e}")))??;
+    Ok(Json(a))
+}
+
+fn attribution_blocking(q: AttributionQuery) -> Result<Attribution> {
+    validate_stock_code(&q.code)?;
+    let end = chrono::Local::now().date_naive();
+
+    // 归因窗口的上限由**后复权覆盖范围**决定，不是估值历史：
+    // 腾讯的后复权只有约 2.6 年，东财不裁剪但 push2his 限流频繁。
+    // 这里照常走 cache::load_or_fetch（生产主路径），拿到多少算多少 ——
+    // 覆盖不足时 attribution 会自己降级为裸价格口径并显式告警，而不是伪造分红贡献。
+    let bars = cache::load_or_fetch(&q.code, stock_cache(), end - chrono::Duration::days(9000), end)
+        .map_err(|e| anyhow!("加载行情失败: {e}"))?;
+    let vals = valuation::load_or_fetch(&q.code, valuation_cache(), end)
+        .map_err(|e| anyhow!("加载估值历史失败: {e}（仅沪深A股有估值历史）"))?;
+
+    let start = match q.start.as_deref() {
+        Some(s) if !s.trim().is_empty() =>
+            NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+                .map_err(|_| anyhow!("起始日格式应为 YYYY-MM-DD: {s}"))?,
+        // 两个数据源都覆盖的最早日期
+        _ => bars.first().map(|b| b.date).unwrap_or(end)
+            .max(vals.first().map(|v| v.date).unwrap_or(end)),
+    };
+
+    attribution::attribute(&bars, &vals, start, end)
+        .map_err(|e| anyhow!("无法归因: {e}"))
 }
 
 #[derive(Debug, Deserialize)]

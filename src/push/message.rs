@@ -2,6 +2,7 @@
 use crate::analyze::RegimeReport;
 use crate::holdings::HoldingsReport;
 use crate::stock::diagnose::StockDiagnosis;
+use crate::stock::screen::ScreenReport;
 
 use super::stock_advice::StockAdvice;
 
@@ -29,6 +30,7 @@ pub fn compose(
     fund_diags: &[(String, String, RegimeReport)],
     stock_adv: &[StockAdvice],
     stock_diags: &[StockDiagnosis],
+    screen: Option<&ScreenReport>,
     sync: &[SyncNote],
 ) -> String {
     let mut s = String::new();
@@ -90,6 +92,54 @@ pub fn compose(
         }
     }
 
+    // 质量筛选
+    //
+    // 这一节的措辞是刻意的。一份「优质股清单」出现在推送里，天然会被读成「翻倍名单」——
+    // 所以标题不叫「选股推荐」，正文不给分数、不给买卖信号，且**必须**附上历史基础发生率。
+    // 少了基础发生率，这一节就是在诱导人；`screen::BaseRate` 的存在就是为了堵这个口子。
+    if let Some(sc) = screen {
+        s.push_str("## 质量筛选（排除法，非推荐）\n");
+        s.push_str(&format!("交易日 {} · 池 {} 只 · 通过 {} 只\n\n",
+                            sc.trade_date, sc.pool_size, sc.passed));
+
+        for p in &sc.top {
+            s.push_str(&format!("**{} {}**\n", p.name, p.code));
+            let roe = p.roe_median.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "-".into());
+            s.push_str(&format!("- {} 年年报 · ROE中位数 {} · ROE连续≥15% {} 年\n",
+                                p.years, roe, p.roe_streak));
+            if let Some(g) = p.profit_cagr {
+                s.push_str(&format!("- 净利 5 年 CAGR {g:.1}%"));
+                if let Some(r) = p.revenue_cagr { s.push_str(&format!(" · 营收 {r:.1}%")); }
+                s.push('\n');
+            }
+            if let Some(pe) = p.pe_ttm {
+                let pct = p.pe_percentile
+                    .map(|v| format!("（自身历史 {:.0}% 分位）", v * 100.0))
+                    .unwrap_or_default();
+                s.push_str(&format!("- PE(TTM) {pe:.1}{pct}\n"));
+            }
+            s.push('\n');
+        }
+        if sc.top.is_empty() {
+            s.push_str("_本轮无标的通过筛选_\n\n");
+        }
+
+        // 被排除了什么，和筛出了什么一样重要 —— 否则无从判断这份清单是否可信
+        if !sc.excluded.is_empty() {
+            s.push_str("**排除明细**\n");
+            for (reason, n) in &sc.excluded {
+                s.push_str(&format!("- {n} 只：{reason}\n"));
+            }
+            s.push('\n');
+        }
+
+        s.push_str(&format!("> **{}**\n", sc.base_rate.headline));
+        for f in &sc.base_rate.facts {
+            s.push_str(&format!("> - {f}\n"));
+        }
+        s.push('\n');
+    }
+
     // 数据同步简报
     if !sync.is_empty() {
         s.push_str("## 数据同步\n");
@@ -147,7 +197,7 @@ mod tests {
         let adv = vec![stock_advice::advise(
             &Holding { code: "600519".into(), amount: 20000.0, profit: 1500.0 }, &stock_diag())];
         let sync = vec![SyncNote { code: "000001".into(), added: 3, latest: Some("2026-07-01".into()), error: None }];
-        let md = compose(&rep, &[], &adv, &[stock_diag()], &sync);
+        let md = compose(&rep, &[], &adv, &[stock_diag()], None, &sync);
         assert!(md.contains("## 基金持仓建议"));
         assert!(md.contains("## 股票持仓建议"));
         assert!(md.contains("贵州茅台"));
@@ -160,15 +210,66 @@ mod tests {
     #[test]
     fn compose_reports_sync_failure() {
         let sync = vec![SyncNote { code: "BADX".into(), added: 0, latest: None, error: Some("抓取失败".into()) }];
-        let md = compose(&sample_report(), &[], &[], &[], &sync);
+        let md = compose(&sample_report(), &[], &[], &[], None, &sync);
         assert!(md.contains("BADX 同步失败：抓取失败"));
+    }
+
+    fn sample_screen() -> ScreenReport {
+        use crate::stock::screen::{BaseRate, Profile, ScreenParams};
+        ScreenReport {
+            generated: "2026-07-12".into(),
+            trade_date: "2026-07-10".into(),
+            pool_size: 5,
+            passed: 1,
+            excluded: vec![("近四季度归母净利为负：该组历史平均最大回撤近38%".into(), 1)],
+            top: vec![Profile {
+                code: "600519".into(), name: "贵州茅台".into(),
+                years: 26, roe_median: Some(32.2), roe_streak: 23,
+                revenue_cagr: Some(11.0), profit_cagr: Some(12.0),
+                gross_margin: Some(91.2), market_cap: 1.5e12,
+                pe_ttm: Some(18.21), pe_percentile: Some(0.004),
+                note: "以上均为历史事实，不含对未来的预测".into(),
+            }],
+            base_rate: BaseRate::default(),
+            params: ScreenParams::default(),
+            disclaimer: crate::stock::screen::DISCLAIMER.into(),
+        }
+    }
+
+    /// 一份「优质股清单」出现在推送里，天然会被读成「翻倍名单」。
+    /// 基础发生率是唯一的对冲 —— 哪天有人把它删了，这个测试必须炸。
+    #[test]
+    fn screen_section_must_carry_base_rates_and_never_read_as_a_buy_list() {
+        let sc = sample_screen();
+        let md = compose(&sample_report(), &[], &[], &[], Some(&sc), &[]);
+
+        assert!(md.contains("## 质量筛选（排除法，非推荐）"), "标题须自我否定「推荐」含义");
+        assert!(md.contains("贵州茅台"));
+        assert!(md.contains("ROE连续≥15% 23 年"));
+        assert!(md.contains("自身历史 0% 分位"));
+
+        // 排除明细必须可见 —— 否则读者无从判断这份清单可不可信
+        assert!(md.contains("**排除明细**"));
+        assert!(md.contains("1 只：近四季度归母净利为负"));
+
+        // 基础发生率：缺了它这一节就是在诱导人
+        assert!(md.contains("4.9%"), "须给出十倍股基础发生率");
+        assert!(md.contains("72%"), "须说明多数十倍股把涨幅还了回去");
+        assert!(md.contains("Bessembinder"), "须给出个股回报分布的硬先验");
+        assert!(md.contains("不是可稳定复制的策略"));
+
+        // 绝不能出现买卖信号式措辞
+        for banned in ["推荐买入", "目标价", "强烈看好"] {
+            assert!(!md.contains(banned), "推送不得出现 `{banned}`");
+        }
     }
 
     #[test]
     fn compose_omits_optional_sections_when_empty() {
-        let md = compose(&sample_report(), &[], &[], &[], &[]);
+        let md = compose(&sample_report(), &[], &[], &[], None, &[]);
         assert!(!md.contains("## 基金诊断"));
         assert!(!md.contains("## 股票持仓建议"));
         assert!(!md.contains("## 股票诊断"));
+        assert!(!md.contains("## 质量筛选"), "未配置筛选时不该出现该章节");
     }
 }
