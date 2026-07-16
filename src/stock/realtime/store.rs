@@ -154,6 +154,9 @@ pub fn recent_ticks(conn: &Connection, code: &str, n: usize) -> Result<Vec<(Naiv
 ///
 /// 硬性：基准必须是历史。把今天算进去等于用当下解释当下 ——
 /// 一只正在异动的股票会自己抬高自己的基准，把自己的异动抹平。
+/// 日内一个时点：((时, 分), 当日累计成交量)
+type Slot = ((u32, u32), f64);
+
 pub fn same_slot_deltas(
     conn: &Connection, code: &str, hhmm: (u32, u32), today: NaiveDate, since: NaiveDate,
 ) -> Result<Vec<f64>> {
@@ -165,7 +168,7 @@ pub fn same_slot_deltas(
     })?;
 
     // 按日分组（已按 ts 升序），日内保留 (时分, 累计量)
-    let mut by_day: std::collections::BTreeMap<NaiveDate, Vec<((u32, u32), f64)>> = Default::default();
+    let mut by_day: std::collections::BTreeMap<NaiveDate, Vec<Slot>> = Default::default();
     for (ts, vol) in rows.filter_map(|r| r.ok()) {
         let Some(dt) = chrono::DateTime::from_timestamp(ts, 0).map(|d| d.naive_utc()) else { continue };
         if dt.date() == today { continue }
@@ -371,7 +374,7 @@ mod tests {
         // 重试同一时点是正常的（网络抖动），(code, ts) 主键必须挡住重复
         let mut c = db();
         let t = tick("600519", dt(2026, 7, 16, 10, 0), 1258.99, 47611.0);
-        insert_ticks(&mut c, &[t.clone()]).unwrap();
+        insert_ticks(&mut c, std::slice::from_ref(&t)).unwrap();
         insert_ticks(&mut c, &[t]).unwrap();
         let n: i64 = c.query_row("SELECT COUNT(*) FROM ticks", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1, "同一 (code, ts) 只应有一行");

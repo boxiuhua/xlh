@@ -33,7 +33,7 @@ pub const INTERVAL_MIN: u32 = 10;
 ///
 /// 秒被忽略：守护是 60 秒 tick，命中的是分钟粒度。
 pub fn is_tick_time(t: NaiveTime) -> bool {
-    if t.minute() % INTERVAL_MIN != 0 { return false }
+    if !t.minute().is_multiple_of(INTERVAL_MIN) { return false }
     let cur = t.hour() * 60 + t.minute();
     WINDOWS.iter().any(|&(sh, sm, eh, em)| {
         let (start, end) = (sh * 60 + sm, eh * 60 + em);
