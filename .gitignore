@@ -11,3 +11,5 @@ Cargo.lock
 /.env
 xlh-latest.tar.gz
 build.log
+*.gz
+*.sha256
