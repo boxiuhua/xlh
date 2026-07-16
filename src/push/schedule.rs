@@ -53,6 +53,10 @@ pub fn run_multi(conn: &Connection, warn: i64, grace: i64) -> Result<()> {
     // 启动即先跳一次，别让 Web 在头 60 秒里误报「未运行」
     if let Err(e) = super::store::beat(conn) { eprintln!("写心跳失败：{e}"); }
 
+    // 实时抓取挂在同一个 60s 循环上（本项目不引入 tokio）。
+    // 它用独立的库连接：盘中每 10 分钟写 5400 行，不该和账号/会话争同一个 WAL 锁。
+    let mut rt = realtime_init();
+
     let mut last_tick = Local::now();
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
@@ -69,7 +73,79 @@ pub fn run_multi(conn: &Connection, warn: i64, grace: i64) -> Result<()> {
                 }
             }
         }
+
+        // 实时抓取失败绝不能拖垮既有的推送守护 —— 那是已上线、用户依赖的功能，
+        // 而实时抓取是新增的、可选的。任何错误只记日志。
+        if let Some((d, rc)) = rt.as_mut() {
+            if let Err(e) = realtime_tick(d, rc, conn, now, warn, grace) {
+                eprintln!("实时抓取本轮失败：{e}");
+            }
+        }
+
         last_tick = now;
+    }
+}
+
+/// 打开实时库。失败返回 None —— 实时抓取是可选功能，不该让守护起不来。
+fn realtime_init() -> Option<(crate::stock::realtime::job::Daemon, Connection)> {
+    let cfg = match crate::stock::realtime::config::load_from_toml(std::path::Path::new("config.toml")) {
+        Ok(c) => c,
+        Err(e) => {
+            // 配置写错了要能看见 —— 静默用默认值会让人以为自己的配置生效了
+            eprintln!("[realtime] 配置无效，实时抓取未启用：{e}");
+            return None;
+        }
+    };
+    match crate::stock::realtime::store::open(&cfg.db_path) {
+        Ok(c) => {
+            println!("实时抓取已启用（库 {}，ticks 保留 {} 天）", cfg.db_path.display(), cfg.retain_days);
+            Some((crate::stock::realtime::job::Daemon::new(cfg), c))
+        }
+        Err(e) => {
+            eprintln!("[realtime] 打开库失败，实时抓取未启用：{e}");
+            None
+        }
+    }
+}
+
+/// 一轮实时抓取 + 推送 + 收盘汇总。
+fn realtime_tick(
+    d: &mut crate::stock::realtime::job::Daemon,
+    rc: &mut Connection,
+    push_conn: &Connection,
+    now: DateTime<Local>,
+    warn: i64,
+    grace: i64,
+) -> Result<()> {
+    use crate::stock::realtime::job;
+
+    let naive = now.naive_local();
+
+    if job::is_summary_time(naive) {
+        let md = job::close_summary(rc, naive.date())?;
+        broadcast(push_conn, "盘中异动汇总", &md, now.date_naive(), warn, grace);
+        return Ok(());
+    }
+
+    let Some(out) = d.tick(rc, naive)? else { return Ok(()) };
+    println!("[{}] 快照 {} 条，异动 {} 只，推送 {} 只{}",
+        naive.format("%H:%M"), out.ticks, out.movers.len(), out.pushed.len(),
+        if out.flow_ok { "" } else { "（资金流不可用）" });
+
+    if out.pushed.is_empty() { return Ok(()) }
+    let md = job::render_movers(&out.pushed, out.flow_ok);
+    broadcast(push_conn, "盘中异动", &md, now.date_naive(), warn, grace);
+    Ok(())
+}
+
+/// 向所有授权放行、且配了推送渠道的用户广播。单用户失败仅记日志。
+fn broadcast(conn: &Connection, title: &str, md: &str, today: chrono::NaiveDate, warn: i64, grace: i64) {
+    for (uid, cfg) in super::store::list_all(conn).unwrap_or_default() {
+        if !user_allowed(conn, uid, today, warn, grace) { continue; }
+        if cfg.channel.webhook.trim().is_empty() { continue; }
+        if let Err(e) = super::channels::send(&cfg.channel, title, md) {
+            eprintln!("用户 {uid} 实时推送失败：{e}");
+        }
     }
 }
 

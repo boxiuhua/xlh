@@ -283,6 +283,7 @@ where
         .route("/api/stock/screen", get(stock::screen_handler))
         .route("/api/stock/attribution", get(stock::attribution_handler))
         .route("/api/stock/sync", post(stock::sync_handler))
+        .route("/api/stock/realtime/movers", get(stock::realtime_movers_handler))
 }
 
 /// 每用户推送配置路由（挂在 licensed 组，按 CurrentUser 隔离）。

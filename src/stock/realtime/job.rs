@@ -26,10 +26,15 @@ const LOW_PE_PCT: f64 = 0.30;
 pub struct TickOutcome {
     /// 本时点写入的快照数
     pub ticks: usize,
-    /// 检出的异动（已排序、已打标签）
+    /// 检出的全部异动（已排序、已打标签）。全部进库。
     pub movers: Vec<Mover>,
-    /// 实际推送的只数
-    pub pushed: usize,
+    /// 经三层限流后**应当推送**的那批。
+    ///
+    /// 这里存 Mover 而非数量：`movers` 是全部异动，`pushed` 是它的一个
+    /// **过滤子集**（强信号 ∩ 今日未推过），二者顺序不对应。
+    /// 若只回传数量、让调用方 `movers.take(n)`，会推错股票 ——
+    /// 比如排第一的异动今天已推过、本该被过滤，却仍被 take 捞出来重推。
+    pub pushed: Vec<Mover>,
     /// 资金流是否可用（东财封禁时为 false）
     pub flow_ok: bool,
 }
@@ -226,7 +231,7 @@ pub fn run_tick(
     }
     store::prune(conn, now, cfg.retain_days)?;
 
-    Ok(TickOutcome { ticks: n, movers: out, pushed: pushable.len(), flow_ok })
+    Ok(TickOutcome { ticks: n, movers: out, pushed: pushable, flow_ok })
 }
 
 fn secid_of(code: &str) -> Option<crate::stock::data::secid::Secid> {
@@ -331,6 +336,50 @@ pub fn is_summary_time(now: NaiveDateTime) -> bool {
 /// 今天（本地时区）。
 pub fn today() -> NaiveDate { Local::now().date_naive() }
 
+/// 守护侧状态：缓存全市场符号表，每日刷新一次。
+///
+/// 符号表来自既有的 `universe::load_or_fetch`（datacenter 源，不受 clist
+/// 封禁影响），它本身按交易日缓存到 `.cache/universe_{date}.csv`，
+/// 所以每天最多真正抓一次。
+pub struct Daemon {
+    pub cfg: RealtimeCfg,
+    symbols: Vec<String>,
+    names: std::collections::HashMap<String, String>,
+    loaded_for: Option<NaiveDate>,
+}
+
+impl Daemon {
+    pub fn new(cfg: RealtimeCfg) -> Self {
+        Self { cfg, symbols: Vec::new(), names: Default::default(), loaded_for: None }
+    }
+
+    /// 全市场符号表，按天惰性加载。
+    fn ensure_universe(&mut self, today: NaiveDate) -> Result<()> {
+        if self.loaded_for == Some(today) && !self.symbols.is_empty() { return Ok(()) }
+        let cache = std::path::Path::new(".cache");
+        // universe 按「最近已收盘交易日」组织，盘中要用昨天的清单 ——
+        // 今天的估值快照要等收盘后才有。清单本身（代码+名称）不受影响。
+        let date = crate::stock::data::universe::latest_trade_date()
+            .unwrap_or(today - chrono::Duration::days(1));
+        let listings = crate::stock::data::universe::load_or_fetch(cache, date)?;
+        self.symbols = a_share_symbols(&listings);
+        self.names = crate::stock::data::universe::name_map(&listings);
+        self.loaded_for = Some(today);
+        println!("实时抓取：已加载 {} 只 A 股符号（清单日 {}）", self.symbols.len(), date);
+        Ok(())
+    }
+
+    /// 跑一个 tick。返回 None 表示本轮无需动作（非抓取时点/周末/已知节假日）。
+    pub fn tick(&mut self, conn: &mut Connection, now: NaiveDateTime) -> Result<Option<TickOutcome>> {
+        if should_run(conn, now)?.is_some() { return Ok(None) }
+        self.ensure_universe(now.date())?;
+        let names = std::mem::take(&mut self.names);
+        let r = run_tick(conn, &self.cfg, &self.symbols, &names, now);
+        self.names = names;
+        r.map(Some)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +430,28 @@ mod tests {
         assert_eq!(out.len(), 5, "每时点上限 5 只");
         assert_eq!(out[0].code, "C5", "资金流占比最高的排第一");
         assert!(!out.iter().any(|m| m.code == "C0"), "占比最低的被截掉");
+    }
+
+    #[test]
+    fn pushable_subset_does_not_align_with_movers_order() {
+        // 回归测试：pushable 是 movers 的**过滤子集**，二者顺序不对应。
+        // 若调用方拿 movers.take(pushed_count)，会把「今日已推过、本该被过滤」
+        // 的那只重新推出去 —— 正是 TickOutcome.pushed 存 Mover 而非数量的原因。
+        //
+        // 构造：TOP 资金流占比最高（排 movers 第一），但今天已推过。
+        let top = mv("TOP", 0.04, 5.0, Some(0.09));
+        let second = mv("SECOND", 0.04, 5.0, Some(0.01));
+        let all = movers::rank_top(vec![top, second], usize::MAX);
+        assert_eq!(all[0].code, "TOP", "TOP 资金流占比最高，排第一");
+
+        let already: HashSet<String> = ["TOP".to_string()].into_iter().collect();
+        let pushable = select_pushable(&all, &already, &cfg());
+
+        assert_eq!(pushable.len(), 1);
+        assert_eq!(pushable[0].code, "SECOND", "已推过的 TOP 须被过滤，只推 SECOND");
+        // 这行演示了那个 bug：按数量截取会拿到 TOP —— 完全错误的那只
+        assert_eq!(all.iter().take(pushable.len()).next().unwrap().code, "TOP",
+            "take(n) 会拿到 TOP，证明按数量截取是错的");
     }
 
     #[test]

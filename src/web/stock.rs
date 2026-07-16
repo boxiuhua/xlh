@@ -234,6 +234,59 @@ pub async fn sync_handler(axum::Json(req): axum::Json<SyncRequest>) -> Json<Vec<
     Json(out)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct MoversQuery {
+    /// 查询日期，默认今天。格式 YYYY-MM-DD。
+    #[serde(default)]
+    pub day: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MoversReport {
+    pub day: String,
+    pub count: usize,
+    pub movers: Vec<crate::stock::realtime::store::SignalRow>,
+    pub disclaimer: &'static str,
+}
+
+/// 盘中异动榜。读库，不抓网络 —— 抓取由守护进程负责。
+pub async fn realtime_movers_handler(
+    Query(q): Query<MoversQuery>,
+) -> std::result::Result<Json<MoversReport>, AppError> {
+    let r = tokio::task::spawn_blocking(move || realtime_movers_blocking(q))
+        .await.map_err(|e| AppError(anyhow!("任务执行失败: {e}")))??;
+    Ok(Json(r))
+}
+
+fn realtime_movers_blocking(q: MoversQuery) -> Result<MoversReport> {
+    use crate::stock::realtime::{job, store};
+    let day = match q.day.as_deref() {
+        Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map_err(|e| anyhow!("日期格式应为 YYYY-MM-DD: {e}"))?,
+        None => chrono::Local::now().date_naive(),
+    };
+    // 库路径从 config 读，不硬编码 —— stock_cache() 那种 &'static Path 的写法
+    // 绕过了配置，新代码不重复这个错。
+    let cfg = realtime_cfg();
+    let conn = store::open(&cfg.db_path)?;
+    let movers = store::signals_on(&conn, day)?;
+    Ok(MoversReport {
+        day: day.to_string(),
+        count: movers.len(),
+        movers,
+        disclaimer: job::DISCLAIMER,
+    })
+}
+
+/// 读 config.toml 的 [realtime] 段；缺失或损坏时用默认值。
+///
+/// 宽松加载与 `AuthCfg::default()` 的处理一致：Web 层不该因为 config.toml
+/// 少一段就整个挂掉。
+fn realtime_cfg() -> crate::stock::realtime::RealtimeCfg {
+    crate::stock::realtime::config::load_from_toml(std::path::Path::new("config.toml"))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -65,6 +65,26 @@ impl Default for RealtimeCfg {
     }
 }
 
+/// 从 config.toml 读 `[realtime]` 段。
+///
+/// 段缺失 → 默认值（不报错：多数用户不跑实时抓取，不该逼他们写这段）。
+/// 段存在但非法 → **报错**（写了就得写对，静默用默认会让人以为自己的配置生效了）。
+pub fn load_from_toml(path: &std::path::Path) -> Result<RealtimeCfg> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("读取配置 {} 失败: {e}", path.display()))?;
+    from_toml_str(&text)
+}
+
+/// 供测试与 load_from_toml 复用的纯解析。
+pub fn from_toml_str(text: &str) -> Result<RealtimeCfg> {
+    #[derive(Deserialize)]
+    struct Root { realtime: Option<RealtimeCfg> }
+    let root: Root = toml::from_str(text).map_err(|e| anyhow!("[realtime] 段解析失败: {e}"))?;
+    let cfg = root.realtime.unwrap_or_default();
+    validate(&cfg)?;
+    Ok(cfg)
+}
+
 /// 校验配置。`baseline_days > retain_days` 必须报错退出而非静默降级 ——
 /// 否则基准会偷偷只用实际存在的数据，行为与配置不符，且无人察觉。
 pub fn validate(c: &RealtimeCfg) -> Result<()> {
@@ -141,6 +161,27 @@ mod tests {
         // config.toml 里没有 [realtime] 段时，全字段走默认，不报错
         let c: RealtimeCfg = toml::from_str("").unwrap();
         assert_eq!(c, RealtimeCfg::default());
+    }
+
+    #[test]
+    fn toml_without_realtime_section_yields_defaults() {
+        // 多数用户不跑实时抓取，不该逼他们在 config.toml 里写这一段
+        let c = from_toml_str("[data]\nfund_code = \"161725\"").unwrap();
+        assert_eq!(c, RealtimeCfg::default());
+    }
+
+    #[test]
+    fn toml_with_realtime_section_is_parsed_and_validated() {
+        let c = from_toml_str("[realtime]\nretain_days = 20\nbaseline_days = 5").unwrap();
+        assert_eq!(c.retain_days, 20);
+        assert_eq!(c.baseline_days, 5);
+    }
+
+    #[test]
+    fn invalid_section_errors_instead_of_silently_defaulting() {
+        // 写了就得写对：静默回退默认会让人以为自己的配置生效了
+        let e = from_toml_str("[realtime]\nbaseline_days = 30\nretain_days = 10");
+        assert!(e.is_err(), "非法配置须报错而非用默认值");
     }
 
     #[test]
