@@ -48,6 +48,32 @@ enum Commands {
         #[command(subcommand)]
         action: UserCmd,
     },
+    /// 盘中实时异动（守护会自动跑；此命令用于手动验证与排查）
+    Realtime {
+        #[command(subcommand)]
+        action: RealtimeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RealtimeCmd {
+    /// 立即抓一次快照并检测异动（忽略抓取时点限制，但仍守交易日判断）
+    Once {
+        /// 只抓前 N 只，用于快速验证（默认全市场）
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// 打印当日异动榜
+    Movers {
+        /// 日期 YYYY-MM-DD，默认今天
+        #[arg(long)]
+        day: Option<String>,
+    },
+    /// 回填结局并打印收盘汇总
+    Summary {
+        #[arg(long)]
+        day: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -100,7 +126,53 @@ fn main() -> Result<()> {
         Some(Commands::User { action }) => match action {
             UserCmd::List => xlh::web::auth::cli::user_list(&cli.config),
         },
+        Some(Commands::Realtime { action }) => realtime_cmd(&cli.config, action),
         None => run_cli(&cli.config),
+    }
+}
+
+fn realtime_cmd(config: &std::path::Path, action: RealtimeCmd) -> Result<()> {
+    use xlh::stock::realtime::{config as rtcfg, job, store};
+    let cfg = rtcfg::load_from_toml(config)?;
+    let mut conn = store::open(&cfg.db_path)?;
+    let parse_day = |s: &Option<String>| -> Result<chrono::NaiveDate> {
+        Ok(match s {
+            Some(s) => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")?,
+            None => chrono::Local::now().date_naive(),
+        })
+    };
+
+    match action {
+        RealtimeCmd::Once { limit } => {
+            let now = chrono::Local::now().naive_local();
+            let date = xlh::stock::data::universe::latest_trade_date()
+                .unwrap_or(now.date() - chrono::Duration::days(1));
+            let listings = xlh::stock::data::universe::load_or_fetch(std::path::Path::new(".cache"), date)?;
+            let mut symbols = job::a_share_symbols(&listings);
+            let names = xlh::stock::data::universe::name_map(&listings);
+            if let Some(n) = limit { symbols.truncate(n); }
+            println!("抓取 {} 只（清单日 {}）…", symbols.len(), date);
+
+            let out = job::run_tick(&mut conn, &cfg, &symbols, &names, now)?;
+            println!("快照 {} 条，异动 {} 只，应推送 {} 只{}",
+                out.ticks, out.movers.len(), out.pushed.len(),
+                if out.flow_ok { "" } else { "（资金流不可用）" });
+            if !out.movers.is_empty() {
+                println!("\n{}", job::render_movers(&out.movers, out.flow_ok));
+            }
+            Ok(())
+        }
+        RealtimeCmd::Movers { day } => {
+            let d = parse_day(&day)?;
+            let rows = store::signals_on(&conn, d)?;
+            println!("{}", job::render_summary(&rows, d));
+            Ok(())
+        }
+        RealtimeCmd::Summary { day } => {
+            let d = parse_day(&day)?;
+            println!("{}", job::close_summary(&conn, d)?);
+            Ok(())
+        }
     }
 }
 

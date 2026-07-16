@@ -187,11 +187,19 @@ pub fn run_tick(
     let ticks = snapshot::fetch(symbols)?;
     if ticks.is_empty() { return Err(anyhow!("快照为空")) }
 
-    // 快照自证：拿到的是今天的行情吗？不是 → 节假日，标记后当天不再重试。
+    // 快照自证：拿到的是今天的行情吗？
     let tss: Vec<NaiveDateTime> = ticks.iter().map(|t| t.ts).collect();
     if !calendar::verify_fresh(&tss, now.date()) {
-        store::mark_non_trading(conn, now.date())?;
-        return Err(anyhow!("{} 非交易日（行情时间戳非今日），已标记", now.date()));
+        // 陈旧 ≠ 节假日。盘前拿到昨天的收盘数据完全正常，据此标记节假日会让
+        // 开市后整个交易日被静默跳过 —— 实测踩过这个坑（00:03 跑一次抓取，
+        // 把当天这个真实交易日毒化了）。只有开盘后仍陈旧才是真节假日。
+        if calendar::stale_means_holiday(now) {
+            store::mark_non_trading(conn, now.date())?;
+            return Err(anyhow!("{} 非交易日（开盘后行情仍非今日），已标记", now.date()));
+        }
+        return Err(anyhow!(
+            "{} 行情尚未更新（当前 {}，早于开盘），未做任何标记",
+            now.date(), now.format("%H:%M")));
     }
 
     let n = store::insert_ticks(conn, &ticks)?;

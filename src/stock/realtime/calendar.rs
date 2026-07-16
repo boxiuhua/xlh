@@ -67,10 +67,27 @@ pub fn should_fetch(now: NaiveDateTime) -> bool {
 /// 取全批时间戳的**最大值**与今天比对，而非任取一只：个股可能停牌
 /// （时间戳停在 09:00:00）或数据延迟，但只要有**任何一只**股票的行情
 /// 时间戳是今天，市场就是开着的。
-///
-/// 返回 false 意味着今天是节假日，拿到的是上一交易日的陈旧数据。
 pub fn verify_fresh(ticks_ts: &[NaiveDateTime], today: NaiveDate) -> bool {
     ticks_ts.iter().map(|t| t.date()).max() == Some(today)
+}
+
+/// A 股开盘时刻。早于此，数据源返回上一交易日的收盘数据是**正常**的。
+const MARKET_OPEN: (u32, u32) = (9, 30);
+
+/// 数据陈旧时，能否据此断定今天是节假日？
+///
+/// **不能一概而论** —— 这是两件完全不同的事：
+///
+/// - 开盘后数据仍陈旧 → 今天确实是节假日，可标记
+/// - **开盘前**数据陈旧 → 完全正常，市场还没开而已
+///
+/// 若不区分，在盘前跑一次抓取就会把当天永久标记成节假日，
+/// 导致开市后整个交易日被静默跳过。（实测踩过：00:03 跑 `realtime once`，
+/// 把当天这个真实交易日标记成了节假日。）
+pub fn stale_means_holiday(now: NaiveDateTime) -> bool {
+    let t = now.time();
+    let cur = t.hour() * 60 + t.minute();
+    cur >= MARKET_OPEN.0 * 60 + MARKET_OPEN.1
 }
 
 #[cfg(test)]
@@ -156,5 +173,24 @@ mod tests {
     fn verify_fresh_rejects_empty_batch() {
         // 空批次说明抓取全失败。不能当交易日 —— 更不能据此把今天永久标记为节假日
         assert!(!verify_fresh(&[], d(2026, 7, 16)));
+    }
+
+    #[test]
+    fn stale_before_market_open_does_not_mean_holiday() {
+        // 实测踩过的 bug：00:03 在一个真实交易日跑抓取，腾讯理所当然返回昨天的
+        // 收盘数据，代码据此把今天永久标记成节假日 —— 开市后整个交易日被静默跳过。
+        //
+        // 盘前数据陈旧是完全正常的，说明不了任何事。
+        assert!(!stale_means_holiday(dt(2026, 7, 17, 0, 3)), "半夜数据陈旧是正常的");
+        assert!(!stale_means_holiday(dt(2026, 7, 17, 8, 0)), "盘前数据陈旧是正常的");
+        assert!(!stale_means_holiday(dt(2026, 7, 17, 9, 29)), "开盘前一分钟仍不能断定");
+    }
+
+    #[test]
+    fn stale_after_market_open_does_mean_holiday() {
+        // 开盘后数据仍是昨天的 —— 这才真的说明今天没开市
+        assert!(stale_means_holiday(dt(2026, 7, 17, 9, 30)), "开盘时刻起，陈旧即节假日");
+        assert!(stale_means_holiday(dt(2026, 7, 17, 10, 0)));
+        assert!(stale_means_holiday(dt(2026, 7, 17, 14, 0)));
     }
 }
