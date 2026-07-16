@@ -87,15 +87,11 @@ pub fn run_multi(conn: &Connection, warn: i64, grace: i64) -> Result<()> {
 }
 
 /// 打开实时库。失败返回 None —— 实时抓取是可选功能，不该让守护起不来。
+///
+/// 用进程级配置（由 `run_multi_daemon` 的调用方经 `config::init` 装载），
+/// **不硬编码 config.toml 路径** —— 否则 `--config` 对实时抓取形同虚设。
 fn realtime_init() -> Option<(crate::stock::realtime::job::Daemon, Connection)> {
-    let cfg = match crate::stock::realtime::config::load_from_toml(std::path::Path::new("config.toml")) {
-        Ok(c) => c,
-        Err(e) => {
-            // 配置写错了要能看见 —— 静默用默认值会让人以为自己的配置生效了
-            eprintln!("[realtime] 配置无效，实时抓取未启用：{e}");
-            return None;
-        }
-    };
+    let cfg = crate::stock::realtime::config::get().clone();
     match crate::stock::realtime::store::open(&cfg.db_path) {
         Ok(c) => {
             println!("实时抓取已启用（库 {}，ticks 保留 {} 天）", cfg.db_path.display(), cfg.retain_days);

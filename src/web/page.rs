@@ -141,6 +141,7 @@ xlhMe();
     <button class="tab" data-tab="s-screen">股选股</button>
     <button class="tab" data-tab="s-quality">质量筛选</button>
     <button class="tab" data-tab="s-attrib">归因分解</button>
+    <button class="tab" data-tab="s-realtime">盘中异动</button>
   </div>
 
   <!-- 单次 -->
@@ -411,6 +412,25 @@ xlhMe();
       </div>
       <div class="hint" style="margin-top:8px">对预设股票池逐只多策略样本外评分 + 技术诊断后排名；首次联网抓取较慢，命中缓存后秒级。不构成任何投资建议。</div>
       <div id="ss-result" style="margin-top:14px"></div>
+    </div>
+  </div>
+
+  <!-- 盘中异动（守护抓取，此处只读库）-->
+  <div class="panel" id="panel-s-realtime">
+    <div class="card">
+      <div class="row">
+        <div class="field"><label>日期</label><input type="date" id="rt-day"/></div>
+        <button class="run" id="run-s-realtime">查看</button>
+      </div>
+      <div class="hint" style="margin-top:8px">
+        <strong>这是线索，不是策略。</strong>开市日 10:00–11:30、13:30–15:00 每 10 分钟抓一次全 A 股快照，
+        「价格突变 + 量能放大」双阈值触发。<strong>阈值是拍脑袋定的，未经前瞻检验</strong> ——
+        本项目基金侧同款择时逻辑上线后被证伪、已删除。每条信号连同其收盘结局永久留档，
+        正是为了几个月后能用真实数据回答「这套阈值到底有没有用」。在那之前，别拿它当交易依据。<br/>
+        「主力资金」是东财按单笔成交金额<strong>分档推算</strong>的代理指标，非真实席位数据，
+        分不出机构/游资/拆单，也识别不了对倒。
+      </div>
+      <div id="rt-result" style="margin-top:14px"></div>
     </div>
   </div>
 
@@ -1359,6 +1379,85 @@ document.getElementById('run-s-screen').addEventListener('click', function(){
     .then(renderStockScreen)
     .catch(function(e){ document.getElementById('ss-result').innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
     .finally(function(){ setBtn(btn, false, '选股'); });
+});
+
+// ===== 盘中异动 =====
+function rtPct(v){ return (v>=0?'+':'') + (v*100).toFixed(2) + '%'; }
+function rtColor(v){ return v>=0 ? '#c0392b' : '#27ae60'; }  // A股惯例：红涨绿跌
+
+function rtDiv(d){
+  if(d==='retail_chasing')   return '<span title="涨但主力净流出" style="color:#e67e22">⚠ 散户抬轿</span>';
+  if(d==='main_accumulating')return '<span title="跌但主力净流入" style="color:#2980b9">⚠ 主力吸筹</span>';
+  if(d==='unknown')          return '<span title="数据源限流，未取到资金流" style="color:#95a5a6">资金流N/A</span>';
+  return '';
+}
+
+function renderRealtime(r){
+  var el = document.getElementById('rt-result');
+  if(!r.movers || !r.movers.length){
+    el.innerHTML = '<div class="hint">' + esc(r.day) + ' 无异动信号。'
+      + '（守护未运行、当日非交易日、或确实没有触发的股票都会是这个结果）</div>';
+    return;
+  }
+  // 单元格 padding 走内联样式：本页既有表格都是这个写法（见 renderEvidence 等）
+  var TH = 'padding:6px 10px;white-space:nowrap';
+  var TD = 'padding:6px 10px;white-space:nowrap';
+  var TDR = TD + ';text-align:right';
+  var h = '<table style="margin-top:6px;border-collapse:collapse;width:100%;font-size:.92rem">'
+        + '<thead><tr style="color:#7f8c8d;text-align:left;border-bottom:1px solid #e5e7eb">'
+        + '<th style="'+TH+'">时间</th><th style="'+TH+'">代码</th><th style="'+TH+'">名称</th>'
+        + '<th style="'+TH+';text-align:right">触发涨跌</th><th style="'+TH+';text-align:right">触发价</th>'
+        + '<th style="'+TH+';text-align:right">量能</th><th style="'+TH+';text-align:right">主力占比</th>'
+        + '<th style="'+TH+'">背离</th><th style="'+TH+'">视角</th>'
+        + '<th style="'+TH+';text-align:right">至收盘</th><th style="'+TH+'">已推送</th>'
+        + '</tr></thead><tbody>';
+  r.movers.forEach(function(m){
+    var flow = (m.main_net_pct===null||m.main_net_pct===undefined)
+      ? '<span style="color:#95a5a6">—</span>'
+      : '<span style="color:'+rtColor(m.main_net_pct)+'">'+rtPct(m.main_net_pct)+'</span>';
+    // 「没数据」≠「零收益」—— 缺失必须显示成 —，不能渲染成 0.00%
+    var ret = (m.close_ret===null||m.close_ret===undefined)
+      ? '<span style="color:#95a5a6" title="日线尚未同步或当日停牌">未知</span>'
+      : '<span style="color:'+rtColor(m.close_ret)+'">'+rtPct(m.close_ret)+'</span>';
+    h += '<tr style="border-bottom:1px solid #f1f2f4">'
+      + '<td style="'+TD+'">'+esc((m.ts||'').slice(11,16))+'</td>'
+      + '<td style="'+TD+'">'+esc(m.code)+'</td>'
+      + '<td style="'+TD+'">'+esc(m.name)+'</td>'
+      + '<td style="'+TDR+';color:'+rtColor(m.jump_pct)+'">'+rtPct(m.jump_pct)+'</td>'
+      + '<td style="'+TDR+'">'+Number(m.trigger_price).toFixed(2)+'</td>'
+      + '<td style="'+TDR+'">'+Number(m.vol_surge_x).toFixed(1)+'×</td>'
+      + '<td style="'+TDR+'">'+flow+'</td>'
+      + '<td style="'+TD+'">'+rtDiv(m.divergence)+'</td>'
+      + '<td style="'+TD+'">'+(m.horizon_tag==='long'?'长线':'短线')+'</td>'
+      + '<td style="'+TDR+'">'+ret+'</td>'
+      + '<td style="'+TD+';text-align:center">'+(m.pushed?'✓':'')+'</td>'
+      + '</tr>';
+  });
+  h += '</tbody></table>';
+
+  // 胜率：只统计有结局的样本，且必须标注样本量 —— 否则 2/3 会被读成 67% 胜率
+  var known = r.movers.filter(function(m){ return m.close_ret!==null && m.close_ret!==undefined; });
+  if(known.length){
+    var win = known.filter(function(m){ return m.close_ret>0; }).length;
+    var avg = known.reduce(function(a,m){ return a+m.close_ret; },0)/known.length;
+    h += '<div class="hint" style="margin-top:10px">信号后至收盘：<strong>'+win+'/'+known.length
+      + '</strong> 上涨，均值 <strong style="color:'+rtColor(avg)+'">'+rtPct(avg)+'</strong>'
+      + '（样本 '+known.length+' 条，<strong>尚不足以证明有效性</strong>；需数百至上千条才谈得上统计检验）</div>';
+  }
+  h += '<div class="hint" style="margin-top:6px">'+esc(r.disclaimer||'')+'</div>';
+  el.innerHTML = h;
+}
+
+document.getElementById('run-s-realtime').addEventListener('click', function(){
+  var btn = this, day = document.getElementById('rt-day').value.trim();
+  var qs = new URLSearchParams(); if(day) qs.append('day', day);
+  setBtn(btn, true, '查看');
+  document.getElementById('rt-result').textContent = '读取中…';
+  fetch('/api/stock/realtime/movers?' + qs.toString())
+    .then(function(res){ if(!res.ok) return res.text().then(function(x){ throw new Error(x); }); return res.json(); })
+    .then(renderRealtime)
+    .catch(function(e){ document.getElementById('rt-result').innerHTML = '<span style="color:#c0392b">'+esc(String(e.message||e))+'</span>'; })
+    .finally(function(){ setBtn(btn, false, '查看'); });
 });
 
 // ===== 推送配置 =====

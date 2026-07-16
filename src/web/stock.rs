@@ -265,9 +265,9 @@ fn realtime_movers_blocking(q: MoversQuery) -> Result<MoversReport> {
             .map_err(|e| anyhow!("日期格式应为 YYYY-MM-DD: {e}"))?,
         None => chrono::Local::now().date_naive(),
     };
-    // 库路径从 config 读，不硬编码 —— stock_cache() 那种 &'static Path 的写法
-    // 绕过了配置，新代码不重复这个错。
-    let cfg = realtime_cfg();
+    // 库路径取自启动时装载的进程级配置，**不硬编码路径** ——
+    // stock_cache() 那种 &'static Path 会让 --config 形同虚设。
+    let cfg = crate::stock::realtime::config::get();
     let conn = store::open(&cfg.db_path)?;
     let movers = store::signals_on(&conn, day)?;
     Ok(MoversReport {
@@ -276,15 +276,6 @@ fn realtime_movers_blocking(q: MoversQuery) -> Result<MoversReport> {
         movers,
         disclaimer: job::DISCLAIMER,
     })
-}
-
-/// 读 config.toml 的 [realtime] 段；缺失或损坏时用默认值。
-///
-/// 宽松加载与 `AuthCfg::default()` 的处理一致：Web 层不该因为 config.toml
-/// 少一段就整个挂掉。
-fn realtime_cfg() -> crate::stock::realtime::RealtimeCfg {
-    crate::stock::realtime::config::load_from_toml(std::path::Path::new("config.toml"))
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

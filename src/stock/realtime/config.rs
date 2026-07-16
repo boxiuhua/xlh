@@ -65,6 +65,32 @@ impl Default for RealtimeCfg {
     }
 }
 
+/// 进程级配置。
+///
+/// # 为什么是全局而不是穿参
+///
+/// Web 层的 `core_routes<S>` 是泛型 state（测试用 `()` 直连 `.oneshot`），
+/// handler 无法取到 `AuthState`。而配置本来就是**进程级**的：一个进程只服务
+/// 一份 config.toml。
+///
+/// 关键是**不得硬编码路径**。`web/stock.rs:19` 那种 `Path::new(".cache/stock")`
+/// 会让 `--config` 参数形同虚设 —— 实测踩过：用 `--config /tmp/x/config.toml`
+/// 起服务，Web 层却仍读当前目录的 config.toml，打开了错误的库，榜单恒为空。
+static CFG: std::sync::OnceLock<RealtimeCfg> = std::sync::OnceLock::new();
+
+/// 启动时装载。由 `web::serve` 与 push 守护调用，各自传入真实的 `--config` 路径。
+///
+/// 段缺失 → 默认值；段非法 → Err（调用方决定是报错退出还是禁用实时抓取）。
+pub fn init(path: &std::path::Path) -> Result<&'static RealtimeCfg> {
+    let cfg = load_from_toml(path)?;
+    Ok(CFG.get_or_init(|| cfg))
+}
+
+/// 取进程级配置。未 init 过则为默认值（测试路径）。
+pub fn get() -> &'static RealtimeCfg {
+    CFG.get_or_init(RealtimeCfg::default)
+}
+
 /// 从 config.toml 读 `[realtime]` 段。
 ///
 /// 段缺失 → 默认值（不报错：多数用户不跑实时抓取，不该逼他们写这段）。

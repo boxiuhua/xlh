@@ -105,6 +105,10 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Push { once }) => {
+            // 装载进程级实时配置：守护的实时抓取靠它，且必须尊重 --config
+            if let Err(e) = xlh::stock::realtime::config::init(&cli.config) {
+                eprintln!("⚠ [realtime] 配置无效，实时抓取未启用：{e}");
+            }
             let auth_cfg = xlh::web::auth::config::load_auth(&cli.config);
             let conn = xlh::web::auth::store::open(&auth_cfg.db_path)?;
             xlh::history::migrate(&conn)?;
@@ -133,7 +137,9 @@ fn main() -> Result<()> {
 
 fn realtime_cmd(config: &std::path::Path, action: RealtimeCmd) -> Result<()> {
     use xlh::stock::realtime::{config as rtcfg, job, store};
-    let cfg = rtcfg::load_from_toml(config)?;
+    // 走 init 而非 load_from_toml：与 serve/守护同一条装载路径，
+    // 确保 --config 在所有入口一致生效
+    let cfg = rtcfg::init(config)?;
     let mut conn = store::open(&cfg.db_path)?;
     let parse_day = |s: &Option<String>| -> Result<chrono::NaiveDate> {
         Ok(match s {

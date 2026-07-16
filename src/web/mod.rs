@@ -372,6 +372,11 @@ async fn funds_handler() -> axum::Json<Vec<crate::data::fundlist::FundInfo>> {
 }
 
 pub async fn serve(config_path: std::path::PathBuf, port: u16) -> Result<()> {
+    // 装载进程级实时配置。段非法要能看见 —— 静默用默认值会让人以为自己的
+    // 配置生效了，而实时榜单会安静地读错库、恒为空。
+    if let Err(e) = crate::stock::realtime::config::init(&config_path) {
+        eprintln!("⚠ [realtime] 配置无效，实时榜单将用默认值：{e}");
+    }
     let cfg = auth::config::load_auth(&config_path);
     let conn = auth::store::open(&cfg.db_path).context("打开授权数据库失败")?;
     crate::history::migrate(&conn).context("建历史表失败")?;
