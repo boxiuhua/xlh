@@ -122,11 +122,24 @@ pub fn recent_ticks(conn: &Connection, code: &str, n: usize) -> Result<Vec<(Naiv
         .collect())
 }
 
-/// 某只股票在「历史同一时点」（同 时:分，**不含今天**）的成交量序列，用于量能基准。
+/// 某只股票在「历史同一时点」（同 时:分，**不含今天**）的成交量**增量**序列，
+/// 用于量能基准。
 ///
-/// 排除今天是硬性的：基准必须是历史。把今天算进去等于用当下解释当下 ——
+/// # 返回增量而非累计量
+///
+/// 腾讯给的 volume 是**当日累计**。检测侧算的是「本时点增量」
+/// （`compute` 里 `vol - prev_vol`）。基准必须与被比较的量同口径 ——
+/// 拿增量去除以累计量毫无意义，且会随时间推移越来越离谱：
+/// 尾盘累计量是早盘的十几倍，同一个增量在 14:50 算出的倍数会比 10:10 小一个量级。
+///
+/// 故这里对每个历史日，取该时点的累计量减去**同日前一个时点**的累计量。
+/// 当天首个时点（无前值）没有增量可言，跳过。
+///
+/// # 排除今天
+///
+/// 硬性：基准必须是历史。把今天算进去等于用当下解释当下 ——
 /// 一只正在异动的股票会自己抬高自己的基准，把自己的异动抹平。
-pub fn same_slot_volumes(
+pub fn same_slot_deltas(
     conn: &Connection, code: &str, hhmm: (u32, u32), today: NaiveDate, since: NaiveDate,
 ) -> Result<Vec<f64>> {
     let mut stmt = conn.prepare(
@@ -135,11 +148,23 @@ pub fn same_slot_volumes(
     let rows = stmt.query_map(rusqlite::params![code, since_ts], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
     })?;
-    let mut out = Vec::new();
+
+    // 按日分组（已按 ts 升序），日内保留 (时分, 累计量)
+    let mut by_day: std::collections::BTreeMap<NaiveDate, Vec<((u32, u32), f64)>> = Default::default();
     for (ts, vol) in rows.filter_map(|r| r.ok()) {
         let Some(dt) = chrono::DateTime::from_timestamp(ts, 0).map(|d| d.naive_utc()) else { continue };
         if dt.date() == today { continue }
-        if (dt.hour(), dt.minute()) == hhmm { out.push(vol) }
+        by_day.entry(dt.date()).or_default().push(((dt.hour(), dt.minute()), vol));
+    }
+
+    let mut out = Vec::new();
+    for (_, day) in by_day {
+        let Some(i) = day.iter().position(|(slot, _)| *slot == hhmm) else { continue };
+        // 当日首个时点无前值，无增量可言
+        if i == 0 { continue }
+        let delta = day[i].1 - day[i - 1].1;
+        // 累计量回退（数据源偶发）→ 负增量，不可当基准
+        if delta > 0.0 { out.push(delta) }
     }
     Ok(out)
 }
@@ -343,28 +368,85 @@ mod tests {
     }
 
     #[test]
-    fn same_slot_volumes_excludes_today_and_other_slots() {
+    fn same_slot_returns_delta_not_cumulative() {
+        // 回归测试。腾讯的 volume 是当日累计，而检测侧算的是「本时点增量」。
+        // 基准必须同口径 —— 拿增量除以累计量毫无意义，且随时间越来越离谱：
+        // 尾盘累计量是早盘的十几倍，同一增量在 14:50 算出的倍数会小一个量级。
+        //
+        // 这个 bug 单测抓不到（单测直接把 history 当增量喂），只有端到端组装才暴露。
         let mut c = db();
-        let today = d(2026, 7, 16);
         insert_ticks(&mut c, &[
-            tick("A", dt(2026, 7, 14, 10, 0), 1.0, 100.0),  // 同时点，历史 ✓
-            tick("A", dt(2026, 7, 15, 10, 0), 1.0, 200.0),  // 同时点，历史 ✓
-            tick("A", dt(2026, 7, 15, 10, 10), 1.0, 999.0), // 不同时点 ✗
-            tick("A", dt(2026, 7, 16, 10, 0), 1.0, 888.0),  // 今天 ✗
+            tick("A", dt(2026, 7, 15, 10, 0), 1.0, 1000.0),   // 累计 1000
+            tick("A", dt(2026, 7, 15, 10, 10), 1.0, 2000.0),  // 累计 2000 → 增量 1000
         ]).unwrap();
-        let v = same_slot_volumes(&c, "A", (10, 0), today, d(2026, 7, 1)).unwrap();
-        assert_eq!(v, vec![100.0, 200.0], "只取历史同时点；今天与其他时点须排除");
+        let v = same_slot_deltas(&c, "A", (10, 10), d(2026, 7, 16), d(2026, 7, 1)).unwrap();
+        assert_eq!(v, vec![1000.0], "须返回增量 1000，而非累计量 2000");
     }
 
     #[test]
-    fn same_slot_volumes_respects_since_window() {
+    fn same_slot_skips_first_tick_of_day_which_has_no_delta() {
+        // 当日首个时点没有前值，无增量可言。若误把累计量当增量，
+        // 10:00 的「增量」会等于开盘至今的全部成交量 —— 一个巨大的假基准
         let mut c = db();
         insert_ticks(&mut c, &[
-            tick("A", dt(2026, 7, 1, 10, 0), 1.0, 111.0),   // baseline 窗口外
-            tick("A", dt(2026, 7, 15, 10, 0), 1.0, 222.0),  // 窗口内
+            tick("A", dt(2026, 7, 15, 10, 0), 1.0, 5000.0),
+            tick("A", dt(2026, 7, 15, 10, 10), 1.0, 6000.0),
         ]).unwrap();
-        let v = same_slot_volumes(&c, "A", (10, 0), d(2026, 7, 16), d(2026, 7, 10)).unwrap();
+        let v = same_slot_deltas(&c, "A", (10, 0), d(2026, 7, 16), d(2026, 7, 1)).unwrap();
+        assert!(v.is_empty(), "当日首个时点无前值，须跳过而非把累计量当增量");
+    }
+
+    #[test]
+    fn same_slot_computes_delta_per_day_independently() {
+        // 累计量每天从 0 重来。若不按日分组、直接对全序列做差，
+        // 跨日那一笔会得到巨大的负数（今日开盘累计 − 昨日收盘累计）
+        let mut c = db();
+        for day in [14u32, 15] {
+            insert_ticks(&mut c, &[
+                tick("A", dt(2026, 7, day, 10, 0), 1.0, 1000.0),
+                tick("A", dt(2026, 7, day, 10, 10), 1.0, 1500.0),
+            ]).unwrap();
+        }
+        let v = same_slot_deltas(&c, "A", (10, 10), d(2026, 7, 16), d(2026, 7, 1)).unwrap();
+        assert_eq!(v, vec![500.0, 500.0], "每日独立做差，不得跨日");
+    }
+
+    #[test]
+    fn same_slot_excludes_today() {
+        let mut c = db();
+        insert_ticks(&mut c, &[
+            tick("A", dt(2026, 7, 15, 10, 0), 1.0, 100.0),
+            tick("A", dt(2026, 7, 15, 10, 10), 1.0, 300.0),   // 历史增量 200 ✓
+            tick("A", dt(2026, 7, 16, 10, 0), 1.0, 100.0),
+            tick("A", dt(2026, 7, 16, 10, 10), 1.0, 9999.0),  // 今天 ✗
+        ]).unwrap();
+        let v = same_slot_deltas(&c, "A", (10, 10), d(2026, 7, 16), d(2026, 7, 1)).unwrap();
+        assert_eq!(v, vec![200.0], "今天的量不得进基准 —— 否则异动股自己抹平自己");
+    }
+
+    #[test]
+    fn same_slot_respects_since_window() {
+        let mut c = db();
+        insert_ticks(&mut c, &[
+            tick("A", dt(2026, 7, 1, 10, 0), 1.0, 100.0),     // baseline 窗口外
+            tick("A", dt(2026, 7, 1, 10, 10), 1.0, 211.0),
+            tick("A", dt(2026, 7, 15, 10, 0), 1.0, 100.0),    // 窗口内
+            tick("A", dt(2026, 7, 15, 10, 10), 1.0, 322.0),
+        ]).unwrap();
+        let v = same_slot_deltas(&c, "A", (10, 10), d(2026, 7, 16), d(2026, 7, 10)).unwrap();
         assert_eq!(v, vec![222.0], "baseline_days 窗口外的样本不得参与基准");
+    }
+
+    #[test]
+    fn same_slot_drops_negative_delta_from_source_glitch() {
+        // 腾讯偶发累计量回退。负增量不可当基准
+        let mut c = db();
+        insert_ticks(&mut c, &[
+            tick("A", dt(2026, 7, 15, 10, 0), 1.0, 2000.0),
+            tick("A", dt(2026, 7, 15, 10, 10), 1.0, 1500.0),  // 回退
+        ]).unwrap();
+        let v = same_slot_deltas(&c, "A", (10, 10), d(2026, 7, 16), d(2026, 7, 1)).unwrap();
+        assert!(v.is_empty(), "负增量须丢弃");
     }
 
     #[test]

@@ -255,7 +255,7 @@ fn detect(
     let mut out = Vec::new();
     for t in ticks {
         let recent = store::recent_ticks(conn, &t.code, 2)?;
-        let history = store::same_slot_volumes(conn, &t.code, slot, now.date(), since)?;
+        let history = store::same_slot_deltas(conn, &t.code, slot, now.date(), since)?;
         // 冷启动兜底：无历史同时点样本时用当日累计均量。
         // 当日均量 = 累计量 ÷ 已过时点数，粗糙但总比不判定强。
         let today_avg = today_average(conn, &t.code, now)?;

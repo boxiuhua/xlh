@@ -107,18 +107,41 @@ pub fn parse(body: &str) -> Result<Vec<Flow>> {
 
 /// 抓候选股资金流。`secids` 形如 `["1.600519", "0.000001"]`。
 ///
-/// 复用 `universe` 的 client/get：已封装 IPv4 强制绑定（东财部分 IPv6 CDN
-/// 节点不可达）、20s 超时、4 次指数退避重试。不要再手写一份 reqwest builder。
+/// # 为什么不复用 `universe::get`，也不重试
+///
+/// `universe::get` 会重试 4 次带指数退避。那对「必须拿到」的全市场清单是对的
+/// （残缺清单是静默错误），但对资金流是**有害的**：
+///
+/// 1. 资金流失败**本来就允许降级** —— 佐证拿不到不影响价量主判定成立
+/// 2. 实测东财封禁**持续 ≥600 秒**（观测窗口内未解除）。在封禁期间重试，
+///    等于一次调用打 4 发，只会加深伤口。对一个可失败的功能，**快速失败**
+///    比顽强重试正确。
+///
+/// 故这里单发不重试。IPv4 绑定仍保留（东财部分 IPv6 CDN 节点不可达），
+/// 超时压到 8s —— 封禁时连接是直接被掐的，等 20s 没有意义。
+fn client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        .build()
+        .map_err(|e| anyhow!("构建HTTP客户端失败: {e}"))
+}
+
 pub fn fetch(secids: &[String]) -> Result<Vec<Flow>> {
     if secids.is_empty() { return Ok(Vec::new()) }
-    let c = crate::stock::data::universe::client()?;
+    let c = client()?;
     let mut all = Vec::with_capacity(secids.len());
     for (i, chunk) in secids.chunks(BATCH).enumerate() {
         if i > 0 { std::thread::sleep(std::time::Duration::from_millis(300)); }
         let url = format!(
             "https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&secids={}&fields=f12,f14,f2,f3,f6,f62,f184",
             chunk.join(","));
-        let body = crate::stock::data::universe::get(&c, &url, "https://quote.eastmoney.com/")?;
+        // 单发不重试 —— 见上方注释
+        let body = c.get(&url)
+            .header("Referer", "https://quote.eastmoney.com/")
+            .header("User-Agent", "Mozilla/5.0")
+            .send().and_then(|r| r.text())
+            .map_err(|e| anyhow!("资金流请求失败（东财可能限流）: {e}"))?;
         all.extend(parse(&body)?);
     }
     Ok(all)
