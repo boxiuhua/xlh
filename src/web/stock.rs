@@ -322,6 +322,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn realtime_movers_route_returns_report_with_disclaimer() {
+        let resp = crate::web::core_router()
+            .oneshot(Request::builder().uri("/api/stock/realtime/movers").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["movers"].is_array(), "movers 应是数组");
+        assert!(v["day"].is_string());
+        // 免责声明不是装饰：不能让人误以为「主力资金」是真实席位数据
+        let d = v["disclaimer"].as_str().unwrap_or_default();
+        assert!(d.contains("代理指标"), "榜单必须带资金流局限声明");
+        assert!(d.contains("非投资建议"));
+    }
+
+    #[tokio::test]
+    async fn realtime_movers_bad_date_is_400() {
+        let resp = crate::web::core_router()
+            .oneshot(Request::builder().uri("/api/stock/realtime/movers?day=garbage").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), 400, "非法日期须 400，而非静默用今天");
+    }
+
+    #[tokio::test]
     async fn diagnose_bad_code_is_400() {
         let resp = crate::web::core_router()
             .oneshot(Request::builder().uri("/api/stock/diagnose?code=bad!!code").body(Body::empty()).unwrap())

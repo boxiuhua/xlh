@@ -16,6 +16,21 @@
 //! `signals` 的保留期刻意不做成配置项：不给「一改配置就把验证依据清掉」
 //! 留任何路径。若它随 ticks 一起滚动删除，就永久失去了回答「这套阈值到底
 //! 有没有用」的能力 —— 而那是本项目的头号风险。
+//!
+//! # ⚠ `ts` 列的口径：本地朴素时间，不是真 Unix 时间戳
+//!
+//! `ts` 存的是 `naive_local.and_utc().timestamp()` —— 即把**本地**朴素时间
+//! 当作 UTC 编码。读回时 `from_timestamp(ts,0).naive_utc()` 反向解，
+//! 与写入精确互逆。
+//!
+//! 全模块统一此口径（写入、读取、prune 的时间比较、pushed_today 的日界），
+//! 故内部完全自洽。A 股只有一个时区，不需要真正的时区换算。
+//!
+//! **但这意味着 `ts` 不能当 Unix 时间戳解读**：
+//! `sqlite3 "SELECT datetime(ts,'unixepoch') FROM ticks"` 会得到偏移 8 小时
+//! 的错误时间（CST=UTC+8），正确的读法是 `datetime(ts,'unixepoch')` 的结果
+//! 直接当本地时间看，不要再做时区转换。外部脚本写入本表时同理 ——
+//! 用 `datetime.combine(day, t).timestamp()`（本地→epoch）会与本模块差 8 小时。
 use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::{NaiveDate, NaiveDateTime, Timelike};
@@ -323,6 +338,32 @@ mod tests {
             jump_pct: 0.03, vol_surge_x: 4.0, main_net: None, main_net_pct: None,
             divergence: Divergence::Unknown, horizon: Horizon::Short, baseline: Baseline::History,
         }
+    }
+
+    #[test]
+    fn timestamp_roundtrips_exactly_as_local_naive() {
+        // ts 的口径是「本地朴素时间当 UTC 编码」，写入与读取必须精确互逆。
+        // 若哪天有人把写入改成 Local::now().timestamp()（真 epoch）而读取不变，
+        // 所有时间会偏移 8 小时：10:30 的信号显示成 02:30，日界判断跟着错乱，
+        // pushed_today 会在下午 4 点「跨日」把限流状态清掉。
+        let mut c = db();
+        let t = dt(2026, 7, 16, 10, 30);
+        insert_ticks(&mut c, &[tick("A", t, 10.0, 100.0)]).unwrap();
+        let back = recent_ticks(&c, "A", 1).unwrap();
+        assert_eq!(back[0].0, t, "写入读取须精确互逆，不得有时区偏移");
+    }
+
+    #[test]
+    fn pushed_today_day_boundary_uses_same_convention_as_writes() {
+        // 日界必须与 ts 口径一致。若二者用不同口径，会差 8 小时 ——
+        // 下午的信号被算进「明天」，当日限流形同虚设
+        let c = db();
+        insert_signal(&c, &mover("LATE", dt(2026, 7, 16, 14, 50)), true).unwrap();
+        insert_signal(&c, &mover("EARLY", dt(2026, 7, 16, 10, 0)), true).unwrap();
+        let set = pushed_today(&c, d(2026, 7, 16)).unwrap();
+        assert!(set.contains("LATE"), "下午的信号必须算作今天");
+        assert!(set.contains("EARLY"));
+        assert_eq!(set.len(), 2);
     }
 
     #[test]
