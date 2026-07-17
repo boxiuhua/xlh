@@ -63,30 +63,72 @@ docker compose logs -f xlh-web
 
 **发到线上服务器（免镜像仓库，save + scp + load）**
 
-Git Bash 里一键：
+Git Bash 里一键（脚本自带：部署前备份、旧布局迁移、崩溃循环检测、部署前后用户数比对）：
 
 ```bash
-scripts/deploy.sh user@服务器IP                 # 加 WITH_PUSH=1 同时起推送守护
+WITH_PUSH=1 scripts/deploy.sh root@服务器IP          # 默认部署到 /opt/xlh
+XLH_STATE_DIR=/srv/xlh-state WITH_PUSH=1 scripts/deploy.sh root@服务器IP
 ```
 
-或手动（本机 **PowerShell** 用 `docker save -o`，别用 `| gzip >`，PowerShell 无 gzip 且 `>` 会损坏二进制）：
+**`WITH_PUSH=1` 别漏** —— `xlh-push` 在 compose 里是可选 profile，不带它时 `up -d` **完全不管这个服务**（不建、不重建、看都不看）。而**盘中实时抓取整个挂在这个守护上**（`push/schedule.rs` 的 60s 循环），它不跑就永远没有实时数据，偏偏 `xlh-web` 一切正常、页面照开，从外面看不出问题。查 `xlh.db` 的 `push_heartbeat` 表：0 行 = 守护从没跑过。
+
+**打包给老版本 Docker**：buildx 默认产出 OCI image index + attestation manifest，老 Docker（20.10 等）`docker load` 会失败或加载出跑不起来的镜像。服务器 Docker 版本不确定时：
+
+```bash
+docker build --provenance=false --sbom=false --output type=docker,name=xlh:latest .
+```
+
+这样本地镜像存储里就是单一 `manifest.v2+json`，`deploy.sh` 自己那步 `docker save` 导出的也干净。
+
+手动路径（本机 **PowerShell** 用 `docker save -o`，别用 `| gzip >`，PowerShell 无 gzip 且 `>` 会损坏二进制）：
 
 ```powershell
 docker save xlh:latest -o xlh-latest.tar
-scp xlh-latest.tar docker-compose.prod.yml config.toml push.toml user@服务器IP:/opt/xlh/
+scp xlh-latest.tar docker-compose.prod.yml config.toml user@服务器IP:/opt/xlh/
 ```
 
 ```bash
 # 服务器（Linux）
-cd /opt/xlh && mkdir -p .cache output
+cd /opt/xlh
+
+# 1. .env 必须先有，且 XLH_STATE_DIR 必须是绝对路径。
+#    compose 里它是 `:?` 强制的 —— 没有就直接报错起不来。这是故意的：
+#    静默回退到空库会让服务照常启动、所有账号却登不上，看起来像「数据丢了」。
+cat > .env <<'EOF'
+XLH_STATE_DIR=/opt/xlh
+XLH_IMAGE=xlh:latest
+XLH_BIND_ADDR=127.0.0.1
+XLH_PORT=8080
+TZ=Asia/Shanghai
+EOF
+
+# 2. 先备份。用 .backup 而非 cp —— 库跑在 WAL 模式，数据可能几乎全在 -wal 里，
+#    cp 主库会得到一个能打开、看着正常、其实没数据的空壳。
+mkdir -p "$(. ./.env; echo $XLH_STATE_DIR)"/{data,cache,output,backups}
+sqlite3 /opt/xlh/data/xlh.db ".backup '/opt/xlh/backups/xlh-$(date +%F-%H%M%S).db'" 2>/dev/null || true
+
+# 3. 加载 + 起。--profile push 每条命令都要带，漏了 xlh-push 就不会被创建。
 docker load -i xlh-latest.tar
-docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml --profile push up -d --force-recreate --remove-orphans
+docker compose -f docker-compose.prod.yml --profile push ps
 ```
+
+**部署后必须验证**（容器 `Up` 不等于活着，崩溃循环在 `ps` 里也占一行）：
+
+```bash
+docker logs --tail 20 xlh-push     # 要看到「实时抓取已启用（库 data/realtime.db，ticks 保留 10 天）」
+docker ps -a --filter name=xlh- --format '{{.Names}} {{.Status}}' | grep -Ei 'restarting|exited'
+```
+
+盘中每 10 分钟还应有一行 `[HH:MM] 快照 N 条，异动 N 只`。只有推送日志、没有「实时抓取已启用」= `config.toml` 的 `[realtime]` 段没被读到。
 
 **对外暴露**：`docker-compose.prod.yml` 默认把端口绑在 `127.0.0.1:8080`（防裸奔）。要开外网访问，改成 `- "8080:8080"` 后 `up -d`，**并在云安全组/防火墙放行入方向 TCP 8080**（来源建议限成你自己的 IP）。因界面无鉴权且 `push.toml` 含密钥，长期对外强烈建议前置 Nginx/Caddy + Basic Auth + HTTPS，只对外开 443。
 
 **常见坑**
 
+- **实时异动一直没数据、`ticks` 表空**：`xlh-push` 没在跑。实时抓取挂在推送守护的 60s 循环上，不在 `serve` 里 —— `serve` 只调 `realtime::config::init` 供 Web 读榜，从不启动抓取。用 `--profile push` 起 `xlh-push`；`push_heartbeat` 为 0 行即可确认守护从没跑过。另注：`baseline_days = 10`，冷启动前 10 个交易日 `Baseline` 只会是 `Fallback`（拿当日自己比自己），不是 `History`。
+- **`docker load` 报 invalid/unsupported manifest，或加载后跑不起来**：包是 buildx 的 OCI index + attestation，服务器 Docker 太老吃不下。用 `--provenance=false --sbom=false --output type=docker` 重新构建再 save。验包：`tar -xzOf xlh-latest.tar.gz index.json` 应只有 `application/vnd.docker.distribution.manifest.v2+json`。
+- **`error: XLH_STATE_DIR is required` / compose 直接起不来**：服务器上 `.env` 不存在或没设 `XLH_STATE_DIR`（必须绝对路径）。这是刻意设计的强制失败，别去掉 `:?` 加默认值 —— 静默回退到空库比起不来危险得多。`deploy.sh` 会自动生成 `.env`，手工部署要自己写。
 - **`写入 push.toml 失败: Is a directory`**：启动容器时宿主 `push.toml` **文件不存在**，Docker 会把挂载源自动建成**目录**。修复：`docker compose ... down` → `rm -rf push.toml` → 重新 `scp` 真正的文件 → 确认 `ls -l push.toml` 是文件 → `up -d`。**务必先放好文件再 `up`**（`config.toml` 同理）。
 - **外网打不开、`docker ps` 显示 `127.0.0.1:8080->8080`**：端口只绑了本机，按上面「对外暴露」改绑定并放行安全组。
 - **Windows Docker Desktop 本机 `localhost:8080` 返回 502**：是 Docker Desktop 的 WSL2 端口转发问题（对所有容器都复现，与本项目无关），Linux 服务器上不存在。
