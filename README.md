@@ -142,7 +142,7 @@ docker ps -a --filter name=xlh- --format '{{.Names}} {{.Status}}' | grep -Ei 're
 ```bash
 XLH_ADMIN_PASSWORD=YourSecurePassword123 xlh admin create --username admin
 
-docker exec -e XLH_ADMIN_PASSWORD='123qwe!@#QWE' xlh-web xlh admin create --username admin
+docker exec -e XLH_ADMIN_PASSWORD='换成你自己的强密码' xlh-web xlh admin create --username admin
 ```
 
 启动 Web 后访问 `/admin`（左上管理后台入口），用上述凭证登录。
