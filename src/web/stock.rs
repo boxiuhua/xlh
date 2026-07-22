@@ -115,13 +115,51 @@ pub async fn recommend_handler(Query(q): Query<RecommendQuery>) -> std::result::
     Ok(Json(rep))
 }
 
+/// 是否沪深 A 股（market 0/1）。离线判定，不触发美股搜索网络请求。
+fn is_a_share(code: &str) -> bool {
+    use crate::stock::data::secid::{resolve_offline, Resolved};
+    matches!(resolve_offline(code), Ok(Resolved::Ready(s)) if s.market == 0 || s.market == 1)
+}
+
 fn recommend_blocking(q: RecommendQuery) -> StockRecommendReport {
     let params = RecommendParams { top_n: q.top_n.unwrap_or(5), ..Default::default() };
     let names = std::collections::HashMap::new();
     let end = chrono::Local::now().date_naive();
     let start = end - chrono::Duration::days(8 * 365);
+
+    // 基本面闸门数据：A 股全集快照（含市值/PE/名称）。加载失败则 A 股一律降级 NotApplicable，
+    // 不阻断整轮选股。
+    let trade_date = universe::latest_trade_date().unwrap_or(end);
+    let snapshot: std::collections::HashMap<String, universe::Listing> =
+        universe::load_or_fetch(universe_cache(), trade_date)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|l| (l.code.clone(), l))
+            .collect();
+
+    let gate = |code: &str| -> recommend::GateOutcome {
+        if !is_a_share(code) {
+            return recommend::GateOutcome::NotApplicable("非A股".into());
+        }
+        let Some(listing) = snapshot.get(code) else {
+            return recommend::GateOutcome::NotApplicable("全集快照无此股".into());
+        };
+        let reports = match fundamentals::load_or_fetch(
+            code, fundamentals_cache(), FUNDAMENTALS_MAX_AGE, end) {
+            Ok(r) => r,
+            Err(_) => return recommend::GateOutcome::NotApplicable("基本面数据获取失败,未经闸门".into()),
+        };
+        // 港股无估值历史；A 股正常应有，取不到则空序列（PE 分位因子自动降级）。
+        let vals = valuation::load_or_fetch(code, valuation_cache(), trade_date).unwrap_or_default();
+        match screen::evaluate(listing, &reports, &vals, &ScreenParams::default()) {
+            Ok(profile) => recommend::GateOutcome::Passed(profile),
+            Err(excl) => recommend::GateOutcome::Excluded(excl),
+        }
+    };
+
     recommend::build_report(STOCK_POOL, &names, &end.to_string(), &params,
-        |code| cache::load_or_fetch(code, stock_cache(), start, end))
+        |code| cache::load_or_fetch(code, stock_cache(), start, end),
+        gate)
 }
 
 // ---- 质量筛选 ----
@@ -299,6 +337,14 @@ mod tests {
     fn stock_pool_valid() {
         assert!(!STOCK_POOL.is_empty());
         for c in STOCK_POOL { assert!(validate_stock_code(c).is_ok(), "池内代码应合法: {c}"); }
+    }
+
+    #[test]
+    fn a_share_classification() {
+        assert!(is_a_share("600519"), "沪 A");
+        assert!(is_a_share("000858"), "深 A");
+        assert!(!is_a_share("00700"), "港股非 A");
+        assert!(!is_a_share("AAPL"), "美股非 A");
     }
 
     #[tokio::test]
