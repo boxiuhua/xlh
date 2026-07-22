@@ -32,6 +32,7 @@ pub enum GateStatus {
 }
 
 /// 闸门对单只股票的裁定（`build_report` 内部消费，不序列化）。
+#[derive(Debug)]
 pub enum GateOutcome {
     /// 过闸，携带质量画像。
     Passed(Profile),

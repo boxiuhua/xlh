@@ -1159,11 +1159,12 @@ function sCard(r, rank){
   var d = r.diagnosis || {}, b = r.best_strategy || {}, tc = trendColor(d.trend);
   var extra = '';
   if (r.profile){
-    var pf = r.profile, bits = [];
-    if (pf.roe_streak != null && pf.roe_streak > 0) bits.push('ROE 连续 '+pf.roe_streak+' 年≥15%');
-    if (pf.profit_cagr != null && isFinite(pf.profit_cagr)) bits.push('净利5年CAGR '+pf.profit_cagr.toFixed(1)+'%');
-    if (pf.pe_percentile != null && isFinite(pf.pe_percentile)) bits.push('PE 自身历史分位 '+(pf.pe_percentile*100).toFixed(0)+'%');
+    var prof = r.profile, bits = [];
+    if (prof.roe_streak != null && prof.roe_streak > 0) bits.push('ROE 连续 '+prof.roe_streak+' 年≥15%');
+    if (prof.profit_cagr != null && isFinite(prof.profit_cagr)) bits.push('净利5年CAGR '+prof.profit_cagr.toFixed(1)+'%');
+    if (prof.pe_percentile != null && isFinite(prof.pe_percentile)) bits.push('PE 自身历史分位 '+(prof.pe_percentile*100).toFixed(0)+'%');
     if (bits.length) extra = '<div style="margin-top:6px;color:#2c6e49">基本面（历史事实，非预测）：'+esc(bits.join(' · '))+'</div>';
+    else extra = '<div style="margin-top:6px;color:#2c6e49">基本面：已通过闸门（无突出可核验项）</div>';
   } else if (r.gate && r.gate.kind === 'NotApplicable'){
     extra = '<div style="margin-top:6px"><span style="background:#eef1f4;color:#7f8c8d;padding:1px 8px;border-radius:10px;font-size:.85rem">基本面闸门不适用：'+esc(r.gate.reason||'')+'</span></div>';
   }

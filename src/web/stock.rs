@@ -130,19 +130,25 @@ fn recommend_blocking(q: RecommendQuery) -> StockRecommendReport {
     // 基本面闸门数据：A 股全集快照（含市值/PE/名称）。加载失败则 A 股一律降级 NotApplicable，
     // 不阻断整轮选股。
     let trade_date = universe::latest_trade_date().unwrap_or(end);
-    let snapshot: std::collections::HashMap<String, universe::Listing> =
-        universe::load_or_fetch(universe_cache(), trade_date)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|l| (l.code.clone(), l))
-            .collect();
+    let (snapshot_list, snapshot_ok) = match universe::load_or_fetch(universe_cache(), trade_date) {
+        Ok(list) => (list, true),
+        Err(_) => (Vec::new(), false),
+    };
+    let snapshot: std::collections::HashMap<String, universe::Listing> = snapshot_list
+        .into_iter()
+        .map(|l| (l.code.clone(), l))
+        .collect();
 
     let gate = |code: &str| -> recommend::GateOutcome {
         if !is_a_share(code) {
             return recommend::GateOutcome::NotApplicable("非A股".into());
         }
         let Some(listing) = snapshot.get(code) else {
-            return recommend::GateOutcome::NotApplicable("全集快照无此股".into());
+            return if snapshot_ok {
+                recommend::GateOutcome::NotApplicable("全集快照无此股".into())
+            } else {
+                recommend::GateOutcome::NotApplicable("全集快照获取失败,未经闸门".into())
+            };
         };
         let reports = match fundamentals::load_or_fetch(
             code, fundamentals_cache(), FUNDAMENTALS_MAX_AGE, end) {
