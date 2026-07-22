@@ -13,12 +13,34 @@ use crate::stock::backtest;
 use crate::stock::fee::StockFee;
 use crate::stock::data::StockBar;
 use crate::stock::diagnose::{self, DiagnoseParams, StockDiagnosis};
+use crate::stock::screen::{Exclusion, Profile};
 
 pub const DISCLAIMER: &str =
     "基于历史行情的统计回测与技术指标启发式，不预测未来走势，不构成任何投资建议。";
 
 const MIN_TRAIN: usize = 120;
 const MIN_TEST: usize = 30;
+
+/// 基本面闸门判定结果（随推荐项序列化给前端）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind")]
+pub enum GateStatus {
+    /// A 股，已过基本面闸门。
+    Passed,
+    /// 港/美股或数据缺失，未经闸门 —— 附原因。
+    NotApplicable { reason: String },
+}
+
+/// 闸门对单只股票的裁定（`build_report` 内部消费，不序列化）。
+#[derive(Debug)]
+pub enum GateOutcome {
+    /// 过闸，携带质量画像。
+    Passed(Profile),
+    /// 被排除（不进技术排名）。
+    Excluded(Exclusion),
+    /// 不适用（保留、标注、无画像）。
+    NotApplicable(String),
+}
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ScoreWeights { pub w_return: f64, pub w_sharpe: f64, pub w_mdd: f64 }
@@ -46,12 +68,19 @@ pub struct StockRecommendation {
     pub all_strategies: Vec<StockStrategyEval>,
     pub diagnosis: StockDiagnosis,
     pub rationale: String,
+    /// 基本面质量画像（A 股过闸者 Some）。**独立上下文，绝不折算进 stock_score。**
+    pub profile: Option<Profile>,
+    /// 基本面闸门状态。
+    pub gate: GateStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StockRecommendReport {
     pub generated: String, pub pool_size: usize, pub analyzed: usize,
-    pub skipped: Vec<String>, pub top: Vec<StockRecommendation>,
+    pub skipped: Vec<String>,
+    /// 被基本面闸门在技术排名前踢掉的股票：(代码, 排除理由)。
+    pub gate_excluded: Vec<(String, String)>,
+    pub top: Vec<StockRecommendation>,
     pub weights: ScoreWeights, pub split_ratio: f64, pub disclaimer: String,
 }
 
@@ -150,6 +179,8 @@ pub fn evaluate_stock(code: &str, name: &str, bars: &[StockBar], p: &RecommendPa
     Ok(StockRecommendation {
         code: code.to_string(), name: name.to_string(), stock_score: 0.0,
         best_strategy: best, all_strategies: evals, diagnosis, rationale,
+        profile: None,
+        gate: GateStatus::Passed,
     })
 }
 
@@ -168,21 +199,30 @@ pub fn rank_top(mut recs: Vec<StockRecommendation>, p: &RecommendParams) -> Vec<
     recs
 }
 
-/// 遍历股票池：注入 loader 取 bars → evaluate_stock → rank_top，装配整页报告。
-pub fn build_report<F>(
-    pool: &[&str], names: &HashMap<String, String>, today: &str, p: &RecommendParams, mut load: F,
+/// 遍历股票池：先过基本面闸门（gate），过闸/不适用者再注入 loader 取 bars → evaluate_stock
+/// → rank_top，装配整页报告。被 gate 排除者不进技术排名。
+pub fn build_report<F, G>(
+    pool: &[&str], names: &HashMap<String, String>, today: &str, p: &RecommendParams,
+    mut load: F, mut gate: G,
 ) -> StockRecommendReport
 where
     F: FnMut(&str) -> anyhow::Result<Vec<StockBar>>,
+    G: FnMut(&str) -> GateOutcome,
 {
     let mut recs = Vec::new();
     let mut skipped = Vec::new();
+    let mut gate_excluded: Vec<(String, String)> = Vec::new();
     for &code in pool {
+        let (gate_status, profile) = match gate(code) {
+            GateOutcome::Excluded(e) => { gate_excluded.push((code.to_string(), e.reason())); continue; }
+            GateOutcome::Passed(prof) => (GateStatus::Passed, Some(prof)),
+            GateOutcome::NotApplicable(reason) => (GateStatus::NotApplicable { reason }, None),
+        };
         match load(code) {
             Ok(bars) => {
                 let name = names.get(code).cloned().unwrap_or_else(|| code.to_string());
                 match evaluate_stock(code, &name, &bars, p) {
-                    Ok(r) => recs.push(r),
+                    Ok(mut r) => { r.profile = profile; r.gate = gate_status; recs.push(r); }
                     Err(_) => skipped.push(code.to_string()),
                 }
             }
@@ -196,6 +236,7 @@ where
         pool_size: pool.len(),
         analyzed,
         skipped,
+        gate_excluded,
         top,
         weights: p.weights,
         split_ratio: p.split_ratio,
@@ -213,6 +254,23 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap() + chrono::Duration::days(i as i64),
             open: *v, high: *v, low: *v, close: *v, volume: 0.0, adj_close: *v,
         }).collect()
+    }
+
+    fn load_two(code: &str) -> anyhow::Result<Vec<StockBar>> {
+        match code {
+            "600519" => Ok(series(&(0..300).map(|i| 100.0 + i as f64 * 0.5).collect::<Vec<_>>())),
+            _ => Ok(series(&(0..300).map(|i| 100.0 + i as f64 * 0.2).collect::<Vec<_>>())),
+        }
+    }
+
+    fn dummy_profile() -> Profile {
+        Profile {
+            code: "600519".into(), name: "茅台".into(), years: 10,
+            roe_median: Some(30.0), roe_streak: 10, revenue_cagr: Some(20.0),
+            profit_cagr: Some(20.0), gross_margin: Some(90.0),
+            market_cap: 1.5e12, pe_ttm: Some(18.0), pe_percentile: Some(0.3),
+            note: "测试画像".into(),
+        }
     }
 
     #[test]
@@ -268,7 +326,7 @@ mod tests {
                 "000001" => Ok(series(&(0..300).map(|i| 100.0 + i as f64 * 0.2).collect::<Vec<_>>())),
                 _ => Err(anyhow::anyhow!("加载失败")),
             }
-        });
+        }, |_| GateOutcome::NotApplicable("测试".into()));
         assert_eq!(rep.pool_size, 3);
         assert_eq!(rep.analyzed, 2);
         assert_eq!(rep.skipped, vec!["BADX".to_string()]);
@@ -280,7 +338,8 @@ mod tests {
     #[test]
     fn build_report_empty_pool() {
         let names = HashMap::new();
-        let rep = build_report(&[], &names, "2026-07-01", &RecommendParams::default(), |_| Ok(Vec::new()));
+        let rep = build_report(&[], &names, "2026-07-01", &RecommendParams::default(),
+            |_| Ok(Vec::new()), |_| GateOutcome::NotApplicable("测试".into()));
         assert_eq!(rep.analyzed, 0);
         assert!(rep.top.is_empty());
     }
@@ -290,12 +349,53 @@ mod tests {
         let names = HashMap::new();
         let rep = build_report(&["600519"], &names, "2026-07-01", &RecommendParams::default(), |_| {
             Ok(series(&(0..300).map(|i| 100.0 + i as f64 * 0.4).collect::<Vec<_>>()))
-        });
+        }, |_| GateOutcome::Passed(dummy_profile()));
         let j = serde_json::to_string(&rep).unwrap();
         for key in ["\"top\"", "\"best_strategy\"", "\"all_strategies\"", "\"diagnosis\"",
                     "\"rationale\"", "\"weights\"", "\"split_ratio\"", "\"disclaimer\"",
-                    "\"stock_score\"", "\"skipped\""] {
+                    "\"stock_score\"", "\"skipped\"", "\"gate_excluded\"", "\"gate\"", "\"profile\""] {
             assert!(j.contains(key), "JSON 应含 {key}");
+        }
+    }
+
+    #[test]
+    fn gate_excludes_before_technical_ranking() {
+        let names: HashMap<String, String> = HashMap::new();
+        let rep = build_report(&["600519", "LOSSY"], &names, "2026-07-01", &RecommendParams::default(),
+            load_two,
+            |code| if code == "LOSSY" { GateOutcome::Excluded(Exclusion::LossMaking) }
+                   else { GateOutcome::Passed(dummy_profile()) });
+        assert!(rep.top.iter().all(|r| r.code != "LOSSY"), "被排除者不进技术排名");
+        assert!(rep.gate_excluded.iter().any(|(c, _)| c == "LOSSY"), "排除应记入 gate_excluded");
+        assert!(rep.top.iter().any(|r| r.code == "600519" && r.profile.is_some()), "过闸者应带 Profile");
+    }
+
+    #[test]
+    fn non_a_share_kept_and_marked_not_applicable() {
+        let names: HashMap<String, String> = HashMap::new();
+        let rep = build_report(&["AAPL"], &names, "2026-07-01", &RecommendParams::default(),
+            load_two, |_| GateOutcome::NotApplicable("非A股".into()));
+        assert_eq!(rep.top.len(), 1, "不适用者保留在推荐里");
+        assert!(rep.top[0].profile.is_none());
+        match &rep.top[0].gate {
+            GateStatus::NotApplicable { reason } => assert!(reason.contains("非A股")),
+            GateStatus::Passed => panic!("应为 NotApplicable"),
+        }
+    }
+
+    #[test]
+    fn profile_does_not_affect_ranking_score() {
+        // 同样两只股票：一次带 Profile 过闸、一次 NotApplicable，stock_score 必须完全一致
+        // —— 证明 Profile 是旁证、绝没被折算进排名分（铁律）。
+        let names: HashMap<String, String> = HashMap::new();
+        let with_prof = build_report(&["600519", "000001"], &names, "2026-07-01",
+            &RecommendParams::default(), load_two, |_| GateOutcome::Passed(dummy_profile()));
+        let without = build_report(&["600519", "000001"], &names, "2026-07-01",
+            &RecommendParams::default(), load_two, |_| GateOutcome::NotApplicable("非A股".into()));
+        assert_eq!(with_prof.top.len(), without.top.len());
+        for (a, b) in with_prof.top.iter().zip(without.top.iter()) {
+            assert_eq!(a.code, b.code, "排名顺序不受 Profile 影响");
+            assert!((a.stock_score - b.stock_score).abs() < 1e-12, "分数不受 Profile 影响");
         }
     }
 }

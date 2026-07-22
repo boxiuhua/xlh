@@ -1157,6 +1157,17 @@ function renderStockRun(o){
 }
 function sCard(r, rank){
   var d = r.diagnosis || {}, b = r.best_strategy || {}, tc = trendColor(d.trend);
+  var extra = '';
+  if (r.profile){
+    var prof = r.profile, bits = [];
+    if (prof.roe_streak != null && prof.roe_streak > 0) bits.push('ROE 连续 '+prof.roe_streak+' 年≥15%');
+    if (prof.profit_cagr != null && isFinite(prof.profit_cagr)) bits.push('净利5年CAGR '+prof.profit_cagr.toFixed(1)+'%');
+    if (prof.pe_percentile != null && isFinite(prof.pe_percentile)) bits.push('PE 自身历史分位 '+(prof.pe_percentile*100).toFixed(0)+'%');
+    if (bits.length) extra = '<div style="margin-top:6px;color:#2c6e49">基本面（历史事实，非预测）：'+esc(bits.join(' · '))+'</div>';
+    else extra = '<div style="margin-top:6px;color:#2c6e49">基本面：已通过闸门（无突出可核验项）</div>';
+  } else if (r.gate && r.gate.kind === 'NotApplicable'){
+    extra = '<div style="margin-top:6px"><span style="background:#eef1f4;color:#7f8c8d;padding:1px 8px;border-radius:10px;font-size:.85rem">基本面闸门不适用：'+esc(r.gate.reason||'')+'</span></div>';
+  }
   return '<div class="card" style="border-left:4px solid '+tc+'">'
     + '<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap"><span style="font-size:1.3rem;font-weight:700;color:#c0392b">#'+rank+'</span>'
     + '<span style="font-size:1.1rem;font-weight:600">'+esc(r.name)+'</span><span style="color:#7f8c8d">'+esc(r.code)+'</span>'
@@ -1164,6 +1175,7 @@ function sCard(r, rank){
     + '<div style="margin-top:8px">最优策略：<strong style="background:#fdecea;color:#c0392b;padding:2px 10px;border-radius:12px">'+esc(b.name)+'</strong></div>'
     + '<div style="margin-top:6px;color:#34495e">样本外：收益 '+pct(b.oos_return)+' · 夏普 '+b.oos_sharpe.toFixed(2)+' · 回撤 '+pct(b.oos_mdd)+'</div>'
     + '<div style="margin-top:6px;color:#34495e">技术面：<strong style="color:'+tc+'">'+esc(d.trend||'-')+'</strong> · '+esc(d.signal||'-')+'</div>'
+    + extra
     + '<div style="margin-top:6px;color:#5a6a7a">'+esc(r.rationale)+'</div></div>';
 }
 function renderStockScreen(rep){
@@ -1171,6 +1183,13 @@ function renderStockScreen(rep){
   if(!rep || !Array.isArray(rep.top)){ box.innerHTML = '<span style="color:#c0392b">选股失败</span>'; return; }
   if(!rep.top.length){ box.innerHTML = '<div style="color:#c0392b">暂无可分析数据（已分析 '+rep.analyzed+'/'+rep.pool_size+'）。</div>'; return; }
   var head = '<div style="color:#5a6a7a;margin-bottom:10px">已分析 '+rep.analyzed+'/'+rep.pool_size+' · 跳过 '+(rep.skipped||[]).length+' · 生成于 '+esc(rep.generated)+'</div>';
+  var gx = rep.gate_excluded || [];
+  if (gx.length){
+    var agg = {};
+    gx.forEach(function(pair){ var reason = pair[1] || '未知'; agg[reason] = (agg[reason]||0) + 1; });
+    var parts = Object.keys(agg).map(function(k){ return esc(k)+' '+agg[k]+' 只'; });
+    head += '<div style="margin-bottom:10px;color:#8a6d3b;background:#fcf8e3;border-radius:6px;padding:6px 10px">基本面闸门排除 '+gx.length+' 只：'+parts.join(' · ')+'</div>';
+  }
   var cards = rep.top.map(function(r,i){ return sCard(r,i+1); }).join('');
   var foot = '<div class="hint" style="margin-top:6px;color:#c0392b">'+esc(rep.disclaimer)+'</div>';
   box.innerHTML = head + cards + foot;
