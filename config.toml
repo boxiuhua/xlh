@@ -39,6 +39,7 @@ out_dir = "output"
 # warn_days = 7
 # grace_days = 3
 # session_ttl_days = 30
+# secure_cookie = true            # HTTPS 反向代理部署时开启；也可用 XLH_COOKIE_SECURE 覆盖
 
 [realtime]
 db_path = "data/realtime.db"

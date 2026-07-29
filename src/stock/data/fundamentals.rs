@@ -43,39 +43,67 @@ pub struct FinReport {
 // ---- A股 ----
 
 #[derive(Deserialize)]
-struct AResp { result: Option<AResult> }
+struct AResp {
+    result: Option<AResult>,
+}
 #[derive(Deserialize)]
-struct AResult { #[serde(default)] data: Vec<ARow> }
+struct AResult {
+    #[serde(default)]
+    data: Vec<ARow>,
+}
 #[derive(Deserialize)]
 struct ARow {
-    #[serde(rename = "REPORTDATE")] report_date: String,
-    #[serde(rename = "TOTAL_OPERATE_INCOME")] revenue: Option<f64>,
-    #[serde(rename = "YSTZ")] revenue_yoy: Option<f64>,
-    #[serde(rename = "PARENT_NETPROFIT")] net_profit: Option<f64>,
-    #[serde(rename = "SJLTZ")] net_profit_yoy: Option<f64>,
-    #[serde(rename = "WEIGHTAVG_ROE")] roe: Option<f64>,
-    #[serde(rename = "XSMLL")] gross_margin: Option<f64>,
-    #[serde(rename = "BPS")] bps: Option<f64>,
-    #[serde(rename = "BASIC_EPS")] eps: Option<f64>,
+    #[serde(rename = "REPORTDATE")]
+    report_date: String,
+    #[serde(rename = "TOTAL_OPERATE_INCOME")]
+    revenue: Option<f64>,
+    #[serde(rename = "YSTZ")]
+    revenue_yoy: Option<f64>,
+    #[serde(rename = "PARENT_NETPROFIT")]
+    net_profit: Option<f64>,
+    #[serde(rename = "SJLTZ")]
+    net_profit_yoy: Option<f64>,
+    #[serde(rename = "WEIGHTAVG_ROE")]
+    roe: Option<f64>,
+    #[serde(rename = "XSMLL")]
+    gross_margin: Option<f64>,
+    #[serde(rename = "BPS")]
+    bps: Option<f64>,
+    #[serde(rename = "BASIC_EPS")]
+    eps: Option<f64>,
 }
 
 // ---- 港股 ----
 
 #[derive(Deserialize)]
-struct HResp { result: Option<HResult> }
+struct HResp {
+    result: Option<HResult>,
+}
 #[derive(Deserialize)]
-struct HResult { #[serde(default)] data: Vec<HRow> }
+struct HResult {
+    #[serde(default)]
+    data: Vec<HRow>,
+}
 #[derive(Deserialize)]
 struct HRow {
-    #[serde(rename = "STD_REPORT_DATE")] report_date: String,
-    #[serde(rename = "OPERATE_INCOME")] revenue: Option<f64>,
-    #[serde(rename = "OPERATE_INCOME_YOY")] revenue_yoy: Option<f64>,
-    #[serde(rename = "HOLDER_PROFIT")] net_profit: Option<f64>,
-    #[serde(rename = "HOLDER_PROFIT_YOY")] net_profit_yoy: Option<f64>,
-    #[serde(rename = "ROE_AVG")] roe: Option<f64>,
-    #[serde(rename = "GROSS_PROFIT_RATIO")] gross_margin: Option<f64>,
-    #[serde(rename = "BPS")] bps: Option<f64>,
-    #[serde(rename = "BASIC_EPS")] eps: Option<f64>,
+    #[serde(rename = "STD_REPORT_DATE")]
+    report_date: String,
+    #[serde(rename = "OPERATE_INCOME")]
+    revenue: Option<f64>,
+    #[serde(rename = "OPERATE_INCOME_YOY")]
+    revenue_yoy: Option<f64>,
+    #[serde(rename = "HOLDER_PROFIT")]
+    net_profit: Option<f64>,
+    #[serde(rename = "HOLDER_PROFIT_YOY")]
+    net_profit_yoy: Option<f64>,
+    #[serde(rename = "ROE_AVG")]
+    roe: Option<f64>,
+    #[serde(rename = "GROSS_PROFIT_RATIO")]
+    gross_margin: Option<f64>,
+    #[serde(rename = "BPS")]
+    bps: Option<f64>,
+    #[serde(rename = "BASIC_EPS")]
+    eps: Option<f64>,
 }
 
 /// "2026-03-31 00:00:00" → NaiveDate
@@ -85,8 +113,11 @@ fn parse_date(s: &str) -> Result<NaiveDate> {
 }
 
 pub fn parse_a(body: &str) -> Result<Vec<FinReport>> {
-    let resp: AResp = serde_json::from_str(body).map_err(|e| anyhow!("解析A股财报JSON失败: {e}"))?;
-    let Some(result) = resp.result else { return Ok(Vec::new()); };
+    let resp: AResp =
+        serde_json::from_str(body).map_err(|e| anyhow!("解析A股财报JSON失败: {e}"))?;
+    let Some(result) = resp.result else {
+        return Ok(Vec::new());
+    };
     let mut out = Vec::with_capacity(result.data.len());
     for r in result.data {
         out.push(FinReport {
@@ -106,8 +137,11 @@ pub fn parse_a(body: &str) -> Result<Vec<FinReport>> {
 }
 
 pub fn parse_hk(body: &str) -> Result<Vec<FinReport>> {
-    let resp: HResp = serde_json::from_str(body).map_err(|e| anyhow!("解析港股财报JSON失败: {e}"))?;
-    let Some(result) = resp.result else { return Ok(Vec::new()); };
+    let resp: HResp =
+        serde_json::from_str(body).map_err(|e| anyhow!("解析港股财报JSON失败: {e}"))?;
+    let Some(result) = resp.result else {
+        return Ok(Vec::new());
+    };
     let mut out = Vec::with_capacity(result.data.len());
     for r in result.data {
         out.push(FinReport {
@@ -128,7 +162,10 @@ pub fn parse_hk(body: &str) -> Result<Vec<FinReport>> {
 
 /// 只取年报（12-31）。营收/净利/ROE 是 YTD 累计值，只有年报之间才是同口径可比的。
 pub fn annuals(reports: &[FinReport]) -> Vec<&FinReport> {
-    reports.iter().filter(|r| r.date.month() == 12 && r.date.day() == 31).collect()
+    reports
+        .iter()
+        .filter(|r| r.date.month() == 12 && r.date.day() == 31)
+        .collect()
 }
 
 fn http() -> Result<reqwest::blocking::Client> {
@@ -144,7 +181,8 @@ fn get(url: &str, referer: &str) -> Result<String> {
     let client = http()?;
     let mut last_err = None;
     for _ in 0..2 {
-        match client.get(url)
+        match client
+            .get(url)
             .header("Referer", referer)
             .header("User-Agent", "Mozilla/5.0")
             .send()
@@ -195,20 +233,31 @@ fn fmt(v: Option<f64>) -> String {
 /// 空串 → None（接口对不适用字段返回 null，如银行无毛利率）
 fn num(s: &str) -> Option<f64> {
     let t = s.trim();
-    if t.is_empty() { None } else { t.parse().ok() }
+    if t.is_empty() {
+        None
+    } else {
+        t.parse().ok()
+    }
 }
 
 pub fn write_csv(path: &Path, reports: &[FinReport]) -> Result<()> {
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).ok(); }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
     let mut s = String::from(HEADER);
     s.push('\n');
     for r in reports {
         s.push_str(&format!(
             "{},{},{},{},{},{},{},{},{}\n",
             r.date,
-            fmt(r.revenue), fmt(r.revenue_yoy),
-            fmt(r.net_profit), fmt(r.net_profit_yoy),
-            fmt(r.roe), fmt(r.gross_margin), fmt(r.bps), fmt(r.eps),
+            fmt(r.revenue),
+            fmt(r.revenue_yoy),
+            fmt(r.net_profit),
+            fmt(r.net_profit_yoy),
+            fmt(r.roe),
+            fmt(r.gross_margin),
+            fmt(r.bps),
+            fmt(r.eps),
         ));
     }
     std::fs::write(path, s).map_err(|e| anyhow!("写财报缓存失败: {e}"))?;
@@ -219,14 +268,23 @@ pub fn read_csv(path: &Path) -> Result<Vec<FinReport>> {
     let text = std::fs::read_to_string(path).map_err(|e| anyhow!("读财报缓存失败: {e}"))?;
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
-        if i == 0 || line.trim().is_empty() { continue; }
+        if i == 0 || line.trim().is_empty() {
+            continue;
+        }
         let c: Vec<&str> = line.split(',').collect();
-        if c.len() < 9 { continue; }
+        if c.len() < 9 {
+            continue;
+        }
         out.push(FinReport {
             date: NaiveDate::parse_from_str(c[0], "%Y-%m-%d")?,
-            revenue: num(c[1]), revenue_yoy: num(c[2]),
-            net_profit: num(c[3]), net_profit_yoy: num(c[4]),
-            roe: num(c[5]), gross_margin: num(c[6]), bps: num(c[7]), eps: num(c[8]),
+            revenue: num(c[1]),
+            revenue_yoy: num(c[2]),
+            net_profit: num(c[3]),
+            net_profit_yoy: num(c[4]),
+            roe: num(c[5]),
+            gross_margin: num(c[6]),
+            bps: num(c[7]),
+            eps: num(c[8]),
         });
     }
     out.sort_by_key(|r| r.date);
@@ -237,19 +295,33 @@ pub fn read_csv(path: &Path) -> Result<Vec<FinReport>> {
 ///
 /// 与 K线的 `cache::load_or_fetch` 语义不同：K线按"是否覆盖窗口"判断，
 /// 财报按"缓存新鲜度"判断 —— 因为最新一期财报的存在与否无法从已有数据推断。
-pub fn load_or_fetch(input: &str, cache_dir: &Path, max_age_days: i64, today: NaiveDate) -> Result<Vec<FinReport>> {
+pub fn load_or_fetch(
+    input: &str,
+    cache_dir: &Path,
+    max_age_days: i64,
+    today: NaiveDate,
+) -> Result<Vec<FinReport>> {
     let secid = super::resolve_secid(input)?;
     let path = cache_dir.join(format!("{}.csv", secid.cache_key()));
     if path.exists() {
         if let Ok(cached) = read_csv(&path) {
-            let fresh_enough = cached.last()
-                .map(|_| file_age_days(&path, today).map(|a| a <= max_age_days).unwrap_or(false))
+            let fresh_enough = cached
+                .last()
+                .map(|_| {
+                    file_age_days(&path, today)
+                        .map(|a| a <= max_age_days)
+                        .unwrap_or(false)
+                })
                 .unwrap_or(false);
-            if fresh_enough { return Ok(cached); }
+            if fresh_enough {
+                return Ok(cached);
+            }
         }
     }
     let fresh = fetch(&secid)?;
-    if fresh.is_empty() { return Err(anyhow!("股票 {input} 无财报数据")); }
+    if fresh.is_empty() {
+        return Err(anyhow!("股票 {input} 无财报数据"));
+    }
     write_csv(&path, &fresh)?;
     Ok(fresh)
 }
@@ -264,7 +336,9 @@ fn file_age_days(path: &Path, today: NaiveDate) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn d(y: i32, m: u32, day: u32) -> NaiveDate { NaiveDate::from_ymd_opt(y, m, day).unwrap() }
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
 
     // 取自东财实测响应（600519 贵州茅台）
     const A_BODY: &str = r#"{"result":{"pages":17,"data":[
@@ -285,10 +359,19 @@ mod tests {
         let fy = &rs[0];
         assert!((fy.revenue.unwrap() - 172_054_171_890.91).abs() < 1.0);
         assert!((fy.net_profit.unwrap() - 82_320_067_101.68).abs() < 1.0);
-        assert!((fy.roe.unwrap() - 32.53).abs() < 1e-9, "WEIGHTAVG_ROE → roe");
-        assert!((fy.gross_margin.unwrap() - 91.1795516835).abs() < 1e-9, "XSMLL → gross_margin");
+        assert!(
+            (fy.roe.unwrap() - 32.53).abs() < 1e-9,
+            "WEIGHTAVG_ROE → roe"
+        );
+        assert!(
+            (fy.gross_margin.unwrap() - 91.1795516835).abs() < 1e-9,
+            "XSMLL → gross_margin"
+        );
         assert!((fy.eps.unwrap() - 65.66).abs() < 1e-9);
-        assert!((fy.revenue_yoy.unwrap() - (-1.2000971769)).abs() < 1e-9, "YSTZ 可为负");
+        assert!(
+            (fy.revenue_yoy.unwrap() - (-1.2000971769)).abs() < 1e-9,
+            "YSTZ 可为负"
+        );
     }
 
     #[test]
@@ -297,10 +380,22 @@ mod tests {
         assert_eq!(rs.len(), 1);
         let r = &rs[0];
         assert_eq!(r.date, d(2025, 12, 31));
-        assert!((r.revenue.unwrap() - 751_766_000_000.0).abs() < 1.0, "OPERATE_INCOME → revenue");
-        assert!((r.net_profit.unwrap() - 224_842_000_000.0).abs() < 1.0, "HOLDER_PROFIT → net_profit");
-        assert!((r.roe.unwrap() - 21.134746439818).abs() < 1e-9, "ROE_AVG → roe");
-        assert!((r.gross_margin.unwrap() - 56.213369585749).abs() < 1e-9, "GROSS_PROFIT_RATIO → gross_margin");
+        assert!(
+            (r.revenue.unwrap() - 751_766_000_000.0).abs() < 1.0,
+            "OPERATE_INCOME → revenue"
+        );
+        assert!(
+            (r.net_profit.unwrap() - 224_842_000_000.0).abs() < 1.0,
+            "HOLDER_PROFIT → net_profit"
+        );
+        assert!(
+            (r.roe.unwrap() - 21.134746439818).abs() < 1e-9,
+            "ROE_AVG → roe"
+        );
+        assert!(
+            (r.gross_margin.unwrap() - 56.213369585749).abs() < 1e-9,
+            "GROSS_PROFIT_RATIO → gross_margin"
+        );
     }
 
     #[test]
@@ -334,38 +429,78 @@ mod tests {
     #[ignore]
     fn live_fetch_a_and_hk_fundamentals() {
         // A股：茅台
-        let a = fetch(&Secid { market: 1, code: "600519".into() }).expect("抓茅台财报");
+        let a = fetch(&Secid {
+            market: 1,
+            code: "600519".into(),
+        })
+        .expect("抓茅台财报");
         let ay = annuals(&a);
         assert!(ay.len() >= 10, "茅台年报应有10年以上，实得 {} 期", ay.len());
         let last = ay.last().unwrap();
-        assert!(last.roe.unwrap() > 20.0, "茅台年报ROE应>20%，实得 {:?}", last.roe);
-        assert!(last.gross_margin.unwrap() > 80.0, "茅台毛利率应>80%，实得 {:?}", last.gross_margin);
+        assert!(
+            last.roe.unwrap() > 20.0,
+            "茅台年报ROE应>20%，实得 {:?}",
+            last.roe
+        );
+        assert!(
+            last.gross_margin.unwrap() > 80.0,
+            "茅台毛利率应>80%，实得 {:?}",
+            last.gross_margin
+        );
 
         // 关键前提：财报历史必须显著长于腾讯K线的 ~2.5 年，否则算不了 5 年 CAGR
         let span = last.date.year() - ay.first().unwrap().date.year();
-        assert!(span >= 10, "财报历史跨度仅 {span} 年，不足以支撑长周期CAGR因子");
-        println!("茅台年报 {} 期，跨 {span} 年，最新 ROE={:?} 毛利率={:?}",
-                 ay.len(), last.roe, last.gross_margin);
+        assert!(
+            span >= 10,
+            "财报历史跨度仅 {span} 年，不足以支撑长周期CAGR因子"
+        );
+        println!(
+            "茅台年报 {} 期，跨 {span} 年，最新 ROE={:?} 毛利率={:?}",
+            ay.len(),
+            last.roe,
+            last.gross_margin
+        );
 
         // 港股：腾讯（走另一套 reportName + 列名，必须归一化到同一 struct）
-        let h = fetch(&Secid { market: 116, code: "00700".into() }).expect("抓腾讯财报");
+        let h = fetch(&Secid {
+            market: 116,
+            code: "00700".into(),
+        })
+        .expect("抓腾讯财报");
         let hy = annuals(&h);
         assert!(hy.len() >= 5, "腾讯年报应有5年以上，实得 {}", hy.len());
         let hl = hy.last().unwrap();
         assert!(hl.revenue.unwrap() > 1e11, "腾讯年营收应>1000亿");
-        println!("腾讯年报 {} 期，最新营收={:?} ROE={:?}", hy.len(), hl.revenue, hl.roe);
+        println!(
+            "腾讯年报 {} 期，最新营收={:?} ROE={:?}",
+            hy.len(),
+            hl.revenue,
+            hl.roe
+        );
 
         // 美股应明确报错而非静默返回空
-        assert!(fetch(&Secid { market: 105, code: "AAPL".into() }).is_err(), "美股应明确不支持");
+        assert!(
+            fetch(&Secid {
+                market: 105,
+                code: "AAPL".into()
+            })
+            .is_err(),
+            "美股应明确不支持"
+        );
     }
 
     #[test]
     fn csv_roundtrip_preserves_none_as_empty() {
         let reports = vec![FinReport {
             date: d(2025, 12, 31),
-            revenue: Some(1.5), revenue_yoy: None,
-            net_profit: Some(-2.5), net_profit_yoy: Some(3.0),
-            roe: Some(32.53), gross_margin: None, bps: Some(195.35), eps: Some(65.66),
+            revenue: Some(1.5),
+            revenue_yoy: None,
+            net_profit: Some(-2.5),
+            net_profit_yoy: Some(3.0),
+            roe: Some(32.53),
+            gross_margin: None,
+            bps: Some(195.35),
+            eps: Some(65.66),
         }];
         let tmp = std::env::temp_dir().join("xlh_fundamentals_test.csv");
         write_csv(&tmp, &reports).unwrap();

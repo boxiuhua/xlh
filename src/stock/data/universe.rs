@@ -47,7 +47,10 @@ pub struct Listing {
 
 impl Listing {
     pub fn secid(&self) -> Secid {
-        Secid { market: self.market, code: self.code.clone() }
+        Secid {
+            market: self.market,
+            code: self.code.clone(),
+        }
     }
 
     /// ST / *ST / 退市 / PT 壳股。财务数据失真、流动性枯竭，
@@ -70,19 +73,28 @@ impl Listing {
 // ---- A股：datacenter 估值分析表 ----
 
 #[derive(Deserialize)]
-struct DcResp { result: Option<DcResult> }
+struct DcResp {
+    result: Option<DcResult>,
+}
 #[derive(Deserialize)]
 struct DcResult {
-    #[serde(default)] data: Vec<DcRow>,
-    #[serde(default)] count: usize,
+    #[serde(default)]
+    data: Vec<DcRow>,
+    #[serde(default)]
+    count: usize,
 }
 #[derive(Deserialize)]
 struct DcRow {
-    #[serde(rename = "SECURITY_CODE")] code: String,
-    #[serde(rename = "SECURITY_NAME_ABBR")] name: String,
-    #[serde(rename = "PE_TTM")] pe_ttm: Option<f64>,
-    #[serde(rename = "PB_MRQ")] pb_mrq: Option<f64>,
-    #[serde(rename = "TOTAL_MARKET_CAP")] market_cap: Option<f64>,
+    #[serde(rename = "SECURITY_CODE")]
+    code: String,
+    #[serde(rename = "SECURITY_NAME_ABBR")]
+    name: String,
+    #[serde(rename = "PE_TTM")]
+    pe_ttm: Option<f64>,
+    #[serde(rename = "PB_MRQ")]
+    pb_mrq: Option<f64>,
+    #[serde(rename = "TOTAL_MARKET_CAP")]
+    market_cap: Option<f64>,
 }
 
 /// 按代码首位判沪深，与 `secid::resolve_offline` 同规则（估值表不给市场号）
@@ -95,17 +107,24 @@ fn market_of(code: &str) -> u16 {
 
 /// 解析一页估值表响应，返回 (条目, 全市场总数)。
 pub fn parse_snapshot_page(body: &str) -> Result<(Vec<Listing>, usize)> {
-    let resp: DcResp = serde_json::from_str(body).map_err(|e| anyhow!("解析估值表JSON失败: {e}"))?;
-    let Some(r) = resp.result else { return Ok((Vec::new(), 0)); };
+    let resp: DcResp =
+        serde_json::from_str(body).map_err(|e| anyhow!("解析估值表JSON失败: {e}"))?;
+    let Some(r) = resp.result else {
+        return Ok((Vec::new(), 0));
+    };
     let count = r.count;
-    let out = r.data.into_iter().map(|d| Listing {
-        market: market_of(&d.code),
-        name: d.name.trim().replace(['　', ' '], ""),
-        code: d.code,
-        market_cap: d.market_cap,
-        pe_ttm: d.pe_ttm,
-        pb_mrq: d.pb_mrq,
-    }).collect();
+    let out = r
+        .data
+        .into_iter()
+        .map(|d| Listing {
+            market: market_of(&d.code),
+            name: d.name.trim().replace(['　', ' '], ""),
+            code: d.code,
+            market_cap: d.market_cap,
+            pe_ttm: d.pe_ttm,
+            pb_mrq: d.pb_mrq,
+        })
+        .collect();
     Ok((out, count))
 }
 
@@ -132,8 +151,12 @@ pub(crate) fn get(c: &reqwest::blocking::Client, url: &str, referer: &str) -> Re
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(400) * 2u32.pow(attempt - 1));
         }
-        match c.get(url).header("Referer", referer).header("User-Agent", "Mozilla/5.0")
-            .send().and_then(|r| r.text())
+        match c
+            .get(url)
+            .header("Referer", referer)
+            .header("User-Agent", "Mozilla/5.0")
+            .send()
+            .and_then(|r| r.text())
         {
             Ok(b) => return Ok(b),
             Err(e) => last_err = Some(e),
@@ -147,10 +170,13 @@ pub(crate) fn get(c: &reqwest::blocking::Client, url: &str, referer: &str) -> Re
 /// 不能用「今天」—— 周末/节假日无数据，且盘中数据未必落库。直接问接口要最大 TRADE_DATE。
 pub fn latest_trade_date() -> Result<NaiveDate> {
     let c = client()?;
-    let url = format!("{DC_BASE}&columns=TRADE_DATE&pageNumber=1&pageSize=1&sortColumns=TRADE_DATE&sortTypes=-1");
+    let url = format!(
+        "{DC_BASE}&columns=TRADE_DATE&pageNumber=1&pageSize=1&sortColumns=TRADE_DATE&sortTypes=-1"
+    );
     let body = get(&c, &url, "https://data.eastmoney.com/")?;
     let resp: serde_json::Value = serde_json::from_str(&body)?;
-    let s = resp["result"]["data"][0]["TRADE_DATE"].as_str()
+    let s = resp["result"]["data"][0]["TRADE_DATE"]
+        .as_str()
         .ok_or_else(|| anyhow!("估值表未返回 TRADE_DATE"))?;
     NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d").map_err(|e| anyhow!("解析交易日 {s} 失败: {e}"))
 }
@@ -161,19 +187,25 @@ pub fn fetch_a_snapshot(date: NaiveDate) -> Result<Vec<Listing>> {
     let mut all = Vec::new();
     let mut total = usize::MAX;
     for page in 1..=MAX_PAGES {
-        if page > 1 { std::thread::sleep(PAGE_DELAY); }
+        if page > 1 {
+            std::thread::sleep(PAGE_DELAY);
+        }
         let url = format!(
             "{DC_BASE}&columns=SECURITY_CODE%2CSECURITY_NAME_ABBR%2CPE_TTM%2CPB_MRQ%2CTOTAL_MARKET_CAP\
              &filter=(TRADE_DATE%3D%27{date}%27)&pageNumber={page}&pageSize={PAGE_SIZE}\
              &sortColumns=SECURITY_CODE&sortTypes=1");
         let (rows, count) = parse_snapshot_page(&get(&c, &url, "https://data.eastmoney.com/")?)?;
         if page == 1 {
-            if count == 0 { return Err(anyhow!("{date} 无估值数据（非交易日？）")); }
+            if count == 0 {
+                return Err(anyhow!("{date} 无估值数据（非交易日？）"));
+            }
             total = count;
         }
         let got = rows.len();
         all.extend(rows);
-        if got < PAGE_SIZE || all.len() >= total { break; }
+        if got < PAGE_SIZE || all.len() >= total {
+            break;
+        }
     }
     if all.len() < total {
         // 宁可明确报错也不返回残缺全集：少一半股票的「全市场筛选」是静默错误 ——
@@ -186,14 +218,22 @@ pub fn fetch_a_snapshot(date: NaiveDate) -> Result<Vec<Listing>> {
 // ---- 港股：退回 clist（best-effort） ----
 
 #[derive(Deserialize)]
-struct ClistResp { data: Option<ClistData> }
+struct ClistResp {
+    data: Option<ClistData>,
+}
 #[derive(Deserialize)]
-struct ClistData { #[serde(default)] diff: Option<Diff> }
+struct ClistData {
+    #[serde(default)]
+    diff: Option<Diff>,
+}
 
 /// `diff` 形状随参数而变：带 `np=1` 是数组，否则是 `{"0":{...}}` 的 map。两种都接住。
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum Diff { List(Vec<HkRow>), Map(HashMap<String, HkRow>) }
+enum Diff {
+    List(Vec<HkRow>),
+    Map(HashMap<String, HkRow>),
+}
 
 impl Diff {
     fn into_rows(self) -> Vec<HkRow> {
@@ -201,7 +241,8 @@ impl Diff {
             Diff::List(v) => v,
             Diff::Map(m) => {
                 // key 是字符串化序号，须按数值序还原，否则 "10" < "2" 会打乱顺序
-                let mut keyed: Vec<(usize, HkRow)> = m.into_iter()
+                let mut keyed: Vec<(usize, HkRow)> = m
+                    .into_iter()
                     .filter_map(|(k, v)| k.parse::<usize>().ok().map(|i| (i, v)))
                     .collect();
                 keyed.sort_by_key(|(i, _)| *i);
@@ -215,21 +256,32 @@ impl Diff {
 /// 变体顺序有意义：先试 Num，落不进去的由 Other 兜住。
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum Cell { Num(f64), Other(serde::de::IgnoredAny) }
+enum Cell {
+    Num(f64),
+    Other(serde::de::IgnoredAny),
+}
 
 impl Cell {
     fn num(&self) -> Option<f64> {
-        match self { Cell::Num(v) => Some(*v), Cell::Other(_) => None }
+        match self {
+            Cell::Num(v) => Some(*v),
+            Cell::Other(_) => None,
+        }
     }
 }
 
 #[derive(Deserialize)]
 struct HkRow {
-    #[serde(rename = "f12")] code: String,
-    #[serde(rename = "f14")] name: String,
-    #[serde(rename = "f20")] market_cap: Option<Cell>,
-    #[serde(rename = "f9")] pe: Option<Cell>,
-    #[serde(rename = "f23")] pb: Option<Cell>,
+    #[serde(rename = "f12")]
+    code: String,
+    #[serde(rename = "f14")]
+    name: String,
+    #[serde(rename = "f20")]
+    market_cap: Option<Cell>,
+    #[serde(rename = "f9")]
+    pe: Option<Cell>,
+    #[serde(rename = "f23")]
+    pb: Option<Cell>,
 }
 
 /// 解析 clist 一页（港股）。
@@ -238,16 +290,24 @@ struct HkRow {
 /// 别照搬 `push2/stock/get` 单只行情接口的经验 —— 那边同类字段是放大 100 倍的定点整数
 /// （f162=1382 表示 PE 13.82），两套接口的编号与量纲都不通用。
 pub fn parse_hk_page(body: &str) -> Result<Vec<Listing>> {
-    let resp: ClistResp = serde_json::from_str(body).map_err(|e| anyhow!("解析港股清单JSON失败: {e}"))?;
-    let rows = resp.data.and_then(|d| d.diff).map(|d| d.into_rows()).unwrap_or_default();
-    Ok(rows.into_iter().map(|r| Listing {
-        market: 116,
-        name: r.name.trim().replace(['　', ' '], ""),
-        code: r.code,
-        market_cap: r.market_cap.as_ref().and_then(|c| c.num()),
-        pe_ttm: r.pe.as_ref().and_then(|c| c.num()),
-        pb_mrq: r.pb.as_ref().and_then(|c| c.num()),
-    }).collect())
+    let resp: ClistResp =
+        serde_json::from_str(body).map_err(|e| anyhow!("解析港股清单JSON失败: {e}"))?;
+    let rows = resp
+        .data
+        .and_then(|d| d.diff)
+        .map(|d| d.into_rows())
+        .unwrap_or_default();
+    Ok(rows
+        .into_iter()
+        .map(|r| Listing {
+            market: 116,
+            name: r.name.trim().replace(['　', ' '], ""),
+            code: r.code,
+            market_cap: r.market_cap.as_ref().and_then(|c| c.num()),
+            pe_ttm: r.pe.as_ref().and_then(|c| c.num()),
+            pb_mrq: r.pb.as_ref().and_then(|c| c.num()),
+        })
+        .collect())
 }
 
 const FS_HK: &str = "m:128+t:3,m:128+t:4,m:128+t:1,m:128+t:2";
@@ -257,16 +317,23 @@ pub fn fetch_hk() -> Result<Vec<Listing>> {
     let c = client()?;
     let mut all = Vec::new();
     for page in 1..=30 {
-        if page > 1 { std::thread::sleep(std::time::Duration::from_millis(400)); }
+        if page > 1 {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
         let url = format!(
             "https://push2.eastmoney.com/api/qt/clist/get?pn={page}&pz=200&po=0&np=1\
-             &fltt=2&invt=2&fid=f12&fs={FS_HK}&fields=f12,f14,f9,f20,f23");
+             &fltt=2&invt=2&fid=f12&fs={FS_HK}&fields=f12,f14,f9,f20,f23"
+        );
         let rows = parse_hk_page(&get(&c, &url, "https://quote.eastmoney.com/")?)?;
         let got = rows.len();
         all.extend(rows);
-        if got < 200 { break; }
+        if got < 200 {
+            break;
+        }
     }
-    if all.is_empty() { return Err(anyhow!("港股清单为空")); }
+    if all.is_empty() {
+        return Err(anyhow!("港股清单为空"));
+    }
     Ok(all)
 }
 
@@ -285,21 +352,36 @@ pub fn fetch_all(date: NaiveDate) -> Result<Vec<Listing>> {
 
 const HEADER: &str = "market,code,name,market_cap,pe_ttm,pb_mrq";
 
-fn fmt(v: Option<f64>) -> String { v.map(|x| x.to_string()).unwrap_or_default() }
+fn fmt(v: Option<f64>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_default()
+}
 fn num(s: &str) -> Option<f64> {
     let t = s.trim();
-    if t.is_empty() { None } else { t.parse().ok() }
+    if t.is_empty() {
+        None
+    } else {
+        t.parse().ok()
+    }
 }
 
 pub fn write_csv(path: &Path, rows: &[Listing]) -> Result<()> {
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).ok(); }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
     let mut s = String::from(HEADER);
     s.push('\n');
     for r in rows {
         // 名称里的逗号会撕裂 CSV 列 → 统一剔除
         let name = r.name.replace([',', '，'], "");
-        s.push_str(&format!("{},{},{},{},{},{}\n",
-            r.market, r.code, name, fmt(r.market_cap), fmt(r.pe_ttm), fmt(r.pb_mrq)));
+        s.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            r.market,
+            r.code,
+            name,
+            fmt(r.market_cap),
+            fmt(r.pe_ttm),
+            fmt(r.pb_mrq)
+        ));
     }
     std::fs::write(path, s).map_err(|e| anyhow!("写清单缓存失败: {e}"))?;
     Ok(())
@@ -309,14 +391,20 @@ pub fn read_csv(path: &Path) -> Result<Vec<Listing>> {
     let text = std::fs::read_to_string(path).map_err(|e| anyhow!("读清单缓存失败: {e}"))?;
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
-        if i == 0 || line.trim().is_empty() { continue; }
+        if i == 0 || line.trim().is_empty() {
+            continue;
+        }
         let c: Vec<&str> = line.split(',').collect();
-        if c.len() < 6 { continue; }
+        if c.len() < 6 {
+            continue;
+        }
         out.push(Listing {
             market: c[0].parse()?,
             code: c[1].to_string(),
             name: c[2].to_string(),
-            market_cap: num(c[3]), pe_ttm: num(c[4]), pb_mrq: num(c[5]),
+            market_cap: num(c[3]),
+            pe_ttm: num(c[4]),
+            pb_mrq: num(c[5]),
         });
     }
     Ok(out)
@@ -327,11 +415,15 @@ pub fn load_or_fetch(cache_dir: &Path, date: NaiveDate) -> Result<Vec<Listing>> 
     let path = cache_dir.join(format!("universe_{date}.csv"));
     if path.exists() {
         if let Ok(rows) = read_csv(&path) {
-            if !rows.is_empty() { return Ok(rows); }
+            if !rows.is_empty() {
+                return Ok(rows);
+            }
         }
     }
     let fresh = fetch_all(date)?;
-    if fresh.is_empty() { return Err(anyhow!("全市场清单为空")); }
+    if fresh.is_empty() {
+        return Err(anyhow!("全市场清单为空"));
+    }
     write_csv(&path, &fresh)?;
     Ok(fresh)
 }
@@ -339,7 +431,9 @@ pub fn load_or_fetch(cache_dir: &Path, date: NaiveDate) -> Result<Vec<Listing>> 
 /// code → 中文名。补上项目此前缺失的名称映射
 /// （`web/stock.rs` 传空 HashMap、`push/job.rs` 直接拿 code 当 name）。
 pub fn name_map(rows: &[Listing]) -> HashMap<String, String> {
-    rows.iter().map(|r| (r.code.clone(), r.name.clone())).collect()
+    rows.iter()
+        .map(|r| (r.code.clone(), r.name.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -401,8 +495,12 @@ mod tests {
     #[test]
     fn shell_detection_covers_st_pt_and_delisted() {
         let mk = |name: &str| Listing {
-            market: 0, code: "000001".into(), name: name.into(),
-            market_cap: Some(1e9), pe_ttm: Some(10.0), pb_mrq: Some(1.0),
+            market: 0,
+            code: "000001".into(),
+            name: name.into(),
+            market_cap: Some(1e9),
+            pe_ttm: Some(10.0),
+            pb_mrq: Some(1.0),
         };
         assert!(mk("ST星源").is_risky_shell());
         assert!(mk("*ST海核").is_risky_shell());
@@ -415,8 +513,12 @@ mod tests {
     #[test]
     fn zero_market_cap_not_screenable() {
         let l = Listing {
-            market: 0, code: "000003".into(), name: "某股".into(),
-            market_cap: Some(0.0), pe_ttm: None, pb_mrq: None,
+            market: 0,
+            code: "000003".into(),
+            name: "某股".into(),
+            market_cap: Some(0.0),
+            pe_ttm: None,
+            pb_mrq: None,
         };
         assert!(!l.is_screenable());
     }
@@ -448,8 +550,12 @@ mod tests {
     #[test]
     fn csv_roundtrip() {
         let rows = vec![Listing {
-            market: 1, code: "600519".into(), name: "贵州茅台".into(),
-            market_cap: Some(1.5e12), pe_ttm: Some(13.82), pb_mrq: None,
+            market: 1,
+            code: "600519".into(),
+            name: "贵州茅台".into(),
+            market_cap: Some(1.5e12),
+            pe_ttm: Some(13.82),
+            pb_mrq: None,
         }];
         let tmp = std::env::temp_dir().join("xlh_universe_test.csv");
         write_csv(&tmp, &rows).unwrap();
@@ -463,7 +569,10 @@ mod tests {
     #[test]
     fn name_map_fills_the_gap_project_had() {
         let (rows, _) = parse_snapshot_page(SNAP).unwrap();
-        assert_eq!(name_map(&rows).get("600519").map(|s| s.as_str()), Some("贵州茅台"));
+        assert_eq!(
+            name_map(&rows).get("600519").map(|s| s.as_str()),
+            Some("贵州茅台")
+        );
     }
 
     /// 实网测试：`cargo test -- --ignored`。接口漂移时能立刻发现 ——
@@ -475,14 +584,24 @@ mod tests {
         let rows = fetch_a_snapshot(date).expect("抓A股全集");
         assert!(rows.len() > 5000, "沪深A股应有5000+只，实得 {}", rows.len());
 
-        let mt = rows.iter().find(|r| r.code == "600519").expect("茅台应在全集中");
+        let mt = rows
+            .iter()
+            .find(|r| r.code == "600519")
+            .expect("茅台应在全集中");
         assert_eq!(mt.name, "贵州茅台");
         // 量纲哨兵：若接口改成 ×100 定点数，PE 会变成 1382，这里立刻炸
         let pe = mt.pe_ttm.expect("茅台应有PE");
         assert!((5.0..80.0).contains(&pe), "PE 量纲异常: {pe}");
 
         let ok = rows.iter().filter(|r| r.is_screenable()).count();
-        assert!(ok > 3000 && ok < rows.len(), "可筛选 {ok} / 全集 {}", rows.len());
-        println!("{date}: 全集 {} 只，可筛选 {ok} 只，茅台 PE_TTM={pe}", rows.len());
+        assert!(
+            ok > 3000 && ok < rows.len(),
+            "可筛选 {ok} / 全集 {}",
+            rows.len()
+        );
+        println!(
+            "{date}: 全集 {} 只，可筛选 {ok} 只，茅台 PE_TTM={pe}",
+            rows.len()
+        );
     }
 }

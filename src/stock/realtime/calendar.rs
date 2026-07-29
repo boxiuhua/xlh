@@ -21,10 +21,7 @@ use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
 ///
 /// 刻意不含 09:30–10:00：开盘半小时的量价波动是常态而非异动，
 /// 且此时「过去 N 天同时点」的基准样本本身就最不稳。
-const WINDOWS: [(u32, u32, u32, u32); 2] = [
-    (10, 0, 11, 30),
-    (13, 30, 15, 0),
-];
+const WINDOWS: [(u32, u32, u32, u32); 2] = [(10, 0, 11, 30), (13, 30, 15, 0)];
 
 /// 抓取间隔（分钟）。
 pub const INTERVAL_MIN: u32 = 10;
@@ -33,7 +30,9 @@ pub const INTERVAL_MIN: u32 = 10;
 ///
 /// 秒被忽略：守护是 60 秒 tick，命中的是分钟粒度。
 pub fn is_tick_time(t: NaiveTime) -> bool {
-    if !t.minute().is_multiple_of(INTERVAL_MIN) { return false }
+    if !t.minute().is_multiple_of(INTERVAL_MIN) {
+        return false;
+    }
     let cur = t.hour() * 60 + t.minute();
     WINDOWS.iter().any(|&(sh, sm, eh, em)| {
         let (start, end) = (sh * 60 + sm, eh * 60 + em);
@@ -43,10 +42,13 @@ pub fn is_tick_time(t: NaiveTime) -> bool {
 
 /// 一个交易日内的时点总数。用于容量估算与量能基准的样本对齐。
 pub fn ticks_per_day() -> usize {
-    WINDOWS.iter().map(|&(sh, sm, eh, em)| {
-        let (start, end) = (sh * 60 + sm, eh * 60 + em);
-        ((end - start) / INTERVAL_MIN + 1) as usize
-    }).sum()
+    WINDOWS
+        .iter()
+        .map(|&(sh, sm, eh, em)| {
+            let (start, end) = (sh * 60 + sm, eh * 60 + em);
+            ((end - start) / INTERVAL_MIN + 1) as usize
+        })
+        .sum()
 }
 
 /// 周末？周末不发请求 —— 这是唯一能零成本本地判定的非交易日。
@@ -94,8 +96,12 @@ pub fn stale_means_holiday(now: NaiveDateTime) -> bool {
 mod tests {
     use super::*;
 
-    fn t(h: u32, m: u32) -> NaiveTime { NaiveTime::from_hms_opt(h, m, 0).unwrap() }
-    fn d(y: i32, m: u32, day: u32) -> NaiveDate { NaiveDate::from_ymd_opt(y, m, day).unwrap() }
+    fn t(h: u32, m: u32) -> NaiveTime {
+        NaiveTime::from_hms_opt(h, m, 0).unwrap()
+    }
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
     fn dt(y: i32, mo: u32, da: u32, h: u32, mi: u32) -> NaiveDateTime {
         d(y, mo, da).and_hms_opt(h, mi, 0).unwrap()
     }
@@ -140,7 +146,10 @@ mod tests {
     #[test]
     fn should_fetch_requires_both_weekday_and_tick_time() {
         assert!(should_fetch(dt(2026, 7, 16, 10, 30)), "周四 10:30 应抓");
-        assert!(!should_fetch(dt(2026, 7, 18, 10, 30)), "周六即便时点对也不抓");
+        assert!(
+            !should_fetch(dt(2026, 7, 18, 10, 30)),
+            "周六即便时点对也不抓"
+        );
         assert!(!should_fetch(dt(2026, 7, 16, 12, 0)), "周四午休不抓");
     }
 
@@ -181,15 +190,27 @@ mod tests {
         // 收盘数据，代码据此把今天永久标记成节假日 —— 开市后整个交易日被静默跳过。
         //
         // 盘前数据陈旧是完全正常的，说明不了任何事。
-        assert!(!stale_means_holiday(dt(2026, 7, 17, 0, 3)), "半夜数据陈旧是正常的");
-        assert!(!stale_means_holiday(dt(2026, 7, 17, 8, 0)), "盘前数据陈旧是正常的");
-        assert!(!stale_means_holiday(dt(2026, 7, 17, 9, 29)), "开盘前一分钟仍不能断定");
+        assert!(
+            !stale_means_holiday(dt(2026, 7, 17, 0, 3)),
+            "半夜数据陈旧是正常的"
+        );
+        assert!(
+            !stale_means_holiday(dt(2026, 7, 17, 8, 0)),
+            "盘前数据陈旧是正常的"
+        );
+        assert!(
+            !stale_means_holiday(dt(2026, 7, 17, 9, 29)),
+            "开盘前一分钟仍不能断定"
+        );
     }
 
     #[test]
     fn stale_after_market_open_does_mean_holiday() {
         // 开盘后数据仍是昨天的 —— 这才真的说明今天没开市
-        assert!(stale_means_holiday(dt(2026, 7, 17, 9, 30)), "开盘时刻起，陈旧即节假日");
+        assert!(
+            stale_means_holiday(dt(2026, 7, 17, 9, 30)),
+            "开盘时刻起，陈旧即节假日"
+        );
         assert!(stale_means_holiday(dt(2026, 7, 17, 10, 0)));
         assert!(stale_means_holiday(dt(2026, 7, 17, 14, 0)));
     }

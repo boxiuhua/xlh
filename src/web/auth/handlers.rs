@@ -21,14 +21,21 @@ pub struct ActivateReq {
 
 fn valid_username(u: &str) -> bool {
     let n = u.chars().count();
-    (3..=32).contains(&n) && u.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    (3..=32).contains(&n)
+        && u.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 pub async fn register(State(st): State<AuthState>, Json(cred): Json<Credentials>) -> Response {
+    let limit_key = format!("register:{}", cred.username.to_ascii_lowercase());
+    if !st.auth_attempt_allowed(&limit_key) {
+        return json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited", None);
+    }
     if !st.cfg.open_registration {
         return json_error(StatusCode::FORBIDDEN, "registration_closed", None);
     }
     if !valid_username(&cred.username) || cred.password.chars().count() < 6 {
+        st.auth_attempt_failed(&limit_key);
         return json_error(StatusCode::BAD_REQUEST, "invalid_credentials", None);
     }
     let hash = match super::password::hash(&cred.password) {
@@ -40,8 +47,14 @@ pub async fn register(State(st): State<AuthState>, Json(cred): Json<Credentials>
         return json_error(StatusCode::FORBIDDEN, "registration_full", None);
     }
     match store::create_user(&conn, &cred.username, &hash, false) {
-        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
-        Err(_) => json_error(StatusCode::CONFLICT, "username_taken", None),
+        Ok(_) => {
+            st.auth_attempt_succeeded(&limit_key);
+            (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+        }
+        Err(_) => {
+            st.auth_attempt_failed(&limit_key);
+            json_error(StatusCode::CONFLICT, "username_taken", None)
+        }
     }
 }
 
@@ -52,22 +65,30 @@ fn dummy_phc() -> &'static str {
 }
 
 pub async fn login(State(st): State<AuthState>, Json(cred): Json<Credentials>) -> Response {
+    let limit_key = format!("login:{}", cred.username.to_ascii_lowercase());
+    if !st.auth_attempt_allowed(&limit_key) {
+        return json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited", None);
+    }
     // (a) 加锁取数后立即释放，绝不在慢速 argon2 校验期间持锁（否则串行化全库、可 DoS）。
     let found = {
         let conn = st.db.lock().unwrap();
-        store::find_user_by_name(&conn, &cred.username).ok().flatten()
+        store::find_user_by_name(&conn, &cred.username)
+            .ok()
+            .flatten()
     };
     // (b)/(c) 在锁外做口令校验；用户名不存在时对固定 PHC 做等量假校验，避免计时枚举。
     let uid = match found {
         Some((uid, hash, user)) => {
             let ok = super::password::verify(&cred.password, &hash);
             if user.disabled || user.cancelled || !ok {
+                st.auth_attempt_failed(&limit_key);
                 return json_error(StatusCode::UNAUTHORIZED, "invalid_login", None);
             }
             uid
         }
         None => {
             let _ = super::password::verify(&cred.password, dummy_phc());
+            st.auth_attempt_failed(&limit_key);
             return json_error(StatusCode::UNAUTHORIZED, "invalid_login", None);
         }
     };
@@ -81,7 +102,13 @@ pub async fn login(State(st): State<AuthState>, Json(cred): Json<Credentials>) -
         }
     }
     let mut headers = HeaderMap::new();
-    headers.insert(SET_COOKIE, session::set_cookie_header(&token, st.cfg.session_ttl_days).parse().unwrap());
+    st.auth_attempt_succeeded(&limit_key);
+    headers.insert(
+        SET_COOKIE,
+        session::set_cookie_header(&token, st.cfg.session_ttl_days, st.cfg.secure_cookie)
+            .parse()
+            .unwrap(),
+    );
     (StatusCode::OK, headers, Json(json!({"ok": true}))).into_response()
 }
 
@@ -91,21 +118,40 @@ pub async fn logout(State(st): State<AuthState>, headers: HeaderMap) -> Response
         let _ = store::delete_session(&conn, &token);
     }
     let mut out = HeaderMap::new();
-    out.insert(SET_COOKIE, session::clear_cookie_header().parse().unwrap());
+    out.insert(
+        SET_COOKIE,
+        session::clear_cookie_header(st.cfg.secure_cookie)
+            .parse()
+            .unwrap(),
+    );
     (StatusCode::OK, out, Json(json!({"ok": true}))).into_response()
 }
 
-pub async fn activate(State(st): State<AuthState>, Extension(user): Extension<CurrentUser>, Json(req): Json<ActivateReq>) -> Response {
+pub async fn activate(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<ActivateReq>,
+) -> Response {
     let mut conn = st.db.lock().unwrap();
     match store::activate(&mut conn, req.code.trim(), user.id) {
         Ok(new_exp) => {
             let now = chrono::Local::now().date_naive();
             let status = LicenseStatus::of(Some(new_exp), now, st.cfg.warn_days, st.cfg.grace_days);
-            (StatusCode::OK, Json(json!({"ok": true, "expires_at": new_exp, "status": status}))).into_response()
+            (
+                StatusCode::OK,
+                Json(json!({"ok": true, "expires_at": new_exp, "status": status})),
+            )
+                .into_response()
         }
-        Err(store::ActivateError::NotFound) => json_error(StatusCode::BAD_REQUEST, "code_not_found", None),
-        Err(store::ActivateError::AlreadyUsed) => json_error(StatusCode::BAD_REQUEST, "code_used", None),
-        Err(store::ActivateError::Revoked) => json_error(StatusCode::BAD_REQUEST, "code_revoked", None),
+        Err(store::ActivateError::NotFound) => {
+            json_error(StatusCode::BAD_REQUEST, "code_not_found", None)
+        }
+        Err(store::ActivateError::AlreadyUsed) => {
+            json_error(StatusCode::BAD_REQUEST, "code_used", None)
+        }
+        Err(store::ActivateError::Revoked) => {
+            json_error(StatusCode::BAD_REQUEST, "code_revoked", None)
+        }
         Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "activate_failed", None),
     }
 }
@@ -163,5 +209,6 @@ pub async fn me(State(st): State<AuthState>, Extension(user): Extension<CurrentU
         "warn_days": st.cfg.warn_days,
         "grace_days": st.cfg.grace_days,
         "remaining_days": remaining,
-    })).into_response()
+    }))
+    .into_response()
 }

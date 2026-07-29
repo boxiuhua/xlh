@@ -1,8 +1,8 @@
 //! 推送配置 `push.toml` 解析与校验。
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use crate::holdings::Holding;
 
@@ -46,9 +46,13 @@ pub struct ScreenCfg {
     pub top_n: usize,
 }
 
-fn default_screen_top_n() -> usize { 10 }
+fn default_screen_top_n() -> usize {
+    10
+}
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleCfg {
@@ -71,7 +75,9 @@ pub struct ChannelCfg {
     pub cache_dir: PathBuf,
 }
 
-fn default_cache_dir() -> PathBuf { PathBuf::from(".cache") }
+fn default_cache_dir() -> PathBuf {
+    PathBuf::from(".cache")
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PortfolioCfg {
@@ -86,8 +92,16 @@ pub struct PortfolioCfg {
 /// 一份空白默认配置（Web 首次打开、push.toml 不存在时用于起表单）。
 pub fn default_config() -> PushConfig {
     PushConfig {
-        schedule: ScheduleCfg { cron: "0 30 8 * * *".into(), only_on_new_data: true },
-        channel: ChannelCfg { kind: "feishu".into(), webhook: String::new(), secret: String::new(), cache_dir: default_cache_dir() },
+        schedule: ScheduleCfg {
+            cron: "0 30 8 * * *".into(),
+            only_on_new_data: true,
+        },
+        channel: ChannelCfg {
+            kind: "feishu".into(),
+            webhook: String::new(),
+            secret: String::new(),
+            cache_dir: default_cache_dir(),
+        },
         portfolio: PortfolioCfg::default(),
         holdings: Vec::new(),
         diagnose: Vec::new(),
@@ -107,7 +121,11 @@ pub fn load(path: &Path) -> Result<PushConfig> {
 
 pub fn validate(cfg: &PushConfig) -> Result<()> {
     if !CHANNELS.contains(&cfg.channel.kind.as_str()) {
-        return Err(anyhow!("未知推送渠道 kind={}（支持 {:?}）", cfg.channel.kind, CHANNELS));
+        return Err(anyhow!(
+            "未知推送渠道 kind={}（支持 {:?}）",
+            cfg.channel.kind,
+            CHANNELS
+        ));
     }
     if cfg.channel.webhook.trim().is_empty() {
         return Err(anyhow!("channel.webhook 不能为空"));
@@ -126,10 +144,14 @@ pub fn validate(cfg: &PushConfig) -> Result<()> {
     }
     cron::Schedule::from_str(&cfg.schedule.cron)
         .map_err(|e| anyhow!("cron 表达式非法 '{}': {e}", cfg.schedule.cron))?;
-    if cfg.holdings.is_empty() && cfg.diagnose.is_empty()
-        && cfg.stocks.is_empty() && cfg.diagnose_stocks.is_empty()
+    if cfg.holdings.is_empty()
+        && cfg.diagnose.is_empty()
+        && cfg.stocks.is_empty()
+        && cfg.diagnose_stocks.is_empty()
     {
-        return Err(anyhow!("holdings/stocks/diagnose/diagnose_stocks 至少配置一项"));
+        return Err(anyhow!(
+            "holdings/stocks/diagnose/diagnose_stocks 至少配置一项"
+        ));
     }
     Ok(())
 }
@@ -177,7 +199,10 @@ pub fn require_allowed_host(cfg: &PushConfig) -> Result<()> {
 /// 用与实际发送相同的 URL 解析器（reqwest/url crate, WHATWG）提取小写主机名，
 /// 避免解析差异导致的白名单绕过（如 `https://evil.com\@allowed.host/`）。解析失败或无主机返回 None。
 fn host_of(url: &str) -> Option<String> {
-    reqwest::Url::parse(url).ok()?.host_str().map(|h| h.to_ascii_lowercase())
+    reqwest::Url::parse(url)
+        .ok()?
+        .host_str()
+        .map(|h| h.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -226,7 +251,11 @@ profit = 1500
         assert_eq!(cfg.diagnose, vec!["110022".to_string()]);
         assert_eq!(cfg.diagnose_stocks, vec!["000001".to_string()]);
         assert_eq!(cfg.portfolio.total_amount, Some(30000.0));
-        assert_eq!(cfg.channel.cache_dir, PathBuf::from(".cache"), "cache_dir 默认 .cache");
+        assert_eq!(
+            cfg.channel.cache_dir,
+            PathBuf::from(".cache"),
+            "cache_dir 默认 .cache"
+        );
     }
 
     #[test]
@@ -244,7 +273,10 @@ profit = 1500
     #[test]
     fn rejects_unknown_channel() {
         let cfg: PushConfig = toml::from_str(&SAMPLE.replace("feishu", "qq")).unwrap();
-        assert!(validate(&cfg).unwrap_err().to_string().contains("未知推送渠道"));
+        assert!(validate(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("未知推送渠道"));
     }
 
     #[test]
@@ -256,17 +288,24 @@ profit = 1500
 
     #[test]
     fn rejects_bad_cron() {
-        let cfg: PushConfig = toml::from_str(&SAMPLE.replace("0 30 8 * * *", "not a cron")).unwrap();
+        let cfg: PushConfig =
+            toml::from_str(&SAMPLE.replace("0 30 8 * * *", "not a cron")).unwrap();
         assert!(validate(&cfg).unwrap_err().to_string().contains("cron"));
     }
 
     #[test]
     fn rejects_feishu_webhook_that_is_not_url() {
         // 群会话ID(oc_...) 不是自定义机器人 webhook URL → 应在校验期报错，而非发送时炸 builder error
-        let t = SAMPLE.replace("https://open.feishu.cn/open-apis/bot/v2/hook/xxx", "oc_f1103754b002dc17b290d470b9b1d05c");
+        let t = SAMPLE.replace(
+            "https://open.feishu.cn/open-apis/bot/v2/hook/xxx",
+            "oc_f1103754b002dc17b290d470b9b1d05c",
+        );
         let cfg: PushConfig = toml::from_str(&t).unwrap();
         let err = validate(&cfg).unwrap_err().to_string();
-        assert!(err.contains("webhook") && err.contains("URL"), "应提示 webhook 需为 URL，实际: {err}");
+        assert!(
+            err.contains("webhook") && err.contains("URL"),
+            "应提示 webhook 需为 URL，实际: {err}"
+        );
     }
 
     #[test]
@@ -279,7 +318,10 @@ profit = 1500
     #[test]
     fn accepts_feishu_bare_hook_token() {
         // 只贴 hook token(UUID) 也应通过（发送时自动补全为完整 URL）
-        let t = SAMPLE.replace("https://open.feishu.cn/open-apis/bot/v2/hook/xxx", "097074dc-0f9c-44c0-a7ab-af8942e24143");
+        let t = SAMPLE.replace(
+            "https://open.feishu.cn/open-apis/bot/v2/hook/xxx",
+            "097074dc-0f9c-44c0-a7ab-af8942e24143",
+        );
         let cfg: PushConfig = toml::from_str(&t).unwrap();
         assert!(validate(&cfg).is_ok(), "飞书裸 token 应通过校验");
     }
@@ -298,7 +340,10 @@ amount = 12000
 profit = 900
 "#;
         let cfg: PushConfig = toml::from_str(t).unwrap();
-        assert!(validate(&cfg).is_ok(), "serverchan 的 webhook 是 sendkey，不应要求 URL");
+        assert!(
+            validate(&cfg).is_ok(),
+            "serverchan 的 webhook 是 sendkey，不应要求 URL"
+        );
     }
 
     #[test]
@@ -311,7 +356,10 @@ kind = "wework"
 webhook = "https://x"
 "#;
         let cfg: PushConfig = toml::from_str(t).unwrap();
-        assert!(validate(&cfg).unwrap_err().to_string().contains("至少配置一项"));
+        assert!(validate(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("至少配置一项"));
     }
 
     #[test]
@@ -326,7 +374,13 @@ webhook = "https://x"
     fn fixed_seconds_accepts_and_rejects() {
         assert!(require_fixed_seconds("0 30 8 * * *").is_ok());
         assert!(require_fixed_seconds("30 0 12 * * *").is_ok());
-        for bad in ["* 30 8 * * *", "*/5 30 8 * * *", "0-30 0 8 * * *", "1,2 0 8 * * *", ""] {
+        for bad in [
+            "* 30 8 * * *",
+            "*/5 30 8 * * *",
+            "0-30 0 8 * * *",
+            "1,2 0 8 * * *",
+            "",
+        ] {
             assert!(require_fixed_seconds(bad).is_err(), "应拒绝 {bad}");
         }
     }
@@ -340,30 +394,58 @@ webhook = "https://x"
 
     #[test]
     fn allowed_host_accepts_official_feishu_domains() {
-        assert!(require_allowed_host(&with_channel("feishu", "https://open.feishu.cn/open-apis/bot/v2/hook/xxx")).is_ok());
-        assert!(require_allowed_host(&with_channel("feishu", "097074dc-0f9c-44c0-a7ab-af8942e24143")).is_ok(),
-            "飞书裸 token 经 canonical_webhook 补全为 open.feishu.cn 后应通过");
-        assert!(require_allowed_host(&with_channel("feishu", "https://open.larksuite.com/open-apis/bot/v2/hook/xxx")).is_ok());
+        assert!(require_allowed_host(&with_channel(
+            "feishu",
+            "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
+        ))
+        .is_ok());
+        assert!(
+            require_allowed_host(&with_channel(
+                "feishu",
+                "097074dc-0f9c-44c0-a7ab-af8942e24143"
+            ))
+            .is_ok(),
+            "飞书裸 token 经 canonical_webhook 补全为 open.feishu.cn 后应通过"
+        );
+        assert!(require_allowed_host(&with_channel(
+            "feishu",
+            "https://open.larksuite.com/open-apis/bot/v2/hook/xxx"
+        ))
+        .is_ok());
     }
 
     #[test]
     fn allowed_host_accepts_official_dingtalk_and_rejects_other_hosts() {
-        assert!(require_allowed_host(&with_channel("dingtalk", "https://oapi.dingtalk.com/robot/send?access_token=x")).is_ok());
+        assert!(require_allowed_host(&with_channel(
+            "dingtalk",
+            "https://oapi.dingtalk.com/robot/send?access_token=x"
+        ))
+        .is_ok());
         assert!(require_allowed_host(&with_channel("dingtalk", "https://evil.com/x")).is_err());
     }
 
     #[test]
     fn allowed_host_rejects_ssrf_targets_for_wework() {
-        let err = require_allowed_host(&with_channel("wework", "http://169.254.169.254/latest/meta-data")).unwrap_err().to_string();
+        let err = require_allowed_host(&with_channel(
+            "wework",
+            "http://169.254.169.254/latest/meta-data",
+        ))
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("不在允许列表"), "应拒绝云元数据地址: {err}");
-        let err2 = require_allowed_host(&with_channel("wework", "http://127.0.0.1/x")).unwrap_err().to_string();
+        let err2 = require_allowed_host(&with_channel("wework", "http://127.0.0.1/x"))
+            .unwrap_err()
+            .to_string();
         assert!(err2.contains("不在允许列表"), "应拒绝回环地址: {err2}");
     }
 
     #[test]
     fn allowed_host_exempts_serverchan() {
         let cfg = with_channel("serverchan", "SCTKEY123");
-        assert!(require_allowed_host(&cfg).is_ok(), "serverchan 非 URL 渠道应豁免主机校验");
+        assert!(
+            require_allowed_host(&cfg).is_ok(),
+            "serverchan 非 URL 渠道应豁免主机校验"
+        );
     }
 
     // 以下三个用例验证 host_of 与 reqwest 实际发送时的解析器一致，
@@ -372,16 +454,24 @@ webhook = "https://x"
     #[test]
     fn allowed_host_rejects_backslash_authority_terminator_bypass() {
         // reqwest/url crate 将反斜杠视为权威部分终止符，真实连接目标是 evil.com，而非 open.feishu.cn
-        let err = require_allowed_host(&with_channel("feishu", "https://evil.com\\@open.feishu.cn/"))
-            .unwrap_err().to_string();
-        assert!(err.contains("不在允许列表"), "应拒绝反斜杠权威终止符绕过: {err}");
+        let err = require_allowed_host(&with_channel(
+            "feishu",
+            "https://evil.com\\@open.feishu.cn/",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("不在允许列表"),
+            "应拒绝反斜杠权威终止符绕过: {err}"
+        );
     }
 
     #[test]
     fn allowed_host_rejects_userinfo_bypass() {
         // open.feishu.cn@evil.com 中 @ 之前是 userinfo，真实主机是 evil.com
         let err = require_allowed_host(&with_channel("feishu", "https://open.feishu.cn@evil.com/"))
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("不在允许列表"), "应拒绝 userinfo 绕过: {err}");
     }
 
@@ -389,12 +479,17 @@ webhook = "https://x"
     fn allowed_host_rejects_suffix_bypass() {
         // open.feishu.cn.evil.com 的真实主机是整个 open.feishu.cn.evil.com，而非 open.feishu.cn
         let err = require_allowed_host(&with_channel("feishu", "https://open.feishu.cn.evil.com/"))
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("不在允许列表"), "应拒绝域名后缀绕过: {err}");
     }
 
     #[test]
     fn allowed_host_accepts_plain_valid_feishu_webhook() {
-        assert!(require_allowed_host(&with_channel("feishu", "https://open.feishu.cn/open-apis/bot/v2/hook/x")).is_ok());
+        assert!(require_allowed_host(&with_channel(
+            "feishu",
+            "https://open.feishu.cn/open-apis/bot/v2/hook/x"
+        ))
+        .is_ok());
     }
 }

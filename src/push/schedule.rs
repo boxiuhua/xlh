@@ -1,8 +1,8 @@
 //! cron 解析 + 守护循环（普通阻塞线程，不引入 tokio）。
-use std::str::FromStr;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Local, TimeZone};
 use cron::Schedule;
+use std::str::FromStr;
 
 use rusqlite::Connection;
 
@@ -12,13 +12,20 @@ where
     Tz::Offset: Copy,
 {
     let sched = Schedule::from_str(cron).map_err(|e| anyhow!("cron 非法: {e}"))?;
-    sched.after(after).next().ok_or_else(|| anyhow!("cron 无后续触发时间"))
+    sched
+        .after(after)
+        .next()
+        .ok_or_else(|| anyhow!("cron 无后续触发时间"))
 }
 
 use crate::web::auth::model::LicenseStatus;
 
 /// 纯函数：给定各用户 (uid, cron) 与时间窗口 (last_tick, now]，返回本轮应触发的 uid。
-pub fn due_users(configs: &[(i64, String)], last_tick: DateTime<Local>, now: DateTime<Local>) -> Vec<i64> {
+pub fn due_users(
+    configs: &[(i64, String)],
+    last_tick: DateTime<Local>,
+    now: DateTime<Local>,
+) -> Vec<i64> {
     configs
         .iter()
         .filter_map(|(uid, cron)| match next_after(cron, &last_tick) {
@@ -29,7 +36,13 @@ pub fn due_users(configs: &[(i64, String)], last_tick: DateTime<Local>, now: Dat
 }
 
 /// 该用户是否允许被投递：启用、未注销、且授权放行。
-fn user_allowed(conn: &Connection, uid: i64, today: chrono::NaiveDate, warn: i64, grace: i64) -> bool {
+fn user_allowed(
+    conn: &Connection,
+    uid: i64,
+    today: chrono::NaiveDate,
+    warn: i64,
+    grace: i64,
+) -> bool {
     match crate::web::auth::store::find_user_by_id(conn, uid) {
         Ok(Some(u)) => {
             !u.disabled
@@ -51,7 +64,9 @@ fn user_allowed(conn: &Connection, uid: i64, today: chrono::NaiveDate, warn: i64
 pub fn run_multi(conn: &Connection, warn: i64, grace: i64) -> Result<()> {
     println!("多用户推送守护已启动（Ctrl+C 退出）");
     // 启动即先跳一次，别让 Web 在头 60 秒里误报「未运行」
-    if let Err(e) = super::store::beat(conn) { eprintln!("写心跳失败：{e}"); }
+    if let Err(e) = super::store::beat(conn) {
+        eprintln!("写心跳失败：{e}");
+    }
 
     // 实时抓取挂在同一个 60s 循环上（本项目不引入 tokio）。
     // 它用独立的库连接：盘中每 10 分钟写 5400 行，不该和账号/会话争同一个 WAL 锁。
@@ -61,12 +76,19 @@ pub fn run_multi(conn: &Connection, warn: i64, grace: i64) -> Result<()> {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
         let now = Local::now();
-        if let Err(e) = super::store::beat(conn) { eprintln!("写心跳失败：{e}"); }
+        if let Err(e) = super::store::beat(conn) {
+            eprintln!("写心跳失败：{e}");
+        }
 
         let all = super::store::list_all(conn).unwrap_or_default();
-        let crons: Vec<(i64, String)> = all.iter().map(|(u, c)| (*u, c.schedule.cron.clone())).collect();
+        let crons: Vec<(i64, String)> = all
+            .iter()
+            .map(|(u, c)| (*u, c.schedule.cron.clone()))
+            .collect();
         for uid in due_users(&crons, last_tick, now) {
-            if !user_allowed(conn, uid, now.date_naive(), warn, grace) { continue; }
+            if !user_allowed(conn, uid, now.date_naive(), warn, grace) {
+                continue;
+            }
             if let Some((_, cfg)) = all.iter().find(|(u, _)| *u == uid) {
                 if let Err(e) = super::job::run(cfg, Some(conn), Some(uid)) {
                     eprintln!("用户 {uid} 推送失败：{e}");
@@ -94,7 +116,11 @@ fn realtime_init() -> Option<(crate::stock::realtime::job::Daemon, Connection)> 
     let cfg = crate::stock::realtime::config::get().clone();
     match crate::stock::realtime::store::open(&cfg.db_path) {
         Ok(c) => {
-            println!("实时抓取已启用（库 {}，ticks 保留 {} 天）", cfg.db_path.display(), cfg.retain_days);
+            println!(
+                "实时抓取已启用（库 {}，ticks 保留 {} 天）",
+                cfg.db_path.display(),
+                cfg.retain_days
+            );
             Some((crate::stock::realtime::job::Daemon::new(cfg), c))
         }
         Err(e) => {
@@ -119,26 +145,57 @@ fn realtime_tick(
 
     if job::is_summary_time(naive) {
         let md = job::close_summary(rc, naive.date())?;
-        broadcast(push_conn, "盘中异动汇总", &md, now.date_naive(), warn, grace);
+        broadcast(
+            push_conn,
+            "盘中异动汇总",
+            &md,
+            now.date_naive(),
+            warn,
+            grace,
+        );
         return Ok(());
     }
 
-    let Some(out) = d.tick(rc, naive)? else { return Ok(()) };
-    println!("[{}] 快照 {} 条，异动 {} 只，推送 {} 只{}",
-        naive.format("%H:%M"), out.ticks, out.movers.len(), out.pushed.len(),
-        if out.flow_ok { "" } else { "（资金流不可用）" });
+    let Some(out) = d.tick(rc, naive)? else {
+        return Ok(());
+    };
+    println!(
+        "[{}] 快照 {} 条，异动 {} 只，推送 {} 只{}",
+        naive.format("%H:%M"),
+        out.ticks,
+        out.movers.len(),
+        out.pushed.len(),
+        if out.flow_ok {
+            ""
+        } else {
+            "（资金流不可用）"
+        }
+    );
 
-    if out.pushed.is_empty() { return Ok(()) }
+    if out.pushed.is_empty() {
+        return Ok(());
+    }
     let md = job::render_movers(&out.pushed, out.flow_ok);
     broadcast(push_conn, "盘中异动", &md, now.date_naive(), warn, grace);
     Ok(())
 }
 
 /// 向所有授权放行、且配了推送渠道的用户广播。单用户失败仅记日志。
-fn broadcast(conn: &Connection, title: &str, md: &str, today: chrono::NaiveDate, warn: i64, grace: i64) {
+fn broadcast(
+    conn: &Connection,
+    title: &str,
+    md: &str,
+    today: chrono::NaiveDate,
+    warn: i64,
+    grace: i64,
+) {
     for (uid, cfg) in super::store::list_all(conn).unwrap_or_default() {
-        if !user_allowed(conn, uid, today, warn, grace) { continue; }
-        if cfg.channel.webhook.trim().is_empty() { continue; }
+        if !user_allowed(conn, uid, today, warn, grace) {
+            continue;
+        }
+        if cfg.channel.webhook.trim().is_empty() {
+            continue;
+        }
         if let Err(e) = super::channels::send(&cfg.channel, title, md) {
             eprintln!("用户 {uid} 实时推送失败：{e}");
         }
@@ -149,7 +206,9 @@ fn broadcast(conn: &Connection, title: &str, md: &str, today: chrono::NaiveDate,
 pub fn run_all_once(conn: &Connection, warn: i64, grace: i64) -> Result<()> {
     let today = Local::now().date_naive();
     for (uid, cfg) in super::store::list_all(conn).unwrap_or_default() {
-        if !user_allowed(conn, uid, today, warn, grace) { continue; }
+        if !user_allowed(conn, uid, today, warn, grace) {
+            continue;
+        }
         if let Err(e) = super::job::run_forced(&cfg, Some(conn), Some(uid)) {
             eprintln!("用户 {uid} 推送失败：{e}");
         }
@@ -189,13 +248,16 @@ mod tests {
     #[test]
     fn due_users_window_hit_and_miss() {
         // 每天 08:30:00 触发
-        let cfgs = vec![(1i64, "0 30 8 * * *".to_string()), (2i64, "0 0 9 * * *".to_string())];
+        let cfgs = vec![
+            (1i64, "0 30 8 * * *".to_string()),
+            (2i64, "0 0 9 * * *".to_string()),
+        ];
         let last = Local.with_ymd_and_hms(2026, 1, 1, 8, 29, 0).unwrap();
-        let now  = Local.with_ymd_and_hms(2026, 1, 1, 8, 31, 0).unwrap();
+        let now = Local.with_ymd_and_hms(2026, 1, 1, 8, 31, 0).unwrap();
         assert_eq!(due_users(&cfgs, last, now), vec![1], "仅 08:30 落在窗口内");
         // 窗口内无触发
         let last2 = Local.with_ymd_and_hms(2026, 1, 1, 8, 31, 0).unwrap();
-        let now2  = Local.with_ymd_and_hms(2026, 1, 1, 8, 32, 0).unwrap();
+        let now2 = Local.with_ymd_and_hms(2026, 1, 1, 8, 32, 0).unwrap();
         assert!(due_users(&cfgs, last2, now2).is_empty());
     }
 }

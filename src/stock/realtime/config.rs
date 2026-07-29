@@ -4,9 +4,9 @@
 //! 上线后被证伪删除的教训，其魔数被作者自述为「拍脑袋」。这里的每个阈值
 //! 同样**未经前瞻检验**，配置化是为了日后能用 signals 表的真实结局去调，
 //! 而不是改代码重编译。
-use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RealtimeCfg {
@@ -41,14 +41,30 @@ pub struct RealtimeCfg {
     pub max_push_per_tick: usize,
 }
 
-fn default_db_path() -> PathBuf { PathBuf::from("data/realtime.db") }
-fn default_retain_days() -> i64 { 10 }
-fn default_baseline_days() -> i64 { 10 }
-fn default_price_jump_pct() -> f64 { 0.02 }
-fn default_volume_surge_x() -> f64 { 3.0 }
-fn default_main_flow_pct() -> f64 { 0.05 }
-fn default_strong_signal_x() -> f64 { 1.5 }
-fn default_max_push_per_tick() -> usize { 5 }
+fn default_db_path() -> PathBuf {
+    PathBuf::from("data/realtime.db")
+}
+fn default_retain_days() -> i64 {
+    10
+}
+fn default_baseline_days() -> i64 {
+    10
+}
+fn default_price_jump_pct() -> f64 {
+    0.02
+}
+fn default_volume_surge_x() -> f64 {
+    3.0
+}
+fn default_main_flow_pct() -> f64 {
+    0.05
+}
+fn default_strong_signal_x() -> f64 {
+    1.5
+}
+fn default_max_push_per_tick() -> usize {
+    5
+}
 
 impl Default for RealtimeCfg {
     fn default() -> Self {
@@ -104,7 +120,9 @@ pub fn load_from_toml(path: &std::path::Path) -> Result<RealtimeCfg> {
 /// 供测试与 load_from_toml 复用的纯解析。
 pub fn from_toml_str(text: &str) -> Result<RealtimeCfg> {
     #[derive(Deserialize)]
-    struct Root { realtime: Option<RealtimeCfg> }
+    struct Root {
+        realtime: Option<RealtimeCfg>,
+    }
     let root: Root = toml::from_str(text).map_err(|e| anyhow!("[realtime] 段解析失败: {e}"))?;
     let cfg = root.realtime.unwrap_or_default();
     validate(&cfg)?;
@@ -115,31 +133,47 @@ pub fn from_toml_str(text: &str) -> Result<RealtimeCfg> {
 /// 否则基准会偷偷只用实际存在的数据，行为与配置不符，且无人察觉。
 pub fn validate(c: &RealtimeCfg) -> Result<()> {
     if c.retain_days < 1 {
-        return Err(anyhow!("[realtime] retain_days 须 ≥ 1，当前 {}", c.retain_days));
+        return Err(anyhow!(
+            "[realtime] retain_days 须 ≥ 1，当前 {}",
+            c.retain_days
+        ));
     }
     if c.baseline_days < 1 {
-        return Err(anyhow!("[realtime] baseline_days 须 ≥ 1，当前 {}", c.baseline_days));
+        return Err(anyhow!(
+            "[realtime] baseline_days 须 ≥ 1，当前 {}",
+            c.baseline_days
+        ));
     }
     if c.baseline_days > c.retain_days {
         return Err(anyhow!(
             "[realtime] baseline_days({}) 不得大于 retain_days({}) —— 基准回看不到已被清理的数据",
-            c.baseline_days, c.retain_days));
+            c.baseline_days,
+            c.retain_days
+        ));
     }
     if c.price_jump_pct <= 0.0 {
-        return Err(anyhow!("[realtime] price_jump_pct 须 > 0，当前 {}", c.price_jump_pct));
+        return Err(anyhow!(
+            "[realtime] price_jump_pct 须 > 0，当前 {}",
+            c.price_jump_pct
+        ));
     }
     if c.volume_surge_x <= 1.0 {
         return Err(anyhow!(
             "[realtime] volume_surge_x 须 > 1，当前 {} —— ≤1 意味着「量能没放大也算放大」",
-            c.volume_surge_x));
+            c.volume_surge_x
+        ));
     }
     if c.main_flow_pct <= 0.0 {
-        return Err(anyhow!("[realtime] main_flow_pct 须 > 0，当前 {}", c.main_flow_pct));
+        return Err(anyhow!(
+            "[realtime] main_flow_pct 须 > 0，当前 {}",
+            c.main_flow_pct
+        ));
     }
     if c.strong_signal_x < 1.0 {
         return Err(anyhow!(
             "[realtime] strong_signal_x 须 ≥ 1，当前 {} —— <1 会让强信号比普通信号更宽松",
-            c.strong_signal_x));
+            c.strong_signal_x
+        ));
     }
     Ok(())
 }
@@ -156,29 +190,46 @@ mod tests {
     #[test]
     fn baseline_longer_than_retain_is_rejected_not_silently_clamped() {
         // 基准回看 30 天但只存 10 天 —— 静默降级会让实际行为与配置不符，必须报错
-        let c = RealtimeCfg { baseline_days: 30, retain_days: 10, ..Default::default() };
+        let c = RealtimeCfg {
+            baseline_days: 30,
+            retain_days: 10,
+            ..Default::default()
+        };
         let e = validate(&c).unwrap_err().to_string();
-        assert!(e.contains("baseline_days"), "错误信息应点名 baseline_days: {e}");
+        assert!(
+            e.contains("baseline_days"),
+            "错误信息应点名 baseline_days: {e}"
+        );
     }
 
     #[test]
     fn baseline_equal_to_retain_is_allowed() {
         // 默认即此情形：用满保留窗口
-        let c = RealtimeCfg { baseline_days: 10, retain_days: 10, ..Default::default() };
+        let c = RealtimeCfg {
+            baseline_days: 10,
+            retain_days: 10,
+            ..Default::default()
+        };
         validate(&c).unwrap();
     }
 
     #[test]
     fn volume_surge_at_or_below_one_is_rejected() {
         // ≤1 倍等于「没放大也算异动」，会把全市场每个时点都判成异动
-        let c = RealtimeCfg { volume_surge_x: 1.0, ..Default::default() };
+        let c = RealtimeCfg {
+            volume_surge_x: 1.0,
+            ..Default::default()
+        };
         assert!(validate(&c).is_err());
     }
 
     #[test]
     fn strong_signal_below_one_is_rejected() {
         // <1 会让「强信号」门槛低于普通信号，限流逻辑反而放大刷屏
-        let c = RealtimeCfg { strong_signal_x: 0.5, ..Default::default() };
+        let c = RealtimeCfg {
+            strong_signal_x: 0.5,
+            ..Default::default()
+        };
         assert!(validate(&c).is_err());
     }
 

@@ -29,7 +29,10 @@ pub enum Baseline {
 
 impl Baseline {
     pub fn as_str(&self) -> &'static str {
-        match self { Baseline::History => "history", Baseline::Fallback => "fallback" }
+        match self {
+            Baseline::History => "history",
+            Baseline::Fallback => "fallback",
+        }
     }
 }
 
@@ -78,11 +81,17 @@ pub struct Mover {
 
 /// 中位数。用中位数而非均值：单日异常值（比如上次异动本身的放量）不应污染基准。
 pub fn median(xs: &[f64]) -> Option<f64> {
-    if xs.is_empty() { return None }
+    if xs.is_empty() {
+        return None;
+    }
     let mut v = xs.to_vec();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = v.len();
-    Some(if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 })
+    Some(if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    })
 }
 
 /// 量能基准：历史同时点成交量的中位数；样本为空时降级为当日均值。
@@ -102,7 +111,9 @@ pub fn median(xs: &[f64]) -> Option<f64> {
 pub fn baseline_volume(history: &[f64], today_avg: Option<f64>) -> Option<(f64, Baseline)> {
     match median(history) {
         Some(m) if m > 0.0 => Some((m, Baseline::History)),
-        _ => today_avg.filter(|v| *v > 0.0).map(|v| (v, Baseline::Fallback)),
+        _ => today_avg
+            .filter(|v| *v > 0.0)
+            .map(|v| (v, Baseline::Fallback)),
     }
 }
 
@@ -114,7 +125,13 @@ pub fn is_mover(jump_pct: f64, vol_surge_x: f64, jump_th: f64, surge_th: f64) ->
 }
 
 /// 强信号？仅强信号进推送，弱信号只进库 —— 一天 20 时点 × 数十只会把飞书刷到静音。
-pub fn is_strong(jump_pct: f64, vol_surge_x: f64, jump_th: f64, surge_th: f64, strong_x: f64) -> bool {
+pub fn is_strong(
+    jump_pct: f64,
+    vol_surge_x: f64,
+    jump_th: f64,
+    surge_th: f64,
+    strong_x: f64,
+) -> bool {
     jump_pct.abs() >= jump_th * strong_x && vol_surge_x >= surge_th * strong_x
 }
 
@@ -123,9 +140,15 @@ pub fn is_strong(jump_pct: f64, vol_surge_x: f64, jump_th: f64, surge_th: f64, s
 /// `main_net_pct` 为 None（东财封禁/失败）时返回 `Unknown` 而非 `None`：
 /// 「没查到」和「查到了没背离」必须可区分。
 pub fn divergence(jump_pct: f64, main_net_pct: Option<f64>, flow_th: f64) -> Divergence {
-    let Some(pct) = main_net_pct else { return Divergence::Unknown };
-    if jump_pct > 0.0 && pct <= -flow_th { return Divergence::RetailChasing }
-    if jump_pct < 0.0 && pct >= flow_th { return Divergence::MainAccumulating }
+    let Some(pct) = main_net_pct else {
+        return Divergence::Unknown;
+    };
+    if jump_pct > 0.0 && pct <= -flow_th {
+        return Divergence::RetailChasing;
+    }
+    if jump_pct < 0.0 && pct >= flow_th {
+        return Divergence::MainAccumulating;
+    }
     Divergence::None
 }
 
@@ -139,7 +162,11 @@ pub fn divergence(jump_pct: f64, main_net_pct: Option<f64>, flow_th: f64) -> Div
 pub fn classify(pe_pct: Option<f64>, trend: &str, low_pct_th: f64) -> Horizon {
     let cheap = pe_pct.map(|p| p <= low_pct_th).unwrap_or(false);
     let not_falling = !trend.contains("下跌");
-    if cheap && not_falling { Horizon::Long } else { Horizon::Short }
+    if cheap && not_falling {
+        Horizon::Long
+    } else {
+        Horizon::Short
+    }
 }
 
 /// 排序权重：主力净流入占比高的排前面。
@@ -155,7 +182,11 @@ pub fn rank_key(m: &Mover) -> f64 {
 
 /// 按权重降序排序并截断到 limit。
 pub fn rank_top(mut movers: Vec<Mover>, limit: usize) -> Vec<Mover> {
-    movers.sort_by(|a, b| rank_key(b).partial_cmp(&rank_key(a)).unwrap_or(std::cmp::Ordering::Equal));
+    movers.sort_by(|a, b| {
+        rank_key(b)
+            .partial_cmp(&rank_key(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     movers.truncate(limit);
     movers
 }
@@ -165,12 +196,18 @@ pub fn rank_top(mut movers: Vec<Mover>, limit: usize) -> Vec<Mover> {
 /// 返回 `(jump_pct, vol_surge_x, baseline_kind, ts, price)`。
 /// None 的情形：不足两点、上一时点价格非正、基准不可得。
 pub fn compute(
-    recent: &[(NaiveDateTime, f64, f64)], history: &[f64], today_avg: Option<f64>,
+    recent: &[(NaiveDateTime, f64, f64)],
+    history: &[f64],
+    today_avg: Option<f64>,
 ) -> Option<(f64, f64, Baseline, NaiveDateTime, f64)> {
-    if recent.len() < 2 { return None }
+    if recent.len() < 2 {
+        return None;
+    }
     let (ts, price, vol) = recent[0];
     let (_, prev_price, prev_vol) = recent[1];
-    if prev_price <= 0.0 { return None }
+    if prev_price <= 0.0 {
+        return None;
+    }
     let jump = (price - prev_price) / prev_price;
     // 成交量是当日累计，做差得本时点增量
     let vol_delta = (vol - prev_vol).max(0.0);
@@ -179,7 +216,9 @@ pub fn compute(
 }
 
 /// 快照时点的 (时, 分)，用于对齐历史同时点。
-pub fn slot_of(ts: NaiveDateTime) -> (u32, u32) { (ts.hour(), ts.minute()) }
+pub fn slot_of(ts: NaiveDateTime) -> (u32, u32) {
+    (ts.hour(), ts.minute())
+}
 
 #[cfg(test)]
 mod tests {
@@ -187,14 +226,25 @@ mod tests {
     use chrono::NaiveDate;
 
     fn dt(h: u32, mi: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(2026, 7, 16).unwrap().and_hms_opt(h, mi, 0).unwrap()
+        NaiveDate::from_ymd_opt(2026, 7, 16)
+            .unwrap()
+            .and_hms_opt(h, mi, 0)
+            .unwrap()
     }
 
     fn m(jump: f64, pct: Option<f64>) -> Mover {
         Mover {
-            code: "A".into(), name: "测试".into(), ts: dt(10, 0), price: 10.0,
-            jump_pct: jump, vol_surge_x: 4.0, main_net: None, main_net_pct: pct,
-            divergence: Divergence::None, horizon: Horizon::Short, baseline: Baseline::History,
+            code: "A".into(),
+            name: "测试".into(),
+            ts: dt(10, 0),
+            price: 10.0,
+            jump_pct: jump,
+            vol_surge_x: 4.0,
+            main_net: None,
+            main_net_pct: pct,
+            divergence: Divergence::None,
+            horizon: Horizon::Short,
+            baseline: Baseline::History,
         }
     }
 
@@ -209,13 +259,19 @@ mod tests {
     #[test]
     fn price_alone_does_not_trigger() {
         // 只看价会把开盘半小时的正常波动全捞进来
-        assert!(!is_mover(0.05, 1.2, 0.02, 3.0), "价超阈值但量没放大，不是异动");
+        assert!(
+            !is_mover(0.05, 1.2, 0.02, 3.0),
+            "价超阈值但量没放大，不是异动"
+        );
     }
 
     #[test]
     fn volume_alone_does_not_trigger() {
         // 只看量会捞到大宗交易导致的放量横盘
-        assert!(!is_mover(0.001, 10.0, 0.02, 3.0), "量放大但价没动，不是异动");
+        assert!(
+            !is_mover(0.001, 10.0, 0.02, 3.0),
+            "量放大但价没动，不是异动"
+        );
     }
 
     #[test]
@@ -232,7 +288,10 @@ mod tests {
     #[test]
     fn strong_signal_requires_multiple_of_threshold() {
         // 弱信号只进库不推送，否则一天数百条刷屏
-        assert!(!is_strong(0.029, 4.0, 0.02, 3.0, 1.5), "2.9% < 2%×1.5=3%，不算强");
+        assert!(
+            !is_strong(0.029, 4.0, 0.02, 3.0, 1.5),
+            "2.9% < 2%×1.5=3%，不算强"
+        );
         assert!(is_strong(0.031, 4.6, 0.02, 3.0, 1.5), "超 1.5 倍阈值才算强");
     }
 
@@ -260,23 +319,40 @@ mod tests {
     fn baseline_returns_none_when_nothing_available() {
         // 首次部署第一个时点：无历史、无当日均值 → 不判定，而非除零
         assert!(baseline_volume(&[], None).is_none());
-        assert!(baseline_volume(&[0.0], Some(0.0)).is_none(), "零基准会导致除零得 inf");
+        assert!(
+            baseline_volume(&[0.0], Some(0.0)).is_none(),
+            "零基准会导致除零得 inf"
+        );
     }
 
     #[test]
     fn divergence_flags_retail_chasing_on_up_with_outflow() {
-        assert_eq!(divergence(0.03, Some(-0.08), 0.05), Divergence::RetailChasing);
+        assert_eq!(
+            divergence(0.03, Some(-0.08), 0.05),
+            Divergence::RetailChasing
+        );
     }
 
     #[test]
     fn divergence_flags_main_accumulating_on_down_with_inflow() {
-        assert_eq!(divergence(-0.03, Some(0.08), 0.05), Divergence::MainAccumulating);
+        assert_eq!(
+            divergence(-0.03, Some(0.08), 0.05),
+            Divergence::MainAccumulating
+        );
     }
 
     #[test]
     fn divergence_none_when_flow_same_direction_as_price() {
-        assert_eq!(divergence(0.03, Some(0.08), 0.05), Divergence::None, "涨+流入不是背离");
-        assert_eq!(divergence(-0.03, Some(-0.08), 0.05), Divergence::None, "跌+流出不是背离");
+        assert_eq!(
+            divergence(0.03, Some(0.08), 0.05),
+            Divergence::None,
+            "涨+流入不是背离"
+        );
+        assert_eq!(
+            divergence(-0.03, Some(-0.08), 0.05),
+            Divergence::None,
+            "跌+流出不是背离"
+        );
     }
 
     #[test]
@@ -295,9 +371,21 @@ mod tests {
 
     #[test]
     fn classify_long_requires_both_cheap_and_not_falling() {
-        assert_eq!(classify(Some(0.15), "震荡", 0.30), Horizon::Long, "低分位+非下跌=长线");
-        assert_eq!(classify(Some(0.15), "下跌", 0.30), Horizon::Short, "低分位但下跌→短线");
-        assert_eq!(classify(Some(0.80), "上涨", 0.30), Horizon::Short, "高分位→短线");
+        assert_eq!(
+            classify(Some(0.15), "震荡", 0.30),
+            Horizon::Long,
+            "低分位+非下跌=长线"
+        );
+        assert_eq!(
+            classify(Some(0.15), "下跌", 0.30),
+            Horizon::Short,
+            "低分位但下跌→短线"
+        );
+        assert_eq!(
+            classify(Some(0.80), "上涨", 0.30),
+            Horizon::Short,
+            "高分位→短线"
+        );
     }
 
     #[test]
@@ -309,8 +397,18 @@ mod tests {
 
     #[test]
     fn rank_sorts_by_flow_pct_descending() {
-        let out = rank_top(vec![m(0.03, Some(0.02)), m(0.03, Some(0.09)), m(0.03, Some(0.05))], 5);
-        assert!((out[0].main_net_pct.unwrap() - 0.09).abs() < 1e-9, "资金流占比高的排前");
+        let out = rank_top(
+            vec![
+                m(0.03, Some(0.02)),
+                m(0.03, Some(0.09)),
+                m(0.03, Some(0.05)),
+            ],
+            5,
+        );
+        assert!(
+            (out[0].main_net_pct.unwrap() - 0.09).abs() < 1e-9,
+            "资金流占比高的排前"
+        );
     }
 
     #[test]
@@ -323,7 +421,10 @@ mod tests {
     fn rank_falls_back_to_jump_when_flow_unavailable() {
         // 资金流查不到时不能把这批信号沉底 —— 它们的价量证据一样硬
         let out = rank_top(vec![m(0.02, None), m(0.09, None), m(0.05, None)], 3);
-        assert!((out[0].jump_pct - 0.09).abs() < 1e-9, "无资金流时按突变幅度排");
+        assert!(
+            (out[0].jump_pct - 0.09).abs() < 1e-9,
+            "无资金流时按突变幅度排"
+        );
     }
 
     #[test]
@@ -333,7 +434,10 @@ mod tests {
         let recent = vec![(dt(10, 10), 11.0, 1500.0), (dt(10, 0), 10.0, 1000.0)];
         let (jump, surge, kind, ts, price) = compute(&recent, &[100.0], None).unwrap();
         assert!((jump - 0.1).abs() < 1e-9, "10→11 是 +10%");
-        assert!((surge - 5.0).abs() < 1e-9, "增量 500 ÷ 基准 100 = 5 倍，不是 1500÷100");
+        assert!(
+            (surge - 5.0).abs() < 1e-9,
+            "增量 500 ÷ 基准 100 = 5 倍，不是 1500÷100"
+        );
         assert_eq!(kind, Baseline::History);
         assert_eq!(ts, dt(10, 10), "时间戳取最新那点");
         assert!((price - 11.0).abs() < 1e-9);
@@ -341,7 +445,10 @@ mod tests {
 
     #[test]
     fn compute_needs_two_points() {
-        assert!(compute(&[(dt(10, 0), 10.0, 100.0)], &[50.0], None).is_none(), "首个时点无从做差");
+        assert!(
+            compute(&[(dt(10, 0), 10.0, 100.0)], &[50.0], None).is_none(),
+            "首个时点无从做差"
+        );
         assert!(compute(&[], &[50.0], None).is_none());
     }
 

@@ -1,18 +1,31 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Macd { pub macd: f64, pub signal: f64, pub hist: f64 }
+pub struct Macd {
+    pub macd: f64,
+    pub signal: f64,
+    pub hist: f64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Boll { pub mid: f64, pub upper: f64, pub lower: f64, pub std: f64 }
+pub struct Boll {
+    pub mid: f64,
+    pub upper: f64,
+    pub lower: f64,
+    pub std: f64,
+}
 
 pub fn sma(prices: &[f64], n: usize) -> Option<f64> {
-    if n == 0 || prices.len() < n { return None; }
+    if n == 0 || prices.len() < n {
+        return None;
+    }
     Some(prices[prices.len() - n..].iter().sum::<f64>() / n as f64)
 }
 
 /// EMA 序列：seed=首值，alpha=2/(n+1)。空输入→空。
 pub fn ema_series(prices: &[f64], n: usize) -> Vec<f64> {
     let mut out = Vec::with_capacity(prices.len());
-    if prices.is_empty() || n == 0 { return out; }
+    if prices.is_empty() || n == 0 {
+        return out;
+    }
     let alpha = 2.0 / (n as f64 + 1.0);
     let mut prev = prices[0];
     out.push(prev);
@@ -24,37 +37,58 @@ pub fn ema_series(prices: &[f64], n: usize) -> Vec<f64> {
 }
 
 pub fn macd(prices: &[f64], fast: usize, slow: usize, signal: usize) -> Option<Macd> {
-    if prices.len() < slow.max(1) { return None; }
+    if prices.len() < slow.max(1) {
+        return None;
+    }
     let ef = ema_series(prices, fast);
     let es = ema_series(prices, slow);
     let line: Vec<f64> = ef.iter().zip(&es).map(|(a, b)| a - b).collect();
     let sig = ema_series(&line, signal);
     let m = *line.last()?;
     let s = *sig.last()?;
-    Some(Macd { macd: m, signal: s, hist: m - s })
+    Some(Macd {
+        macd: m,
+        signal: s,
+        hist: m - s,
+    })
 }
 
 pub fn bollinger(prices: &[f64], n: usize, k: f64) -> Option<Boll> {
-    if n == 0 || prices.len() < n { return None; }
+    if n == 0 || prices.len() < n {
+        return None;
+    }
     let s = &prices[prices.len() - n..];
     let mid = s.iter().sum::<f64>() / n as f64;
     let var = s.iter().map(|x| (x - mid).powi(2)).sum::<f64>() / n as f64; // 总体方差
     let std = var.sqrt();
-    Some(Boll { mid, upper: mid + k * std, lower: mid - k * std, std })
+    Some(Boll {
+        mid,
+        upper: mid + k * std,
+        lower: mid - k * std,
+        std,
+    })
 }
 
 /// 简单均值口径 RSI：最近 n 个日变动的平均涨/跌幅。全涨→100，全跌→0。
 pub fn rsi(prices: &[f64], n: usize) -> Option<f64> {
-    if n == 0 || prices.len() < n + 1 { return None; }
+    if n == 0 || prices.len() < n + 1 {
+        return None;
+    }
     let start = prices.len() - n;
     let (mut gain, mut loss) = (0.0, 0.0);
     for i in start..prices.len() {
         let ch = prices[i] - prices[i - 1];
-        if ch >= 0.0 { gain += ch; } else { loss -= ch; }
+        if ch >= 0.0 {
+            gain += ch;
+        } else {
+            loss -= ch;
+        }
     }
     let avg_gain = gain / n as f64;
     let avg_loss = loss / n as f64;
-    if avg_loss < 1e-12 { return Some(100.0); }
+    if avg_loss < 1e-12 {
+        return Some(100.0);
+    }
     let rs = avg_gain / avg_loss;
     Some(100.0 - 100.0 / (1.0 + rs))
 }
@@ -65,9 +99,9 @@ mod tests {
 
     #[test]
     fn sma_latest_window() {
-        assert_eq!(sma(&[1.0,2.0,3.0,4.0], 2), Some(3.5));
+        assert_eq!(sma(&[1.0, 2.0, 3.0, 4.0], 2), Some(3.5));
         assert_eq!(sma(&[1.0], 2), None);
-        assert_eq!(sma(&[1.0,2.0], 0), None);
+        assert_eq!(sma(&[1.0, 2.0], 0), None);
     }
 
     #[test]
@@ -97,7 +131,7 @@ mod tests {
 
     #[test]
     fn macd_none_when_insufficient() {
-        assert!(macd(&[1.0,2.0,3.0], 12, 26, 9).is_none());
+        assert!(macd(&[1.0, 2.0, 3.0], 12, 26, 9).is_none());
     }
 
     #[test]
@@ -113,7 +147,10 @@ mod tests {
         let prices: Vec<f64> = (1..=20).map(|i| i as f64).collect();
         let b = bollinger(&prices, 20, 2.0).unwrap();
         assert!((b.mid - 10.5).abs() < 1e-9, "1..20 均值=10.5");
-        assert!((b.upper - b.mid - (b.mid - b.lower)).abs() < 1e-9, "上下带对称");
+        assert!(
+            (b.upper - b.mid - (b.mid - b.lower)).abs() < 1e-9,
+            "上下带对称"
+        );
         assert!(bollinger(&prices, 21, 2.0).is_none());
     }
 
@@ -127,9 +164,11 @@ mod tests {
 
     #[test]
     fn rsi_mixed_in_range_and_insufficient_none() {
-        let mixed: Vec<f64> = (0..20).map(|i| 100.0 + if i % 2 == 0 { 1.0 } else { -0.8 } * i as f64).collect();
+        let mixed: Vec<f64> = (0..20)
+            .map(|i| 100.0 + if i % 2 == 0 { 1.0 } else { -0.8 } * i as f64)
+            .collect();
         let r = rsi(&mixed, 14).unwrap();
         assert!(r > 0.0 && r < 100.0, "混合序列 RSI 应在(0,100): {r}");
-        assert!(rsi(&[1.0,2.0], 14).is_none());
+        assert!(rsi(&[1.0, 2.0], 14).is_none());
     }
 }

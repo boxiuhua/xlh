@@ -31,13 +31,13 @@
 //! 的错误时间（CST=UTC+8），正确的读法是 `datetime(ts,'unixepoch')` 的结果
 //! 直接当本地时间看，不要再做时区转换。外部脚本写入本表时同理 ——
 //! 用 `datetime.combine(day, t).timestamp()`（本地→epoch）会与本模块差 8 小时。
-use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use rusqlite::{Connection, OptionalExtension};
+use std::path::Path;
 
-use super::snapshot::Tick;
 use super::movers::{Divergence, Horizon, Mover};
+use super::snapshot::Tick;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS ticks (
@@ -116,8 +116,15 @@ pub fn insert_ticks(conn: &mut Connection, ticks: &[Tick]) -> Result<usize> {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
         for t in ticks {
             stmt.execute(rusqlite::params![
-                t.code, t.ts.and_utc().timestamp(), t.price, t.change_pct,
-                t.volume, t.amount, t.turnover, t.vol_ratio])?;
+                t.code,
+                t.ts.and_utc().timestamp(),
+                t.price,
+                t.change_pct,
+                t.volume,
+                t.amount,
+                t.turnover,
+                t.vol_ratio
+            ])?;
             n += 1;
         }
     }
@@ -126,14 +133,25 @@ pub fn insert_ticks(conn: &mut Connection, ticks: &[Tick]) -> Result<usize> {
 }
 
 /// 取某只股票最近 n 个快照，按时间倒序（最新在前）：(ts, price, volume)。
-pub fn recent_ticks(conn: &Connection, code: &str, n: usize) -> Result<Vec<(NaiveDateTime, f64, f64)>> {
-    let mut stmt = conn.prepare(
-        "SELECT ts, price, volume FROM ticks WHERE code = ?1 ORDER BY ts DESC LIMIT ?2")?;
+pub fn recent_ticks(
+    conn: &Connection,
+    code: &str,
+    n: usize,
+) -> Result<Vec<(NaiveDateTime, f64, f64)>> {
+    let mut stmt = conn
+        .prepare("SELECT ts, price, volume FROM ticks WHERE code = ?1 ORDER BY ts DESC LIMIT ?2")?;
     let rows = stmt.query_map(rusqlite::params![code, n as i64], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?))
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, f64>(1)?,
+            r.get::<_, f64>(2)?,
+        ))
     })?;
-    Ok(rows.filter_map(|r| r.ok())
-        .filter_map(|(ts, p, v)| chrono::DateTime::from_timestamp(ts, 0).map(|d| (d.naive_utc(), p, v)))
+    Ok(rows
+        .filter_map(|r| r.ok())
+        .filter_map(|(ts, p, v)| {
+            chrono::DateTime::from_timestamp(ts, 0).map(|d| (d.naive_utc(), p, v))
+        })
         .collect())
 }
 
@@ -158,10 +176,14 @@ pub fn recent_ticks(conn: &Connection, code: &str, n: usize) -> Result<Vec<(Naiv
 type Slot = ((u32, u32), f64);
 
 pub fn same_slot_deltas(
-    conn: &Connection, code: &str, hhmm: (u32, u32), today: NaiveDate, since: NaiveDate,
+    conn: &Connection,
+    code: &str,
+    hhmm: (u32, u32),
+    today: NaiveDate,
+    since: NaiveDate,
 ) -> Result<Vec<f64>> {
-    let mut stmt = conn.prepare(
-        "SELECT ts, volume FROM ticks WHERE code = ?1 AND ts >= ?2 ORDER BY ts ASC")?;
+    let mut stmt =
+        conn.prepare("SELECT ts, volume FROM ticks WHERE code = ?1 AND ts >= ?2 ORDER BY ts ASC")?;
     let since_ts = since.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
     let rows = stmt.query_map(rusqlite::params![code, since_ts], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
@@ -170,19 +192,32 @@ pub fn same_slot_deltas(
     // 按日分组（已按 ts 升序），日内保留 (时分, 累计量)
     let mut by_day: std::collections::BTreeMap<NaiveDate, Vec<Slot>> = Default::default();
     for (ts, vol) in rows.filter_map(|r| r.ok()) {
-        let Some(dt) = chrono::DateTime::from_timestamp(ts, 0).map(|d| d.naive_utc()) else { continue };
-        if dt.date() == today { continue }
-        by_day.entry(dt.date()).or_default().push(((dt.hour(), dt.minute()), vol));
+        let Some(dt) = chrono::DateTime::from_timestamp(ts, 0).map(|d| d.naive_utc()) else {
+            continue;
+        };
+        if dt.date() == today {
+            continue;
+        }
+        by_day
+            .entry(dt.date())
+            .or_default()
+            .push(((dt.hour(), dt.minute()), vol));
     }
 
     let mut out = Vec::new();
     for (_, day) in by_day {
-        let Some(i) = day.iter().position(|(slot, _)| *slot == hhmm) else { continue };
+        let Some(i) = day.iter().position(|(slot, _)| *slot == hhmm) else {
+            continue;
+        };
         // 当日首个时点无前值，无增量可言
-        if i == 0 { continue }
+        if i == 0 {
+            continue;
+        }
         let delta = day[i].1 - day[i - 1].1;
         // 累计量回退（数据源偶发）→ 负增量，不可当基准
-        if delta > 0.0 { out.push(delta) }
+        if delta > 0.0 {
+            out.push(delta)
+        }
     }
     Ok(out)
 }
@@ -191,7 +226,9 @@ pub fn same_slot_deltas(
 ///
 /// **只动 ticks**。signals 永久保留 —— 它是验证阈值的唯一依据。
 pub fn prune(conn: &Connection, now: NaiveDateTime, retain_days: i64) -> Result<usize> {
-    let cutoff = (now - chrono::Duration::days(retain_days)).and_utc().timestamp();
+    let cutoff = (now - chrono::Duration::days(retain_days))
+        .and_utc()
+        .timestamp();
     let n = conn.execute("DELETE FROM ticks WHERE ts < ?1", [cutoff])?;
     // 不可省略：SQLite 删行后只标记页为空闲、文件不缩。
     conn.pragma_update(None, "incremental_vacuum", 0).ok();
@@ -199,13 +236,20 @@ pub fn prune(conn: &Connection, now: NaiveDateTime, retain_days: i64) -> Result<
 }
 
 pub fn mark_non_trading(conn: &Connection, day: NaiveDate) -> Result<()> {
-    conn.execute("INSERT OR IGNORE INTO non_trading_days (day) VALUES (?1)", [day.to_string()])?;
+    conn.execute(
+        "INSERT OR IGNORE INTO non_trading_days (day) VALUES (?1)",
+        [day.to_string()],
+    )?;
     Ok(())
 }
 
 pub fn is_non_trading(conn: &Connection, day: NaiveDate) -> Result<bool> {
-    let n: Option<i64> = conn.query_row(
-        "SELECT 1 FROM non_trading_days WHERE day = ?1", [day.to_string()], |r| r.get(0))
+    let n: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM non_trading_days WHERE day = ?1",
+            [day.to_string()],
+            |r| r.get(0),
+        )
         .optional()?;
     Ok(n.is_some())
 }
@@ -218,18 +262,32 @@ pub fn insert_signal(conn: &Connection, m: &Mover, pushed: bool) -> Result<()> {
           divergence, horizon_tag, baseline, pushed)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         rusqlite::params![
-            m.code, m.name, m.ts.and_utc().timestamp(), m.price, m.jump_pct, m.vol_surge_x,
-            m.main_net, m.main_net_pct, m.divergence.as_str(), m.horizon.as_str(),
-            m.baseline.as_str(), pushed as i64])?;
+            m.code,
+            m.name,
+            m.ts.and_utc().timestamp(),
+            m.price,
+            m.jump_pct,
+            m.vol_surge_x,
+            m.main_net,
+            m.main_net_pct,
+            m.divergence.as_str(),
+            m.horizon.as_str(),
+            m.baseline.as_str(),
+            pushed as i64
+        ],
+    )?;
     Ok(())
 }
 
 /// 今天已推送过的股票代码集合。用于「同一只股票当日只推一次」的限流。
-pub fn pushed_today(conn: &Connection, today: NaiveDate) -> Result<std::collections::HashSet<String>> {
+pub fn pushed_today(
+    conn: &Connection,
+    today: NaiveDate,
+) -> Result<std::collections::HashSet<String>> {
     let start = today.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
     let end = start + 86400;
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT code FROM signals WHERE pushed = 1 AND ts >= ?1 AND ts < ?2")?;
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT code FROM signals WHERE pushed = 1 AND ts >= ?1 AND ts < ?2")?;
     let rows = stmt.query_map([start, end], |r| r.get::<_, String>(0))?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
@@ -256,14 +314,16 @@ pub fn signals_on(conn: &Connection, day: NaiveDate) -> Result<Vec<SignalRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, code, name, ts, trigger_price, jump_pct, vol_surge_x, main_net_pct,
                 divergence, horizon_tag, close_ret
-         FROM signals WHERE ts >= ?1 AND ts < ?2 ORDER BY ts ASC")?;
+         FROM signals WHERE ts >= ?1 AND ts < ?2 ORDER BY ts ASC",
+    )?;
     let rows = stmt.query_map([start, end], |r| {
         Ok(SignalRow {
             id: r.get(0)?,
             code: r.get(1)?,
             name: r.get(2)?,
             ts: chrono::DateTime::from_timestamp(r.get::<_, i64>(3)?, 0)
-                .map(|d| d.naive_utc()).unwrap_or_default(),
+                .map(|d| d.naive_utc())
+                .unwrap_or_default(),
             trigger_price: r.get(4)?,
             jump_pct: r.get(5)?,
             vol_surge_x: r.get(6)?,
@@ -277,13 +337,22 @@ pub fn signals_on(conn: &Connection, day: NaiveDate) -> Result<Vec<SignalRow>> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Outcome { Close, T1, T5 }
+pub enum Outcome {
+    Close,
+    T1,
+    T5,
+}
 
 /// 回填结局。
 ///
 /// `ret` 为 None 时写 NULL 而非 0 —— 「没数据」和「零收益」是两回事，
 /// 混同会让日后的统计检验把缺失样本当成平局，系统性歪曲信号效果。
-pub fn backfill_outcome(conn: &Connection, id: i64, field: Outcome, ret: Option<f64>) -> Result<()> {
+pub fn backfill_outcome(
+    conn: &Connection,
+    id: i64,
+    field: Outcome,
+    ret: Option<f64>,
+) -> Result<()> {
     let sql = match field {
         Outcome::Close => "UPDATE signals SET close_ret = ?1 WHERE id = ?2",
         Outcome::T1 => "UPDATE signals SET ret_t1 = ?1 WHERE id = ?2",
@@ -295,7 +364,10 @@ pub fn backfill_outcome(conn: &Connection, id: i64, field: Outcome, ret: Option<
 
 /// 结局待回填的信号（close_ret 仍为空）。
 pub fn signals_missing_close(conn: &Connection, day: NaiveDate) -> Result<Vec<SignalRow>> {
-    Ok(signals_on(conn, day)?.into_iter().filter(|s| s.close_ret.is_none()).collect())
+    Ok(signals_on(conn, day)?
+        .into_iter()
+        .filter(|s| s.close_ret.is_none())
+        .collect())
 }
 
 impl Divergence {
@@ -320,26 +392,49 @@ impl Horizon {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::movers::Baseline;
+    use super::*;
 
     fn dt(y: i32, mo: u32, da: u32, h: u32, mi: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(y, mo, da).unwrap().and_hms_opt(h, mi, 0).unwrap()
+        NaiveDate::from_ymd_opt(y, mo, da)
+            .unwrap()
+            .and_hms_opt(h, mi, 0)
+            .unwrap()
     }
-    fn d(y: i32, m: u32, day: u32) -> NaiveDate { NaiveDate::from_ymd_opt(y, m, day).unwrap() }
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
 
-    fn db() -> Connection { open_in_memory().unwrap() }
+    fn db() -> Connection {
+        open_in_memory().unwrap()
+    }
 
     fn tick(code: &str, ts: NaiveDateTime, price: f64, volume: f64) -> Tick {
-        Tick { code: code.into(), ts, price, change_pct: 0.0, volume,
-               amount: volume * price, turnover: 0.5, vol_ratio: 1.0 }
+        Tick {
+            code: code.into(),
+            ts,
+            price,
+            change_pct: 0.0,
+            volume,
+            amount: volume * price,
+            turnover: 0.5,
+            vol_ratio: 1.0,
+        }
     }
 
     fn mover(code: &str, ts: NaiveDateTime) -> Mover {
         Mover {
-            code: code.into(), name: "测试股".into(), ts, price: 10.0,
-            jump_pct: 0.03, vol_surge_x: 4.0, main_net: None, main_net_pct: None,
-            divergence: Divergence::Unknown, horizon: Horizon::Short, baseline: Baseline::History,
+            code: code.into(),
+            name: "测试股".into(),
+            ts,
+            price: 10.0,
+            jump_pct: 0.03,
+            vol_surge_x: 4.0,
+            main_net: None,
+            main_net_pct: None,
+            divergence: Divergence::Unknown,
+            horizon: Horizon::Short,
+            baseline: Baseline::History,
         }
     }
 
@@ -376,7 +471,9 @@ mod tests {
         let t = tick("600519", dt(2026, 7, 16, 10, 0), 1258.99, 47611.0);
         insert_ticks(&mut c, std::slice::from_ref(&t)).unwrap();
         insert_ticks(&mut c, &[t]).unwrap();
-        let n: i64 = c.query_row("SELECT COUNT(*) FROM ticks", [], |r| r.get(0)).unwrap();
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM ticks", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1, "同一 (code, ts) 只应有一行");
     }
 
@@ -384,13 +481,27 @@ mod tests {
     fn prune_keeps_boundary_day_and_deletes_beyond() {
         let mut c = db();
         let now = dt(2026, 7, 16, 15, 0);
-        insert_ticks(&mut c, &[
-            tick("A", now - chrono::Duration::days(10) + chrono::Duration::minutes(1), 1.0, 1.0),
-            tick("B", now - chrono::Duration::days(11), 1.0, 1.0),
-        ]).unwrap();
+        insert_ticks(
+            &mut c,
+            &[
+                tick(
+                    "A",
+                    now - chrono::Duration::days(10) + chrono::Duration::minutes(1),
+                    1.0,
+                    1.0,
+                ),
+                tick("B", now - chrono::Duration::days(11), 1.0, 1.0),
+            ],
+        )
+        .unwrap();
         prune(&c, now, 10).unwrap();
-        let codes: Vec<String> = c.prepare("SELECT code FROM ticks").unwrap()
-            .query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+        let codes: Vec<String> = c
+            .prepare("SELECT code FROM ticks")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
         assert_eq!(codes, vec!["A"], "第 10 天内保留，第 11 天删除");
     }
 
@@ -405,8 +516,12 @@ mod tests {
 
         prune(&c, dt(2026, 7, 16, 15, 0), 10).unwrap();
 
-        let ticks: i64 = c.query_row("SELECT COUNT(*) FROM ticks", [], |r| r.get(0)).unwrap();
-        let sigs: i64 = c.query_row("SELECT COUNT(*) FROM signals", [], |r| r.get(0)).unwrap();
+        let ticks: i64 = c
+            .query_row("SELECT COUNT(*) FROM ticks", [], |r| r.get(0))
+            .unwrap();
+        let sigs: i64 = c
+            .query_row("SELECT COUNT(*) FROM signals", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(ticks, 0, "6 年前的 tick 应被清理");
         assert_eq!(sigs, 1, "signals 永久保留，清理 ticks 不得波及");
     }
@@ -419,10 +534,14 @@ mod tests {
         //
         // 这个 bug 单测抓不到（单测直接把 history 当增量喂），只有端到端组装才暴露。
         let mut c = db();
-        insert_ticks(&mut c, &[
-            tick("A", dt(2026, 7, 15, 10, 0), 1.0, 1000.0),   // 累计 1000
-            tick("A", dt(2026, 7, 15, 10, 10), 1.0, 2000.0),  // 累计 2000 → 增量 1000
-        ]).unwrap();
+        insert_ticks(
+            &mut c,
+            &[
+                tick("A", dt(2026, 7, 15, 10, 0), 1.0, 1000.0), // 累计 1000
+                tick("A", dt(2026, 7, 15, 10, 10), 1.0, 2000.0), // 累计 2000 → 增量 1000
+            ],
+        )
+        .unwrap();
         let v = same_slot_deltas(&c, "A", (10, 10), d(2026, 7, 16), d(2026, 7, 1)).unwrap();
         assert_eq!(v, vec![1000.0], "须返回增量 1000，而非累计量 2000");
     }
@@ -432,10 +551,14 @@ mod tests {
         // 当日首个时点没有前值，无增量可言。若误把累计量当增量，
         // 10:00 的「增量」会等于开盘至今的全部成交量 —— 一个巨大的假基准
         let mut c = db();
-        insert_ticks(&mut c, &[
-            tick("A", dt(2026, 7, 15, 10, 0), 1.0, 5000.0),
-            tick("A", dt(2026, 7, 15, 10, 10), 1.0, 6000.0),
-        ]).unwrap();
+        insert_ticks(
+            &mut c,
+            &[
+                tick("A", dt(2026, 7, 15, 10, 0), 1.0, 5000.0),
+                tick("A", dt(2026, 7, 15, 10, 10), 1.0, 6000.0),
+            ],
+        )
+        .unwrap();
         let v = same_slot_deltas(&c, "A", (10, 0), d(2026, 7, 16), d(2026, 7, 1)).unwrap();
         assert!(v.is_empty(), "当日首个时点无前值，须跳过而非把累计量当增量");
     }
@@ -446,10 +569,14 @@ mod tests {
         // 跨日那一笔会得到巨大的负数（今日开盘累计 − 昨日收盘累计）
         let mut c = db();
         for day in [14u32, 15] {
-            insert_ticks(&mut c, &[
-                tick("A", dt(2026, 7, day, 10, 0), 1.0, 1000.0),
-                tick("A", dt(2026, 7, day, 10, 10), 1.0, 1500.0),
-            ]).unwrap();
+            insert_ticks(
+                &mut c,
+                &[
+                    tick("A", dt(2026, 7, day, 10, 0), 1.0, 1000.0),
+                    tick("A", dt(2026, 7, day, 10, 10), 1.0, 1500.0),
+                ],
+            )
+            .unwrap();
         }
         let v = same_slot_deltas(&c, "A", (10, 10), d(2026, 7, 16), d(2026, 7, 1)).unwrap();
         assert_eq!(v, vec![500.0, 500.0], "每日独立做差，不得跨日");
@@ -458,25 +585,37 @@ mod tests {
     #[test]
     fn same_slot_excludes_today() {
         let mut c = db();
-        insert_ticks(&mut c, &[
-            tick("A", dt(2026, 7, 15, 10, 0), 1.0, 100.0),
-            tick("A", dt(2026, 7, 15, 10, 10), 1.0, 300.0),   // 历史增量 200 ✓
-            tick("A", dt(2026, 7, 16, 10, 0), 1.0, 100.0),
-            tick("A", dt(2026, 7, 16, 10, 10), 1.0, 9999.0),  // 今天 ✗
-        ]).unwrap();
+        insert_ticks(
+            &mut c,
+            &[
+                tick("A", dt(2026, 7, 15, 10, 0), 1.0, 100.0),
+                tick("A", dt(2026, 7, 15, 10, 10), 1.0, 300.0), // 历史增量 200 ✓
+                tick("A", dt(2026, 7, 16, 10, 0), 1.0, 100.0),
+                tick("A", dt(2026, 7, 16, 10, 10), 1.0, 9999.0), // 今天 ✗
+            ],
+        )
+        .unwrap();
         let v = same_slot_deltas(&c, "A", (10, 10), d(2026, 7, 16), d(2026, 7, 1)).unwrap();
-        assert_eq!(v, vec![200.0], "今天的量不得进基准 —— 否则异动股自己抹平自己");
+        assert_eq!(
+            v,
+            vec![200.0],
+            "今天的量不得进基准 —— 否则异动股自己抹平自己"
+        );
     }
 
     #[test]
     fn same_slot_respects_since_window() {
         let mut c = db();
-        insert_ticks(&mut c, &[
-            tick("A", dt(2026, 7, 1, 10, 0), 1.0, 100.0),     // baseline 窗口外
-            tick("A", dt(2026, 7, 1, 10, 10), 1.0, 211.0),
-            tick("A", dt(2026, 7, 15, 10, 0), 1.0, 100.0),    // 窗口内
-            tick("A", dt(2026, 7, 15, 10, 10), 1.0, 322.0),
-        ]).unwrap();
+        insert_ticks(
+            &mut c,
+            &[
+                tick("A", dt(2026, 7, 1, 10, 0), 1.0, 100.0), // baseline 窗口外
+                tick("A", dt(2026, 7, 1, 10, 10), 1.0, 211.0),
+                tick("A", dt(2026, 7, 15, 10, 0), 1.0, 100.0), // 窗口内
+                tick("A", dt(2026, 7, 15, 10, 10), 1.0, 322.0),
+            ],
+        )
+        .unwrap();
         let v = same_slot_deltas(&c, "A", (10, 10), d(2026, 7, 16), d(2026, 7, 10)).unwrap();
         assert_eq!(v, vec![222.0], "baseline_days 窗口外的样本不得参与基准");
     }
@@ -485,10 +624,14 @@ mod tests {
     fn same_slot_drops_negative_delta_from_source_glitch() {
         // 腾讯偶发累计量回退。负增量不可当基准
         let mut c = db();
-        insert_ticks(&mut c, &[
-            tick("A", dt(2026, 7, 15, 10, 0), 1.0, 2000.0),
-            tick("A", dt(2026, 7, 15, 10, 10), 1.0, 1500.0),  // 回退
-        ]).unwrap();
+        insert_ticks(
+            &mut c,
+            &[
+                tick("A", dt(2026, 7, 15, 10, 0), 1.0, 2000.0),
+                tick("A", dt(2026, 7, 15, 10, 10), 1.0, 1500.0), // 回退
+            ],
+        )
+        .unwrap();
         let v = same_slot_deltas(&c, "A", (10, 10), d(2026, 7, 16), d(2026, 7, 1)).unwrap();
         assert!(v.is_empty(), "负增量须丢弃");
     }
@@ -511,7 +654,10 @@ mod tests {
 
         let set = pushed_today(&c, d(2026, 7, 16)).unwrap();
         assert!(set.contains("PUSHED"));
-        assert!(!set.contains("SILENT"), "只进库未推送的不算，否则它会被永久静音");
+        assert!(
+            !set.contains("SILENT"),
+            "只进库未推送的不算，否则它会被永久静音"
+        );
         assert!(!set.contains("YDAY"), "昨天推过的今天应能再推");
     }
 
@@ -521,7 +667,9 @@ mod tests {
         let m = mover("A", dt(2026, 7, 16, 10, 0));
         insert_signal(&c, &m, false).unwrap();
         insert_signal(&c, &m, false).unwrap();
-        let n: i64 = c.query_row("SELECT COUNT(*) FROM signals", [], |r| r.get(0)).unwrap();
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM signals", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1, "重跑同一时点不应产生重复信号");
     }
 
@@ -530,14 +678,24 @@ mod tests {
         // 「没数据」≠「零收益」。混同会让统计检验把缺失样本当平局，歪曲信号效果
         let c = db();
         insert_signal(&c, &mover("A", dt(2026, 7, 16, 10, 0)), false).unwrap();
-        let id: i64 = c.query_row("SELECT id FROM signals", [], |r| r.get(0)).unwrap();
+        let id: i64 = c
+            .query_row("SELECT id FROM signals", [], |r| r.get(0))
+            .unwrap();
 
         backfill_outcome(&c, id, Outcome::Close, None).unwrap();
-        let v: Option<f64> = c.query_row("SELECT close_ret FROM signals WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        let v: Option<f64> = c
+            .query_row("SELECT close_ret FROM signals WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(v, None, "无日线数据时须写 NULL 而非 0");
 
         backfill_outcome(&c, id, Outcome::Close, Some(0.05)).unwrap();
-        let v: Option<f64> = c.query_row("SELECT close_ret FROM signals WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        let v: Option<f64> = c
+            .query_row("SELECT close_ret FROM signals WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(v, Some(0.05));
     }
 
@@ -546,7 +704,9 @@ mod tests {
         let c = db();
         insert_signal(&c, &mover("A", dt(2026, 7, 16, 10, 0)), false).unwrap();
         insert_signal(&c, &mover("B", dt(2026, 7, 16, 10, 10)), false).unwrap();
-        let id: i64 = c.query_row("SELECT id FROM signals WHERE code='A'", [], |r| r.get(0)).unwrap();
+        let id: i64 = c
+            .query_row("SELECT id FROM signals WHERE code='A'", [], |r| r.get(0))
+            .unwrap();
         backfill_outcome(&c, id, Outcome::Close, Some(0.01)).unwrap();
 
         let missing = signals_missing_close(&c, d(2026, 7, 16)).unwrap();
@@ -557,12 +717,19 @@ mod tests {
     #[test]
     fn recent_ticks_returns_newest_first() {
         let mut c = db();
-        insert_ticks(&mut c, &[
-            tick("A", dt(2026, 7, 16, 10, 0), 1.0, 10.0),
-            tick("A", dt(2026, 7, 16, 10, 10), 2.0, 20.0),
-        ]).unwrap();
+        insert_ticks(
+            &mut c,
+            &[
+                tick("A", dt(2026, 7, 16, 10, 0), 1.0, 10.0),
+                tick("A", dt(2026, 7, 16, 10, 10), 2.0, 20.0),
+            ],
+        )
+        .unwrap();
         let r = recent_ticks(&c, "A", 2).unwrap();
         assert_eq!(r.len(), 2);
-        assert!((r[0].1 - 2.0).abs() < 1e-9, "最新的在前 —— 异动检测靠它取当前时点");
+        assert!(
+            (r[0].1 - 2.0).abs() < 1e-9,
+            "最新的在前 —— 异动检测靠它取当前时点"
+        );
     }
 }

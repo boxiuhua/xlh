@@ -11,7 +11,7 @@
 //! 魔数。在做完同样的前瞻检验之前，不应把这些金额当作有依据的建议。
 use serde::Serialize;
 
-use crate::holdings::{Holding, round_yuan};
+use crate::holdings::{round_yuan, Holding};
 use crate::stock::diagnose::StockDiagnosis;
 
 /// 加仓/减仓比例：随信号强度 |z| 放大，clamp 到 [10%, 30%]。
@@ -56,7 +56,11 @@ fn decide(trend: &str, signal: &str, z: f64, amount: f64, profit: f64) -> (Strin
     if signal.contains("卖出") {
         let s = round_yuan(amt * size_pct(z.abs()));
         return if profit > 0.0 {
-            ("止盈".into(), s, "技术面卖出信号且持有盈利，部分止盈".into())
+            (
+                "止盈".into(),
+                s,
+                "技术面卖出信号且持有盈利，部分止盈".into(),
+            )
         } else {
             ("减仓".into(), s, "技术面卖出信号，适度减仓控制风险".into())
         };
@@ -94,14 +98,21 @@ mod tests {
 
     fn diag(trend: &str, signal: &str, z: f64) -> StockDiagnosis {
         StockDiagnosis {
-            code: "600519".into(), name: "贵州茅台".into(),
-            trend: trend.into(), signal: signal.into(), boll_z: z,
+            code: "600519".into(),
+            name: "贵州茅台".into(),
+            trend: trend.into(),
+            signal: signal.into(),
+            boll_z: z,
             rationale: "依据".into(),
             ..Default::default()
         }
     }
     fn hold(amount: f64, profit: f64) -> Holding {
-        Holding { code: "600519".into(), amount, profit }
+        Holding {
+            code: "600519".into(),
+            amount,
+            profit,
+        }
     }
 
     #[test]

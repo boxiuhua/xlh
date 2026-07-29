@@ -1,7 +1,7 @@
-use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use rusqlite::{Connection, OptionalExtension};
+use std::path::Path;
 
 use super::model::{renew_expiry, CodeRow, User};
 
@@ -78,7 +78,12 @@ fn parse_date(s: Option<String>) -> Option<NaiveDate> {
     s.and_then(|s| s.parse().ok())
 }
 
-pub fn create_user(conn: &Connection, username: &str, pw_hash: &str, is_admin: bool) -> Result<i64> {
+pub fn create_user(
+    conn: &Connection,
+    username: &str,
+    pw_hash: &str,
+    is_admin: bool,
+) -> Result<i64> {
     let now = chrono::Local::now().date_naive().to_string();
     conn.execute(
         "INSERT INTO users (username, pw_hash, is_admin, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -155,9 +160,11 @@ pub fn set_admin(conn: &Connection, user_id: i64, is_admin: bool) -> Result<()> 
 
 /// 按 id 取 pw_hash，供自助改密校验旧密码。
 pub fn pw_hash_by_id(conn: &Connection, user_id: i64) -> Result<Option<String>> {
-    conn.query_row("SELECT pw_hash FROM users WHERE id = ?1", [user_id], |r| r.get(0))
-        .optional()
-        .context("查询口令失败")
+    conn.query_row("SELECT pw_hash FROM users WHERE id = ?1", [user_id], |r| {
+        r.get(0)
+    })
+    .optional()
+    .context("查询口令失败")
 }
 
 /// 覆盖用户口令哈希。
@@ -170,7 +177,11 @@ pub fn update_password(conn: &Connection, user_id: i64, new_hash: &str) -> Resul
 }
 
 /// 删除该用户的会话；keep=Some(token) 保留当前会话，None 全删。返回删除行数。
-pub fn delete_sessions_except(conn: &Connection, user_id: i64, keep: Option<&str>) -> Result<usize> {
+pub fn delete_sessions_except(
+    conn: &Connection,
+    user_id: i64,
+    keep: Option<&str>,
+) -> Result<usize> {
     let n = match keep {
         Some(tok) => conn.execute(
             "DELETE FROM sessions WHERE user_id = ?1 AND token <> ?2",
@@ -189,7 +200,10 @@ pub fn set_cancelled(conn: &Connection, user_id: i64, cancelled: bool) -> Result
             rusqlite::params![now, user_id],
         )?;
     } else {
-        conn.execute("UPDATE users SET cancelled_at = NULL WHERE id = ?1", [user_id])?;
+        conn.execute(
+            "UPDATE users SET cancelled_at = NULL WHERE id = ?1",
+            [user_id],
+        )?;
     }
     Ok(())
 }
@@ -252,7 +266,11 @@ pub fn list_users(conn: &Connection) -> Result<Vec<User>> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum CodeFilter { Unused, Used, All }
+pub enum CodeFilter {
+    Unused,
+    Used,
+    All,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ActivateError {
@@ -309,7 +327,11 @@ pub fn revoke_code(conn: &Connection, code: &str) -> Result<bool> {
 }
 
 /// 事务内：一次性占用授权码 + 续期用户到期日。返回新到期日。
-pub fn activate(conn: &mut Connection, code: &str, user_id: i64) -> std::result::Result<NaiveDate, ActivateError> {
+pub fn activate(
+    conn: &mut Connection,
+    code: &str,
+    user_id: i64,
+) -> std::result::Result<NaiveDate, ActivateError> {
     let now = chrono::Local::now().date_naive();
     let tx = conn.transaction()?;
 
@@ -322,19 +344,27 @@ pub fn activate(conn: &mut Connection, code: &str, user_id: i64) -> std::result:
         )
         .optional()?;
     let (days, used_by, revoked) = row.ok_or(ActivateError::NotFound)?;
-    if revoked != 0 { return Err(ActivateError::Revoked); }
-    if used_by.is_some() { return Err(ActivateError::AlreadyUsed); }
+    if revoked != 0 {
+        return Err(ActivateError::Revoked);
+    }
+    if used_by.is_some() {
+        return Err(ActivateError::AlreadyUsed);
+    }
 
     // 条件占用：并发下只有一方 changes()==1
     let claimed = tx.execute(
         "UPDATE codes SET used_by = ?1, used_at = ?2 WHERE code = ?3 AND used_by IS NULL AND revoked = 0",
         rusqlite::params![user_id, now.to_string(), code],
     )?;
-    if claimed != 1 { return Err(ActivateError::AlreadyUsed); }
+    if claimed != 1 {
+        return Err(ActivateError::AlreadyUsed);
+    }
 
     // 读当前到期日并续期
     let cur: Option<String> = tx.query_row(
-        "SELECT expires_at FROM users WHERE id = ?1", [user_id], |r| r.get(0),
+        "SELECT expires_at FROM users WHERE id = ?1",
+        [user_id],
+        |r| r.get(0),
     )?;
     let new_exp = renew_expiry(cur.and_then(|s| s.parse().ok()), now, days);
     tx.execute(
@@ -346,7 +376,12 @@ pub fn activate(conn: &mut Connection, code: &str, user_id: i64) -> std::result:
     Ok(new_exp)
 }
 
-pub fn create_session(conn: &Connection, token: &str, user_id: i64, expires_at: NaiveDate) -> Result<()> {
+pub fn create_session(
+    conn: &Connection,
+    token: &str,
+    user_id: i64,
+    expires_at: NaiveDate,
+) -> Result<()> {
     let now = chrono::Local::now().date_naive().to_string();
     conn.execute(
         "INSERT INTO sessions (token, user_id, expires_at, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -363,7 +398,9 @@ pub fn lookup_session_user(conn: &Connection, token: &str, now: NaiveDate) -> Re
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some((user_id, exp)) = uid else { return Ok(None) };
+    let Some((user_id, exp)) = uid else {
+        return Ok(None);
+    };
     // 无法解析的到期时间视为已过期（fail-closed），绝不放行损坏会话。
     let session_exp: NaiveDate = match exp.parse() {
         Ok(d) => d,
@@ -437,7 +474,10 @@ mod tests {
         issue_code(&conn, "CODE1", 30).unwrap();
 
         let exp = activate(&mut conn, "CODE1", uid).unwrap();
-        assert_eq!(exp, renew_expiry(None, chrono::Local::now().date_naive(), 30));
+        assert_eq!(
+            exp,
+            renew_expiry(None, chrono::Local::now().date_naive(), 30)
+        );
 
         // 二次使用同码失败
         let err = activate(&mut conn, "CODE1", uid).unwrap_err();
@@ -448,11 +488,17 @@ mod tests {
     fn activate_unknown_and_revoked() {
         let mut conn = open_in_memory().unwrap();
         let uid = create_user(&conn, "u", "h", false).unwrap();
-        assert!(matches!(activate(&mut conn, "NOPE", uid).unwrap_err(), ActivateError::NotFound));
+        assert!(matches!(
+            activate(&mut conn, "NOPE", uid).unwrap_err(),
+            ActivateError::NotFound
+        ));
 
         issue_code(&conn, "R", 10).unwrap();
         assert!(revoke_code(&conn, "R").unwrap());
-        assert!(matches!(activate(&mut conn, "R", uid).unwrap_err(), ActivateError::Revoked));
+        assert!(matches!(
+            activate(&mut conn, "R", uid).unwrap_err(),
+            ActivateError::Revoked
+        ));
     }
 
     #[test]
@@ -472,10 +518,17 @@ mod tests {
         let now = chrono::Local::now().date_naive();
 
         create_session(&conn, "tok", uid, now + chrono::Duration::days(30)).unwrap();
-        assert_eq!(lookup_session_user(&conn, "tok", now).unwrap().unwrap().id, uid);
+        assert_eq!(
+            lookup_session_user(&conn, "tok", now).unwrap().unwrap().id,
+            uid
+        );
 
         // 过期会话不返回用户
-        assert!(lookup_session_user(&conn, "tok", now + chrono::Duration::days(31)).unwrap().is_none());
+        assert!(
+            lookup_session_user(&conn, "tok", now + chrono::Duration::days(31))
+                .unwrap()
+                .is_none()
+        );
 
         delete_session(&conn, "tok").unwrap();
         assert!(lookup_session_user(&conn, "tok", now).unwrap().is_none());
@@ -501,11 +554,22 @@ mod tests {
     fn cancelled_flag_reflects_column() {
         let conn = open_in_memory().unwrap();
         let id = create_user(&conn, "c", "h", false).unwrap();
-        conn.execute("UPDATE users SET cancelled_at = '2026-07-06' WHERE id = ?1", [id]).unwrap();
+        conn.execute(
+            "UPDATE users SET cancelled_at = '2026-07-06' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
         assert!(find_user_by_id(&conn, id).unwrap().unwrap().cancelled);
         let (_, _, u) = find_user_by_name(&conn, "c").unwrap().unwrap();
         assert!(u.cancelled);
-        assert!(list_users(&conn).unwrap().iter().find(|x| x.id == id).unwrap().cancelled);
+        assert!(
+            list_users(&conn)
+                .unwrap()
+                .iter()
+                .find(|x| x.id == id)
+                .unwrap()
+                .cancelled
+        );
     }
 
     #[test]
@@ -534,8 +598,20 @@ mod tests {
         update_password(&conn, uid, "new").unwrap();
         assert_eq!(pw_hash_by_id(&conn, uid).unwrap().unwrap(), "new");
         // 会话：留一删其余
-        create_session(&conn, "keep", uid, chrono::Local::now().date_naive() + chrono::Duration::days(1)).unwrap();
-        create_session(&conn, "drop", uid, chrono::Local::now().date_naive() + chrono::Duration::days(1)).unwrap();
+        create_session(
+            &conn,
+            "keep",
+            uid,
+            chrono::Local::now().date_naive() + chrono::Duration::days(1),
+        )
+        .unwrap();
+        create_session(
+            &conn,
+            "drop",
+            uid,
+            chrono::Local::now().date_naive() + chrono::Duration::days(1),
+        )
+        .unwrap();
         assert_eq!(delete_sessions_except(&conn, uid, Some("keep")).unwrap(), 1);
         let now = chrono::Local::now().date_naive();
         assert!(lookup_session_user(&conn, "keep", now).unwrap().is_some());
@@ -550,8 +626,8 @@ mod tests {
         let mut conn = open_in_memory().unwrap();
         let a = create_user(&conn, "act", "h", false).unwrap();
         set_expiry(&conn, a, "2026-08-01".parse().unwrap()).unwrap(); // 已激活
-        let n1 = create_user(&conn, "n1", "h", false).unwrap();       // 未激活
-        create_user(&conn, "n2", "h", false).unwrap();                // 未激活
+        let n1 = create_user(&conn, "n1", "h", false).unwrap(); // 未激活
+        create_user(&conn, "n2", "h", false).unwrap(); // 未激活
         assert_eq!(count_unactivated(&conn).unwrap(), 2, "已激活不计入");
         // 注销 n1 → 不再计入未激活
         set_cancelled(&conn, n1, true).unwrap();
@@ -561,10 +637,20 @@ mod tests {
         set_cancelled(&conn, n1, false).unwrap();
         assert!(!find_user_by_id(&conn, n1).unwrap().unwrap().cancelled);
         // 删除用户 + 其会话
-        create_session(&conn, "s", a, chrono::Local::now().date_naive() + chrono::Duration::days(1)).unwrap();
+        create_session(
+            &conn,
+            "s",
+            a,
+            chrono::Local::now().date_naive() + chrono::Duration::days(1),
+        )
+        .unwrap();
         delete_user(&mut conn, a).unwrap();
         assert!(find_user_by_id(&conn, a).unwrap().is_none());
-        assert!(lookup_session_user(&conn, "s", chrono::Local::now().date_naive()).unwrap().is_none());
+        assert!(
+            lookup_session_user(&conn, "s", chrono::Local::now().date_naive())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -9,9 +9,30 @@ pub struct StockFee {
 }
 
 impl StockFee {
-    pub fn a_share() -> Self { Self { commission_rate: 0.00025, min_commission: 5.0, stamp_tax_rate: 0.0005, transfer_rate: 0.00001 } }
-    pub fn hk() -> Self { Self { commission_rate: 0.0025, min_commission: 3.0, stamp_tax_rate: 0.001, transfer_rate: 0.0 } }
-    pub fn us() -> Self { Self { commission_rate: 0.0, min_commission: 0.0, stamp_tax_rate: 0.0, transfer_rate: 0.0 } }
+    pub fn a_share() -> Self {
+        Self {
+            commission_rate: 0.00025,
+            min_commission: 5.0,
+            stamp_tax_rate: 0.0005,
+            transfer_rate: 0.00001,
+        }
+    }
+    pub fn hk() -> Self {
+        Self {
+            commission_rate: 0.0025,
+            min_commission: 3.0,
+            stamp_tax_rate: 0.001,
+            transfer_rate: 0.0,
+        }
+    }
+    pub fn us() -> Self {
+        Self {
+            commission_rate: 0.0,
+            min_commission: 0.0,
+            stamp_tax_rate: 0.0,
+            transfer_rate: 0.0,
+        }
+    }
     pub fn for_market(market: u16) -> Self {
         match market {
             116 => Self::hk(),
@@ -27,7 +48,9 @@ impl Fee for StockFee {
     }
     fn sell_fee(&self, shares: f64, price: f64, _holding_days: i64) -> f64 {
         let v = shares * price;
-        (v * self.commission_rate).max(self.min_commission) + v * self.stamp_tax_rate + v * self.transfer_rate
+        (v * self.commission_rate).max(self.min_commission)
+            + v * self.stamp_tax_rate
+            + v * self.transfer_rate
     }
 }
 

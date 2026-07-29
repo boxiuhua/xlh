@@ -1,8 +1,8 @@
-use std::path::{Path, PathBuf};
+use crate::runner::RunOutcome;
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use serde::Serialize;
-use crate::runner::RunOutcome;
+use std::path::{Path, PathBuf};
 
 pub struct CompareMeta {
     pub start: NaiveDate,
@@ -28,12 +28,15 @@ pub fn render_compare_html(meta: &CompareMeta, runs: &[RunOutcome]) -> String {
     let payload = Payload {
         start: meta.start.to_string(),
         end: meta.end.to_string(),
-        runs: runs.iter().map(|r| RunJson {
-            name: r.name.clone(),
-            fund_code: r.fund_code.clone(),
-            summary: &r.summary,
-            daily: &r.daily,
-        }).collect(),
+        runs: runs
+            .iter()
+            .map(|r| RunJson {
+                name: r.name.clone(),
+                fund_code: r.fund_code.clone(),
+                summary: &r.summary,
+                daily: &r.daily,
+            })
+            .collect(),
     };
     let data_json = serde_json::to_string(&payload)
         .expect("序列化对比数据失败")
@@ -56,43 +59,80 @@ fn fmt_pct(v: f64) -> String {
 }
 
 fn sign_class(v: f64) -> &'static str {
-    if v >= 0.0 { "pos" } else { "neg" }
+    if v >= 0.0 {
+        "pos"
+    } else {
+        "neg"
+    }
 }
 
 fn build_html(meta: &CompareMeta, runs: &[RunOutcome], data_json: &str) -> String {
     let n = runs.len();
 
     // Compute best per column (indices into runs)
-    let best_ret = runs.iter().enumerate()
-        .max_by(|a, b| a.1.summary.total_return.partial_cmp(&b.1.summary.total_return).unwrap())
+    let best_ret = runs
+        .iter()
+        .enumerate()
+        .max_by(|a, b| {
+            a.1.summary
+                .total_return
+                .partial_cmp(&b.1.summary.total_return)
+                .unwrap()
+        })
         .map(|(i, _)| i);
-    let best_ann = runs.iter().enumerate()
-        .max_by(|a, b| a.1.summary.annualized.partial_cmp(&b.1.summary.annualized).unwrap())
+    let best_ann = runs
+        .iter()
+        .enumerate()
+        .max_by(|a, b| {
+            a.1.summary
+                .annualized
+                .partial_cmp(&b.1.summary.annualized)
+                .unwrap()
+        })
         .map(|(i, _)| i);
-    let best_mdd = runs.iter().enumerate()
-        .min_by(|a, b| a.1.summary.max_drawdown.partial_cmp(&b.1.summary.max_drawdown).unwrap())
+    let best_mdd = runs
+        .iter()
+        .enumerate()
+        .min_by(|a, b| {
+            a.1.summary
+                .max_drawdown
+                .partial_cmp(&b.1.summary.max_drawdown)
+                .unwrap()
+        })
         .map(|(i, _)| i);
-    let best_sharpe = runs.iter().enumerate()
+    let best_sharpe = runs
+        .iter()
+        .enumerate()
         .max_by(|a, b| a.1.summary.sharpe.partial_cmp(&b.1.summary.sharpe).unwrap())
         .map(|(i, _)| i);
-    let best_equity = runs.iter().enumerate()
-        .max_by(|a, b| a.1.summary.final_equity.partial_cmp(&b.1.summary.final_equity).unwrap())
+    let best_equity = runs
+        .iter()
+        .enumerate()
+        .max_by(|a, b| {
+            a.1.summary
+                .final_equity
+                .partial_cmp(&b.1.summary.final_equity)
+                .unwrap()
+        })
         .map(|(i, _)| i);
 
-    let table_rows: String = runs.iter().enumerate().map(|(i, r)| {
-        let s = &r.summary;
-        let name_esc = super::html_escape(&r.name);
-        let fund_esc = super::html_escape(&r.fund_code);
-        let c_ret = sign_class(s.total_return);
-        let c_ann = sign_class(s.annualized);
-        let best_ret_cls = if best_ret == Some(i) { " best" } else { "" };
-        let best_ann_cls = if best_ann == Some(i) { " best" } else { "" };
-        let best_mdd_cls = if best_mdd == Some(i) { " best" } else { "" };
-        let best_sharpe_cls = if best_sharpe == Some(i) { " best" } else { "" };
-        let best_equity_cls = if best_equity == Some(i) { " best" } else { "" };
+    let table_rows: String = runs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let s = &r.summary;
+            let name_esc = super::html_escape(&r.name);
+            let fund_esc = super::html_escape(&r.fund_code);
+            let c_ret = sign_class(s.total_return);
+            let c_ann = sign_class(s.annualized);
+            let best_ret_cls = if best_ret == Some(i) { " best" } else { "" };
+            let best_ann_cls = if best_ann == Some(i) { " best" } else { "" };
+            let best_mdd_cls = if best_mdd == Some(i) { " best" } else { "" };
+            let best_sharpe_cls = if best_sharpe == Some(i) { " best" } else { "" };
+            let best_equity_cls = if best_equity == Some(i) { " best" } else { "" };
 
-        format!(
-            "<tr>\
+            format!(
+                "<tr>\
 <td>{name}</td>\
 <td>{fund}</td>\
 <td class=\"{cr}{br}\">{ret}</td>\
@@ -103,24 +143,28 @@ fn build_html(meta: &CompareMeta, runs: &[RunOutcome], data_json: &str) -> Strin
 <td>{contrib:.2}</td>\
 <td>{tc}</td>\
 </tr>\n",
-            name = name_esc,
-            fund = fund_esc,
-            cr = c_ret, br = best_ret_cls,
-            ret = fmt_pct(s.total_return),
-            ca = c_ann, ba = best_ann_cls,
-            ann = fmt_pct(s.annualized),
-            bm = best_mdd_cls,
-            mdd = fmt_pct(s.max_drawdown),
-            bs = best_sharpe_cls,
-            sharpe = s.sharpe,
-            be = best_equity_cls,
-            eq = s.final_equity,
-            contrib = s.total_contributed,
-            tc = s.trade_count,
-        )
-    }).collect();
+                name = name_esc,
+                fund = fund_esc,
+                cr = c_ret,
+                br = best_ret_cls,
+                ret = fmt_pct(s.total_return),
+                ca = c_ann,
+                ba = best_ann_cls,
+                ann = fmt_pct(s.annualized),
+                bm = best_mdd_cls,
+                mdd = fmt_pct(s.max_drawdown),
+                bs = best_sharpe_cls,
+                sharpe = s.sharpe,
+                be = best_equity_cls,
+                eq = s.final_equity,
+                contrib = s.total_contributed,
+                tc = s.trade_count,
+            )
+        })
+        .collect();
 
-    format!(r#"<!DOCTYPE html>
+    format!(
+        r#"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8"/>
@@ -279,10 +323,10 @@ tr:last-child td{{border-bottom:none}}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
     use crate::metrics::Summary;
     use crate::result::DailyRecord;
     use crate::runner::RunOutcome;
+    use chrono::NaiveDate;
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
@@ -302,19 +346,48 @@ mod tests {
 
     fn make_daily() -> Vec<DailyRecord> {
         vec![
-            DailyRecord { date: d(2024, 1, 1), nav: 1.0, adj_nav: 1.0, equity: 1000.0, contribution: 1000.0, shares: 1000.0, cash: 0.0 },
-            DailyRecord { date: d(2024, 2, 1), nav: 1.0, adj_nav: 1.0, equity: 2000.0, contribution: 1000.0, shares: 2000.0, cash: 0.0 },
-            DailyRecord { date: d(2024, 2, 15), nav: 2.0, adj_nav: 2.0, equity: 4000.0, contribution: 0.0, shares: 2000.0, cash: 0.0 },
+            DailyRecord {
+                date: d(2024, 1, 1),
+                nav: 1.0,
+                adj_nav: 1.0,
+                equity: 1000.0,
+                contribution: 1000.0,
+                shares: 1000.0,
+                cash: 0.0,
+            },
+            DailyRecord {
+                date: d(2024, 2, 1),
+                nav: 1.0,
+                adj_nav: 1.0,
+                equity: 2000.0,
+                contribution: 1000.0,
+                shares: 2000.0,
+                cash: 0.0,
+            },
+            DailyRecord {
+                date: d(2024, 2, 15),
+                nav: 2.0,
+                adj_nav: 2.0,
+                equity: 4000.0,
+                contribution: 0.0,
+                shares: 2000.0,
+                cash: 0.0,
+            },
         ]
     }
 
     #[test]
     fn render_compare_html_returns_markup() {
         let runs = vec![RunOutcome {
-            name: "甲".to_string(), fund_code: "161725".to_string(),
-            summary: make_summary(), daily: make_daily(),
+            name: "甲".to_string(),
+            fund_code: "161725".to_string(),
+            summary: make_summary(),
+            daily: make_daily(),
         }];
-        let meta = CompareMeta { start: d(2024,1,1), end: d(2024,2,15) };
+        let meta = CompareMeta {
+            start: d(2024, 1, 1),
+            end: d(2024, 2, 15),
+        };
         let html = render_compare_html(&meta, &runs);
         assert!(html.contains("const DATA"));
         assert!(html.contains("甲"));
@@ -345,14 +418,23 @@ mod tests {
                 daily: make_daily(),
             },
         ];
-        let meta = CompareMeta { start: d(2024, 1, 1), end: d(2024, 2, 15) };
+        let meta = CompareMeta {
+            start: d(2024, 1, 1),
+            end: d(2024, 2, 15),
+        };
         let tmp = std::env::temp_dir().join("xlh_compare_test");
         let path = render_compare(&meta, &runs, &tmp).unwrap();
 
         assert!(path.exists(), "compare.html should exist");
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("普通定投"), "should contain run name 普通定投");
-        assert!(content.contains("均线择时"), "should contain run name 均线择时");
+        assert!(
+            content.contains("普通定投"),
+            "should contain run name 普通定投"
+        );
+        assert!(
+            content.contains("均线择时"),
+            "should contain run name 均线择时"
+        );
         assert!(content.contains("const DATA"), "should embed const DATA");
         assert!(content.contains("总收益"), "should contain 总收益");
         assert!(content.contains("最大回撤"), "should contain 最大回撤");

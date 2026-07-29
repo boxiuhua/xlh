@@ -58,11 +58,22 @@ pub struct SignalEvidence {
 /// 对技术信号做无未来函数的事件研究。
 ///
 /// `bars` 需按日期升序。返回 `None` 表示数据不足以检验。
-pub fn evaluate_signals(bars: &[StockBar], p: &DiagnoseParams, horizon: usize) -> Option<SignalEvidence> {
+pub fn evaluate_signals(
+    bars: &[StockBar],
+    p: &DiagnoseParams,
+    horizon: usize,
+) -> Option<SignalEvidence> {
     // diagnose 自身需要的最小窗口
-    let need = p.ma_long.max(p.boll_window).max(p.rsi_period + 1).max(p.macd_slow).max(p.trend_window);
+    let need = p
+        .ma_long
+        .max(p.boll_window)
+        .max(p.rsi_period + 1)
+        .max(p.macd_slow)
+        .max(p.trend_window);
     // 还要留出 T+1 入场 + horizon 持有
-    if bars.len() < need + horizon + 2 { return None; }
+    if bars.len() < need + horizon + 2 {
+        return None;
+    }
 
     let adj: Vec<f64> = bars.iter().map(|b| b.adj_close).collect();
 
@@ -70,7 +81,11 @@ pub fn evaluate_signals(bars: &[StockBar], p: &DiagnoseParams, horizon: usize) -
     let fwd = |t: usize| -> Option<f64> {
         let entry = *adj.get(t + 1)?;
         let exit = *adj.get(t + 1 + horizon)?;
-        if entry > 0.0 { Some((exit / entry - 1.0) * 100.0) } else { None }
+        if entry > 0.0 {
+            Some((exit / entry - 1.0) * 100.0)
+        } else {
+            None
+        }
     };
 
     let (mut buy_f, mut sell_f, mut base_f) = (Vec::new(), Vec::new(), Vec::new());
@@ -78,22 +93,44 @@ pub fn evaluate_signals(bars: &[StockBar], p: &DiagnoseParams, horizon: usize) -
     let last_t = bars.len().saturating_sub(horizon + 2);
     for t in (need - 1)..=last_t {
         // 只喂 t 及之前的 bar —— diagnose 拿不到任何未来数据
-        let Ok(d) = diagnose(String::new(), String::new(), &bars[..=t], p) else { continue };
+        let Ok(d) = diagnose(String::new(), String::new(), &bars[..=t], p) else {
+            continue;
+        };
         let Some(r) = fwd(t) else { continue };
         base_f.push(r);
 
-        if d.signal.contains("买入") { buy_f.push(r); }
-        if d.signal.contains("卖出") { sell_f.push(r); }
+        if d.signal.contains("买入") {
+            buy_f.push(r);
+        }
+        if d.signal.contains("卖出") {
+            sell_f.push(r);
+        }
     }
 
-    if base_f.is_empty() { return None; }
+    if base_f.is_empty() {
+        return None;
+    }
 
-    let mean = |v: &[f64]| if v.is_empty() { None } else { Some(v.iter().sum::<f64>() / v.len() as f64) };
-    let up = |v: &[f64]| if v.is_empty() { None } else {
-        Some(v.iter().filter(|x| **x > 0.0).count() as f64 / v.len() as f64 * 100.0)
+    let mean = |v: &[f64]| {
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.iter().sum::<f64>() / v.len() as f64)
+        }
     };
-    let down = |v: &[f64]| if v.is_empty() { None } else {
-        Some(v.iter().filter(|x| **x < 0.0).count() as f64 / v.len() as f64 * 100.0)
+    let up = |v: &[f64]| {
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.iter().filter(|x| **x > 0.0).count() as f64 / v.len() as f64 * 100.0)
+        }
+    };
+    let down = |v: &[f64]| {
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.iter().filter(|x| **x < 0.0).count() as f64 / v.len() as f64 * 100.0)
+        }
     };
 
     let buy_mean = mean(&buy_f);
@@ -102,7 +139,14 @@ pub fn evaluate_signals(bars: &[StockBar], p: &DiagnoseParams, horizon: usize) -
         (Some(b), Some(base)) if buy_f.len() >= MIN_SIGNALS => Some(b - base),
         _ => None,
     };
-    let verdict = build_verdict(buy_f.len(), buy_mean, sell_f.len(), mean(&sell_f), base_mean, horizon);
+    let verdict = build_verdict(
+        buy_f.len(),
+        buy_mean,
+        sell_f.len(),
+        mean(&sell_f),
+        base_mean,
+        horizon,
+    );
 
     Some(SignalEvidence {
         horizon_days: horizon,
@@ -121,14 +165,20 @@ pub fn evaluate_signals(bars: &[StockBar], p: &DiagnoseParams, horizon: usize) -
 }
 
 fn build_verdict(
-    n_buy: usize, buy_mean: Option<f64>,
-    n_sell: usize, sell_mean: Option<f64>,
-    base_mean: Option<f64>, horizon: usize,
+    n_buy: usize,
+    buy_mean: Option<f64>,
+    n_sell: usize,
+    sell_mean: Option<f64>,
+    base_mean: Option<f64>,
+    horizon: usize,
 ) -> String {
-    let Some(base) = base_mean else { return "样本不足，无法检验该信号是否有效。".into() };
+    let Some(base) = base_mean else {
+        return "样本不足，无法检验该信号是否有效。".into();
+    };
 
     let mut parts = vec![format!(
-        "基准：任意一天买入、持有 {horizon} 个交易日，平均收益 {base:+.2}%。")];
+        "基准：任意一天买入、持有 {horizon} 个交易日，平均收益 {base:+.2}%。"
+    )];
 
     match (buy_mean, n_buy >= MIN_SIGNALS) {
         (Some(b), true) => {
@@ -150,14 +200,18 @@ fn build_verdict(
 
     if let (Some(s), true) = (sell_mean, n_sell >= MIN_SIGNALS) {
         parts.push(format!(
-            "卖出信号触发 {n_sell} 次，其后 {horizon} 日平均 {s:+.2}%（为负才说明躲对了下跌）。"));
+            "卖出信号触发 {n_sell} 次，其后 {horizon} 日平均 {s:+.2}%（为负才说明躲对了下跌）。"
+        ));
         if s > 0.0 {
             parts.push("卖出信号之后平均还在涨 —— 照它减仓会错过后续上涨。".into());
         }
     }
 
-    parts.push("以上为该股票自身历史的统计，非预测；信号阈值（布林±1σ/±2σ、RSI 30/70、MACD 柱符号）\
-                均为经验取值，未经寻优验证。".into());
+    parts.push(
+        "以上为该股票自身历史的统计，非预测；信号阈值（布林±1σ/±2σ、RSI 30/70、MACD 柱符号）\
+                均为经验取值，未经寻优验证。"
+            .into(),
+    );
     parts.join(" ")
 }
 
@@ -167,10 +221,20 @@ mod tests {
     use chrono::NaiveDate;
 
     fn bars(closes: &[f64]) -> Vec<StockBar> {
-        closes.iter().enumerate().map(|(i, c)| StockBar {
-            date: NaiveDate::from_ymd_opt(2022, 1, 1).unwrap() + chrono::Duration::days(i as i64),
-            open: *c, high: *c, low: *c, close: *c, volume: 1.0, adj_close: *c,
-        }).collect()
+        closes
+            .iter()
+            .enumerate()
+            .map(|(i, c)| StockBar {
+                date: NaiveDate::from_ymd_opt(2022, 1, 1).unwrap()
+                    + chrono::Duration::days(i as i64),
+                open: *c,
+                high: *c,
+                low: *c,
+                close: *c,
+                volume: 1.0,
+                adj_close: *c,
+            })
+            .collect()
     }
 
     /// 确定性伪随机游走 —— 不该出现稳定超额，但必须**给出基准并算出超额**。
@@ -178,12 +242,16 @@ mod tests {
     fn always_compares_against_an_unconditional_baseline() {
         let mut x = 987654321u64;
         let mut px = 100.0;
-        let closes: Vec<f64> = (0..500).map(|_| {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let u = ((x >> 33) as f64 / (1u64 << 31) as f64) - 1.0;
-            px *= 1.0 + u * 0.015;
-            px
-        }).collect();
+        let closes: Vec<f64> = (0..500)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let u = ((x >> 33) as f64 / (1u64 << 31) as f64) - 1.0;
+                px *= 1.0 + u * 0.015;
+                px
+            })
+            .collect();
 
         let e = evaluate_signals(&bars(&closes), &DiagnoseParams::default(), HORIZON)
             .expect("样本足够");
@@ -203,14 +271,19 @@ mod tests {
     /// 从而拿到虚高的前瞻收益。这里断言前瞻收益的量级不会离谱到只有偷看才能达到。
     #[test]
     fn signal_at_t_cannot_see_beyond_t() {
-        let mut closes: Vec<f64> = (0..200).map(|i| 100.0 + ((i % 7) as f64 - 3.0) * 0.3).collect();
-        closes.extend((0..200).map(|i| 100.0 + i as f64 * 2.0));   // 后段单边暴涨
+        let mut closes: Vec<f64> = (0..200)
+            .map(|i| 100.0 + ((i % 7) as f64 - 3.0) * 0.3)
+            .collect();
+        closes.extend((0..200).map(|i| 100.0 + i as f64 * 2.0)); // 后段单边暴涨
 
         let e = evaluate_signals(&bars(&closes), &DiagnoseParams::default(), HORIZON).unwrap();
         let base = e.baseline_mean_forward.unwrap();
         if let Some(b) = e.buy_mean_forward {
             // 买入信号的前瞻收益不该系统性地把整段暴涨全吃到（那只有偷看未来才做得到）
-            assert!(b < base * 5.0 + 50.0, "买入信号前瞻收益异常高({b:.1}% vs 基准 {base:.1}%)，疑似未来函数");
+            assert!(
+                b < base * 5.0 + 50.0,
+                "买入信号前瞻收益异常高({b:.1}% vs 基准 {base:.1}%)，疑似未来函数"
+            );
         }
     }
 
@@ -229,32 +302,49 @@ mod tests {
 
         // 白马 / 成长 / 银行 / 周期 / 港股 —— 覆盖不同风格
         let pool = [
-            ("600519", "贵州茅台", 1u16), ("300750", "宁德时代", 0),
-            ("600036", "招商银行", 1),   ("000858", "五粮液", 0),
+            ("600519", "贵州茅台", 1u16),
+            ("300750", "宁德时代", 0),
+            ("600036", "招商银行", 1),
+            ("000858", "五粮液", 0),
             ("601318", "中国平安", 1),
         ];
         let p = DiagnoseParams::default();
         let mut rows = Vec::new();
 
         for (code, name, market) in pool {
-            let secid = Secid { market, code: code.into() };
-            let Ok(bars) = kline::fetch(&secid) else { println!("{name} 抓取失败"); continue };
+            let secid = Secid {
+                market,
+                code: code.into(),
+            };
+            let Ok(bars) = kline::fetch(&secid) else {
+                println!("{name} 抓取失败");
+                continue;
+            };
             let Some(e) = evaluate_signals(&bars, &p, HORIZON) else {
-                println!("{name} 数据不足（{} 根）", bars.len()); continue;
+                println!("{name} 数据不足（{} 根）", bars.len());
+                continue;
             };
             rows.push((name, bars.len(), e));
         }
         let _ = cache::covers(&[], chrono::NaiveDate::MIN, chrono::NaiveDate::MIN); // 保持 import
 
-        println!("\n{:<10} {:>5} {:>7} {:>10} {:>10} {:>10}",
-                 "股票", "K线", "买入次", "买入后20日", "基准", "超额");
+        println!(
+            "\n{:<10} {:>5} {:>7} {:>10} {:>10} {:>10}",
+            "股票", "K线", "买入次", "买入后20日", "基准", "超额"
+        );
         println!("{}", "-".repeat(58));
         for (name, n, e) in &rows {
             let (b, base) = (e.buy_mean_forward, e.baseline_mean_forward);
             match (b, base) {
                 (Some(b), Some(base)) => println!(
                     "{:<10} {:>5} {:>7} {:>9.2}% {:>9.2}% {:>9.2}%",
-                    name, n, e.buy_signals, b, base, b - base),
+                    name,
+                    n,
+                    e.buy_signals,
+                    b,
+                    base,
+                    b - base
+                ),
                 _ => println!("{:<10} {:>5} 无有效信号", name, n),
             }
         }
@@ -270,7 +360,9 @@ mod tests {
     /// 结论必须承认阈值是拍脑袋的。
     #[test]
     fn verdict_admits_thresholds_are_arbitrary() {
-        let closes: Vec<f64> = (0..500).map(|i| 100.0 + ((i % 40) as f64 - 20.0) * 0.8).collect();
+        let closes: Vec<f64> = (0..500)
+            .map(|i| 100.0 + ((i % 40) as f64 - 20.0) * 0.8)
+            .collect();
         let e = evaluate_signals(&bars(&closes), &DiagnoseParams::default(), HORIZON).unwrap();
         assert!(e.verdict.contains("经验取值") && e.verdict.contains("未经寻优验证"));
     }

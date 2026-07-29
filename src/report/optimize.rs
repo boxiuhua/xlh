@@ -1,8 +1,8 @@
-use std::path::{Path, PathBuf};
+use crate::optimize::OptReport;
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use serde::Serialize;
-use crate::optimize::OptReport;
+use std::path::{Path, PathBuf};
 
 pub struct OptMeta {
     pub start: NaiveDate,
@@ -25,8 +25,16 @@ struct Payload<'a> {
     runs: Vec<RunJson<'a>>,
 }
 
-fn fmt_pct(v: f64) -> String { format!("{:.2}%", v * 100.0) }
-fn sign_class(v: f64) -> &'static str { if v >= 0.0 { "pos" } else { "neg" } }
+fn fmt_pct(v: f64) -> String {
+    format!("{:.2}%", v * 100.0)
+}
+fn sign_class(v: f64) -> &'static str {
+    if v >= 0.0 {
+        "pos"
+    } else {
+        "neg"
+    }
+}
 
 /// 取 toml 值的紧凑显示（去掉字符串引号，整数/浮点原样）。
 fn cell(v: Option<&toml::Value>) -> String {
@@ -42,11 +50,16 @@ pub fn render_optimize_html(meta: &OptMeta, report: &OptReport) -> String {
     let payload = Payload {
         start: meta.start.to_string(),
         end: meta.end.to_string(),
-        runs: report.ranked.iter().take(top_n).map(|o| RunJson {
-            label: o.label.clone(),
-            summary: &o.outcome.summary,
-            daily: &o.outcome.daily,
-        }).collect(),
+        runs: report
+            .ranked
+            .iter()
+            .take(top_n)
+            .map(|o| RunJson {
+                label: o.label.clone(),
+                summary: &o.outcome.summary,
+                daily: &o.outcome.daily,
+            })
+            .collect(),
     };
     let data_json = serde_json::to_string(&payload)
         .expect("序列化寻优数据失败")
@@ -72,7 +85,9 @@ fn build_html(meta: &OptMeta, report: &OptReport, data_json: &str) -> String {
     let top_n = report.top_n.min(total);
 
     // 表头参数列
-    let param_th: String = report.param_keys.iter()
+    let param_th: String = report
+        .param_keys
+        .iter()
         .map(|k| format!("<th>{}</th>", crate::report::html_escape(k)))
         .collect();
 
@@ -126,7 +141,11 @@ fn build_html(meta: &OptMeta, report: &OptReport, data_json: &str) -> String {
 
     let n_params = report.param_keys.len().max(1);
     let split_desc = match report.split_ratio {
-        Some(r) => format!("训练段 前{:.0}% / 检验段 后{:.0}%", r * 100.0, (1.0 - r) * 100.0),
+        Some(r) => format!(
+            "训练段 前{:.0}% / 检验段 后{:.0}%",
+            r * 100.0,
+            (1.0 - r) * 100.0
+        ),
         None => "未切分（全部为样本内）".to_string(),
     };
     let caveat_html = crate::report::html_escape(&report.caveat).replace('\n', "<br/>");
@@ -136,7 +155,8 @@ fn build_html(meta: &OptMeta, report: &OptReport, data_json: &str) -> String {
         "<th class=\"oos\" colspan=\"3\">检验段（无）</th>"
     };
 
-    format!(r#"<!DOCTYPE html>
+    format!(
+        r#"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8"/>
@@ -256,18 +276,36 @@ tr:last-child td{{border-bottom:none}}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
     use crate::metrics::Summary;
+    use crate::optimize::{OptOutcome, OptReport};
     use crate::result::DailyRecord;
     use crate::runner::RunOutcome;
-    use crate::optimize::{OptOutcome, OptReport};
+    use chrono::NaiveDate;
 
-    fn d(y: i32, m: u32, day: u32) -> NaiveDate { NaiveDate::from_ymd_opt(y, m, day).unwrap() }
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
 
     fn daily() -> Vec<DailyRecord> {
         vec![
-            DailyRecord { date: d(2024, 1, 1), nav: 1.0, adj_nav: 1.0, equity: 1000.0, contribution: 1000.0, shares: 1000.0, cash: 0.0 },
-            DailyRecord { date: d(2024, 2, 15), nav: 2.0, adj_nav: 2.0, equity: 2000.0, contribution: 0.0, shares: 1000.0, cash: 0.0 },
+            DailyRecord {
+                date: d(2024, 1, 1),
+                nav: 1.0,
+                adj_nav: 1.0,
+                equity: 1000.0,
+                contribution: 1000.0,
+                shares: 1000.0,
+                cash: 0.0,
+            },
+            DailyRecord {
+                date: d(2024, 2, 15),
+                nav: 2.0,
+                adj_nav: 2.0,
+                equity: 2000.0,
+                contribution: 0.0,
+                shares: 1000.0,
+                cash: 0.0,
+            },
         ]
     }
 
@@ -275,7 +313,15 @@ mod tests {
         RunOutcome {
             name: label.to_string(),
             fund_code: "161725".to_string(),
-            summary: Summary { total_contributed: 1000.0, final_equity: 2000.0, total_return, annualized: 0.4, max_drawdown: 0.1, sharpe: 1.2, trade_count: 1 },
+            summary: Summary {
+                total_contributed: 1000.0,
+                final_equity: 2000.0,
+                total_return,
+                annualized: 0.4,
+                max_drawdown: 0.1,
+                sharpe: 1.2,
+                trade_count: 1,
+            },
             daily: daily(),
         }
     }
@@ -289,20 +335,27 @@ mod tests {
             params: toml::Value::Table(params),
             label: label.to_string(),
             outcome: run(label, total_return),
-            oos: Some(run(label, total_return * 0.2)),   // 样本外大幅衰减
+            oos: Some(run(label, total_return * 0.2)), // 样本外大幅衰减
         }
     }
 
     #[test]
     fn render_optimize_html_returns_markup() {
         let report = OptReport {
-            strategy: "smart_dca".to_string(), metric: "total_return".to_string(), top_n: 5,
+            strategy: "smart_dca".to_string(),
+            metric: "total_return".to_string(),
+            top_n: 5,
             ranked: vec![outcome("ma_window=250", 1.0, 250)],
             param_keys: vec!["ma_window".to_string()],
-            split_ratio: Some(0.70), combos: 1,
+            split_ratio: Some(0.70),
+            combos: 1,
             caveat: "参数在训练段上选出，请只看检验段的数字。".to_string(),
         };
-        let meta = OptMeta { start: d(2024,1,1), end: d(2024,2,15), fund_code: "161725".to_string() };
+        let meta = OptMeta {
+            start: d(2024, 1, 1),
+            end: d(2024, 2, 15),
+            fund_code: "161725".to_string(),
+        };
         let html = render_optimize_html(&meta, &report);
         assert!(html.contains("参数寻优"));
         assert!(html.contains("ma_window"));
@@ -315,12 +368,20 @@ mod tests {
             strategy: "smart_dca".to_string(),
             metric: "total_return".to_string(),
             top_n: 5,
-            ranked: vec![outcome("ma_window=250", 1.0, 250), outcome("ma_window=120", 0.5, 120)],
+            ranked: vec![
+                outcome("ma_window=250", 1.0, 250),
+                outcome("ma_window=120", 0.5, 120),
+            ],
             param_keys: vec!["ma_window".to_string()],
-            split_ratio: Some(0.70), combos: 2,
+            split_ratio: Some(0.70),
+            combos: 2,
             caveat: "参数在训练段上选出，请只看检验段的数字。".to_string(),
         };
-        let meta = OptMeta { start: d(2024, 1, 1), end: d(2024, 2, 15), fund_code: "161725".to_string() };
+        let meta = OptMeta {
+            start: d(2024, 1, 1),
+            end: d(2024, 2, 15),
+            fund_code: "161725".to_string(),
+        };
         let tmp = std::env::temp_dir().join("xlh_optimize_test");
         let path = render_optimize(&meta, &report, &tmp).unwrap();
 

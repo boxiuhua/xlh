@@ -1,6 +1,6 @@
-use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 use xlh::broker::Broker;
 use xlh::config;
@@ -79,15 +79,26 @@ enum RealtimeCmd {
 #[derive(Subcommand)]
 enum AdminCmd {
     /// 创建管理员账号
-    Create { #[arg(long)] username: String },
+    Create {
+        #[arg(long)]
+        username: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum LicenseCmd {
     /// 生成授权码
-    Issue { #[arg(long)] days: i64, #[arg(long, default_value_t = 1)] count: u32 },
+    Issue {
+        #[arg(long)]
+        days: i64,
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+    },
     /// 列出授权码
-    List { #[arg(long, default_value = "unused")] filter: String },
+    List {
+        #[arg(long, default_value = "unused")]
+        filter: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -121,10 +132,14 @@ fn main() -> Result<()> {
             }
         }
         Some(Commands::Admin { action }) => match action {
-            AdminCmd::Create { username } => xlh::web::auth::cli::admin_create(&cli.config, &username),
+            AdminCmd::Create { username } => {
+                xlh::web::auth::cli::admin_create(&cli.config, &username)
+            }
         },
         Some(Commands::License { action }) => match action {
-            LicenseCmd::Issue { days, count } => xlh::web::auth::cli::license_issue(&cli.config, days, count),
+            LicenseCmd::Issue { days, count } => {
+                xlh::web::auth::cli::license_issue(&cli.config, days, count)
+            }
             LicenseCmd::List { filter } => xlh::web::auth::cli::license_list(&cli.config, &filter),
         },
         Some(Commands::User { action }) => match action {
@@ -153,16 +168,27 @@ fn realtime_cmd(config: &std::path::Path, action: RealtimeCmd) -> Result<()> {
             let now = chrono::Local::now().naive_local();
             let date = xlh::stock::data::universe::latest_trade_date()
                 .unwrap_or(now.date() - chrono::Duration::days(1));
-            let listings = xlh::stock::data::universe::load_or_fetch(std::path::Path::new(".cache"), date)?;
+            let listings =
+                xlh::stock::data::universe::load_or_fetch(std::path::Path::new(".cache"), date)?;
             let mut symbols = job::a_share_symbols(&listings);
             let names = xlh::stock::data::universe::name_map(&listings);
-            if let Some(n) = limit { symbols.truncate(n); }
+            if let Some(n) = limit {
+                symbols.truncate(n);
+            }
             println!("抓取 {} 只（清单日 {}）…", symbols.len(), date);
 
-            let out = job::run_tick(&mut conn, &cfg, &symbols, &names, now)?;
-            println!("快照 {} 条，异动 {} 只，应推送 {} 只{}",
-                out.ticks, out.movers.len(), out.pushed.len(),
-                if out.flow_ok { "" } else { "（资金流不可用）" });
+            let out = job::run_tick(&mut conn, cfg, &symbols, &names, now)?;
+            println!(
+                "快照 {} 条，异动 {} 只，应推送 {} 只{}",
+                out.ticks,
+                out.movers.len(),
+                out.pushed.len(),
+                if out.flow_ok {
+                    ""
+                } else {
+                    "（资金流不可用）"
+                }
+            );
             if !out.movers.is_empty() {
                 println!("\n{}", job::render_movers(&out.movers, out.flow_ok));
             }
@@ -189,22 +215,47 @@ fn run_cli(config: &std::path::Path) -> Result<()> {
         if !cfg.compare.is_empty() {
             eprintln!("⚠ 同时存在 [optimize] 与 [[compare]]，本次按寻优模式执行，忽略 compare。");
         }
-        let points = cache::load_or_fetch(&cfg.data.fund_code, &cfg.data.cache_dir, cfg.data.start, cfg.data.end)?;
-        println!("加载 {} 条净值（{} ~ {}）", points.len(), cfg.data.start, cfg.data.end);
+        let points = cache::load_or_fetch(
+            &cfg.data.fund_code,
+            &cfg.data.cache_dir,
+            cfg.data.start,
+            cfg.data.end,
+        )?;
+        println!(
+            "加载 {} 条净值（{} ~ {}）",
+            points.len(),
+            cfg.data.start,
+            cfg.data.end
+        );
         let fee = config::build_fee(&cfg);
-        let report = xlh::optimize::run_optimize(opt, &cfg.data.fund_code, &points, fee, cfg.portfolio.initial_cash)?;
+        let report = xlh::optimize::run_optimize(
+            opt,
+            &cfg.data.fund_code,
+            &points,
+            fee,
+            cfg.portfolio.initial_cash,
+        )?;
         let show = report.top_n.min(report.ranked.len());
         println!("== 寻优 Top {} （按训练段 {} 排序）==", show, report.metric);
         for (i, o) in report.ranked.iter().take(show).enumerate() {
             let t = &o.outcome.summary;
-            print!("  {}. {}\n     训练段(选参数用): 收益 {:.2}%  夏普 {:.2}  回撤 {:.2}%\n",
-                i + 1, o.label,
-                t.total_return * 100.0, t.sharpe, t.max_drawdown * 100.0);
+            print!(
+                "  {}. {}\n     训练段(选参数用): 收益 {:.2}%  夏普 {:.2}  回撤 {:.2}%\n",
+                i + 1,
+                o.label,
+                t.total_return * 100.0,
+                t.sharpe,
+                t.max_drawdown * 100.0
+            );
             match &o.oos {
                 Some(oo) => {
                     let s = &oo.summary;
-                    println!("     检验段(样本外·看这个): 收益 {:.2}%  夏普 {:.2}  回撤 {:.2}%",
-                        s.total_return * 100.0, s.sharpe, s.max_drawdown * 100.0);
+                    println!(
+                        "     检验段(样本外·看这个): 收益 {:.2}%  夏普 {:.2}  回撤 {:.2}%",
+                        s.total_return * 100.0,
+                        s.sharpe,
+                        s.max_drawdown * 100.0
+                    );
                 }
                 None => println!("     检验段: 无（数据不足）"),
             }
@@ -212,7 +263,9 @@ fn run_cli(config: &std::path::Path) -> Result<()> {
         // 警示必须打出来 —— 只写在 struct 里没人看见的警示等于没有
         println!("\n{}\n", report.caveat);
         let meta = xlh::report::optimize::OptMeta {
-            start: cfg.data.start, end: cfg.data.end, fund_code: cfg.data.fund_code.clone(),
+            start: cfg.data.start,
+            end: cfg.data.end,
+            fund_code: cfg.data.fund_code.clone(),
         };
         let path = xlh::report::optimize::render_optimize(&meta, &report, &cfg.report.out_dir)?;
         println!("寻优报告已生成：{}", path.display());
@@ -222,17 +275,37 @@ fn run_cli(config: &std::path::Path) -> Result<()> {
     if !cfg.compare.is_empty() {
         let mut runs = Vec::new();
         for run in &cfg.compare {
-            let fund = run.fund_code.clone().unwrap_or_else(|| cfg.data.fund_code.clone());
-            let points = cache::load_or_fetch(&fund, &cfg.data.cache_dir, cfg.data.start, cfg.data.end)
-                .map_err(|e| anyhow::anyhow!("run [{}] 加载 {} 失败: {e}", run.name, fund))?;
-            let strategy = config::build_strategy_from(&run.strategy.kind, &run.strategy.params, &run.rules)
-                .map_err(|e| anyhow::anyhow!("run [{}] 构建策略失败: {e}", run.name))?;
+            let fund = run
+                .fund_code
+                .clone()
+                .unwrap_or_else(|| cfg.data.fund_code.clone());
+            let points =
+                cache::load_or_fetch(&fund, &cfg.data.cache_dir, cfg.data.start, cfg.data.end)
+                    .map_err(|e| anyhow::anyhow!("run [{}] 加载 {} 失败: {e}", run.name, fund))?;
+            let strategy =
+                config::build_strategy_from(&run.strategy.kind, &run.strategy.params, &run.rules)
+                    .map_err(|e| anyhow::anyhow!("run [{}] 构建策略失败: {e}", run.name))?;
             let fee = config::build_fee(&cfg);
-            let outcome = xlh::runner::run_one(run.name.clone(), fund, points, strategy, fee, run.initial_cash);
-            println!("✓ {}  总收益 {:.2}%  夏普 {:.2}", outcome.name, outcome.summary.total_return * 100.0, outcome.summary.sharpe);
+            let outcome = xlh::runner::run_one(
+                run.name.clone(),
+                fund,
+                points,
+                strategy,
+                fee,
+                run.initial_cash,
+            );
+            println!(
+                "✓ {}  总收益 {:.2}%  夏普 {:.2}",
+                outcome.name,
+                outcome.summary.total_return * 100.0,
+                outcome.summary.sharpe
+            );
             runs.push(outcome);
         }
-        let meta = xlh::report::compare::CompareMeta { start: cfg.data.start, end: cfg.data.end };
+        let meta = xlh::report::compare::CompareMeta {
+            start: cfg.data.start,
+            end: cfg.data.end,
+        };
         let path = xlh::report::compare::render_compare(&meta, &runs, &cfg.report.out_dir)?;
         println!("对比报告已生成：{}", path.display());
         return Ok(());
@@ -244,7 +317,12 @@ fn run_cli(config: &std::path::Path) -> Result<()> {
         cfg.data.start,
         cfg.data.end,
     )?;
-    println!("加载 {} 条净值（{} ~ {}）", points.len(), cfg.data.start, cfg.data.end);
+    println!(
+        "加载 {} 条净值（{} ~ {}）",
+        points.len(),
+        cfg.data.start,
+        cfg.data.end
+    );
 
     let data = InMemoryData::new(points);
     let strategy = config::build_strategy(&cfg)?;
@@ -271,7 +349,12 @@ fn run_cli(config: &std::path::Path) -> Result<()> {
             end: cfg.data.end,
             strategy: cfg.strategy.kind.clone(),
             strategy_desc: {
-                let params = cfg.strategy.params.as_ref().map(|v| v.to_string()).unwrap_or_default();
+                let params = cfg
+                    .strategy
+                    .params
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
                 if params.is_empty() {
                     cfg.strategy.kind.clone()
                 } else {
@@ -281,7 +364,11 @@ fn run_cli(config: &std::path::Path) -> Result<()> {
             initial_cash: cfg.portfolio.initial_cash,
         };
         let path = report::html::render_report(
-            &meta, pf, engine.daily(), engine.trades(), &cfg.report.out_dir,
+            &meta,
+            pf,
+            engine.daily(),
+            engine.trades(),
+            &cfg.report.out_dir,
         )?;
         println!("HTML 报告已生成：{}", path.display());
     }

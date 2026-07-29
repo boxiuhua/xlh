@@ -1,12 +1,12 @@
-use chrono::{Datelike, NaiveDate};
 use crate::event::{MarketEvent, SignalEvent};
+use chrono::{Datelike, NaiveDate};
 
+pub mod adaptive;
 pub mod dca;
+pub mod rsi;
+pub mod rules;
 pub mod smart_dca;
 pub mod trend;
-pub mod rsi;
-pub mod adaptive;
-pub mod rules;
 
 /// 策略在决策日 T 可见的上下文。
 ///
@@ -55,13 +55,26 @@ impl Strategy for Box<dyn Strategy> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Period { Monthly, Weekly }
+pub enum Period {
+    Monthly,
+    Weekly,
+}
 
 /// 定投日历：每周期(月/周)在到达目标日时触发一次。
-pub struct Schedule { period: Period, day: u32, last_key: Option<i64> }
+pub struct Schedule {
+    period: Period,
+    day: u32,
+    last_key: Option<i64>,
+}
 
 impl Schedule {
-    pub fn new(period: Period, day: u32) -> Self { Self { period, day, last_key: None } }
+    pub fn new(period: Period, day: u32) -> Self {
+        Self {
+            period,
+            day,
+            last_key: None,
+        }
+    }
 
     pub fn due(&mut self, date: NaiveDate) -> bool {
         let (key, reached) = match self.period {
@@ -78,7 +91,9 @@ impl Schedule {
         if reached && self.last_key != Some(key) {
             self.last_key = Some(key);
             true
-        } else { false }
+        } else {
+            false
+        }
     }
 }
 
@@ -86,7 +101,9 @@ impl Schedule {
 ///
 /// 传入的 `history` 已截止 T-1（见 `StrategyContext`），故此均线**不含当日**。
 pub fn moving_average(history: &[MarketEvent], window: usize) -> Option<f64> {
-    if window == 0 || history.len() < window { return None; }
+    if window == 0 || history.len() < window {
+        return None;
+    }
     let slice = &history[history.len() - window..];
     Some(slice.iter().map(|b| b.adj_nav).sum::<f64>() / window as f64)
 }
@@ -96,23 +113,37 @@ mod tests {
     use super::*;
     use crate::event::MarketEvent;
     use chrono::NaiveDate;
-    fn d(y:i32,m:u32,day:u32)->NaiveDate{NaiveDate::from_ymd_opt(y,m,day).unwrap()}
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
 
     #[test]
     fn monthly_schedule_fires_once_per_month_on_or_after_day() {
         let mut s = Schedule::new(Period::Monthly, 5);
-        assert!(!s.due(d(2024,1,3)));  // 早于5号
-        assert!(s.due(d(2024,1,5)));   // 当月首次到达5号
-        assert!(!s.due(d(2024,1,8)));  // 当月已触发
-        assert!(s.due(d(2024,2,6)));   // 新月份
+        assert!(!s.due(d(2024, 1, 3))); // 早于5号
+        assert!(s.due(d(2024, 1, 5))); // 当月首次到达5号
+        assert!(!s.due(d(2024, 1, 8))); // 当月已触发
+        assert!(s.due(d(2024, 2, 6))); // 新月份
     }
 
     #[test]
     fn moving_average_needs_full_window() {
         let bars = vec![
-            MarketEvent{date:d(2024,1,1),nav:1.0,adj_nav:1.0},
-            MarketEvent{date:d(2024,1,2),nav:1.0,adj_nav:2.0},
-            MarketEvent{date:d(2024,1,3),nav:1.0,adj_nav:3.0},
+            MarketEvent {
+                date: d(2024, 1, 1),
+                nav: 1.0,
+                adj_nav: 1.0,
+            },
+            MarketEvent {
+                date: d(2024, 1, 2),
+                nav: 1.0,
+                adj_nav: 2.0,
+            },
+            MarketEvent {
+                date: d(2024, 1, 3),
+                nav: 1.0,
+                adj_nav: 3.0,
+            },
         ];
         assert_eq!(moving_average(&bars, 4), None);
         assert_eq!(moving_average(&bars, 3), Some(2.0));

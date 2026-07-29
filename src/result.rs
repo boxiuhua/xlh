@@ -1,6 +1,6 @@
+use crate::event::Direction;
 use chrono::NaiveDate;
 use serde::Serialize;
-use crate::event::Direction;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DailyRecord {

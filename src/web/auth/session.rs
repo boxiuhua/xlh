@@ -23,13 +23,15 @@ pub fn read_cookie(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-pub fn set_cookie_header(token: &str, ttl_days: i64) -> String {
+pub fn set_cookie_header(token: &str, ttl_days: i64, secure: bool) -> String {
     let max_age = ttl_days * 24 * 3600;
-    format!("{COOKIE_NAME}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}")
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{COOKIE_NAME}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}{secure}")
 }
 
-pub fn clear_cookie_header() -> String {
-    format!("{COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
+pub fn clear_cookie_header(secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}")
 }
 
 #[cfg(test)]
@@ -60,8 +62,10 @@ mod tests {
 
     #[test]
     fn set_and_clear_headers() {
-        assert!(set_cookie_header("t", 30).contains("xlh_session=t"));
-        assert!(set_cookie_header("t", 30).contains("Max-Age=2592000"));
-        assert!(clear_cookie_header().contains("Max-Age=0"));
+        assert!(set_cookie_header("t", 30, false).contains("xlh_session=t"));
+        assert!(set_cookie_header("t", 30, false).contains("Max-Age=2592000"));
+        assert!(!set_cookie_header("t", 30, false).contains("Secure"));
+        assert!(set_cookie_header("t", 30, true).contains("; Secure"));
+        assert!(clear_cookie_header(true).contains("Max-Age=0; Secure"));
     }
 }

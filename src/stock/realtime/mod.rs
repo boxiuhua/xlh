@@ -22,13 +22,13 @@
 //! 本模块产出的是**线索，不是已验证策略**。所有阈值均为拍脑袋起点，
 //! `signals` 表永久留档信号与其结局，正是为了数月后能用真实数据回答
 //! 「这套阈值到底有没有用」。在那之前，不要把它当交易依据。
-pub mod config;
-pub mod snapshot;
 pub mod calendar;
-pub mod store;
+pub mod config;
 pub mod flow;
-pub mod movers;
 pub mod job;
+pub mod movers;
+pub mod snapshot;
+pub mod store;
 
 pub use config::RealtimeCfg;
 pub use snapshot::Tick;

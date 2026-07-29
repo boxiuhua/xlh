@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS push_heartbeat (
 pub const HEARTBEAT_STALE_SECS: i64 = 180;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SCHEMA).context("建 push_configs / push_heartbeat 表失败")?;
+    conn.execute_batch(SCHEMA)
+        .context("建 push_configs / push_heartbeat 表失败")?;
     Ok(())
 }
 
@@ -45,10 +46,14 @@ pub fn beat(conn: &Connection) -> Result<()> {
 /// 最近一次心跳时刻。守护从未跑过 → `None`。
 pub fn last_beat(conn: &Connection) -> Result<Option<chrono::DateTime<chrono::Local>>> {
     let s: Option<String> = conn
-        .query_row("SELECT beat_at FROM push_heartbeat WHERE id = 1", [], |r| r.get(0))
+        .query_row("SELECT beat_at FROM push_heartbeat WHERE id = 1", [], |r| {
+            r.get(0)
+        })
         .optional()?;
-    Ok(s.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|t| t.with_timezone(&chrono::Local)))
+    Ok(
+        s.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|t| t.with_timezone(&chrono::Local)),
+    )
 }
 
 /// 守护是否活着（心跳在 `HEARTBEAT_STALE_SECS` 内）。
@@ -72,7 +77,11 @@ pub fn upsert(conn: &Connection, user_id: i64, cfg: &PushConfig) -> Result<()> {
 
 pub fn get(conn: &Connection, user_id: i64) -> Result<Option<PushConfig>> {
     let row: Option<String> = conn
-        .query_row("SELECT config_json FROM push_configs WHERE user_id = ?1", [user_id], |r| r.get(0))
+        .query_row(
+            "SELECT config_json FROM push_configs WHERE user_id = ?1",
+            [user_id],
+            |r| r.get(0),
+        )
         .optional()?;
     Ok(row.and_then(|j| serde_json::from_str(&j).ok()))
 }
@@ -91,22 +100,32 @@ pub fn list_all(conn: &Connection) -> Result<Vec<(i64, PushConfig)>> {
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
         .filter_map(|x| x.ok())
-        .filter_map(|(uid, j)| serde_json::from_str::<PushConfig>(&j).ok().map(|c| (uid, c)))
+        .filter_map(|(uid, j)| {
+            serde_json::from_str::<PushConfig>(&j)
+                .ok()
+                .map(|c| (uid, c))
+        })
         .collect();
     Ok(rows)
 }
 
 /// 若首个管理员尚无配置则导入 cfg，返回是否发生导入（幂等）。
 pub fn import_to_first_admin(conn: &Connection, cfg: &PushConfig) -> Result<bool> {
-    let Some(admin_id) = crate::web::auth::store::first_admin_id(conn)? else { return Ok(false); };
-    if get(conn, admin_id)?.is_some() { return Ok(false); }
+    let Some(admin_id) = crate::web::auth::store::first_admin_id(conn)? else {
+        return Ok(false);
+    };
+    if get(conn, admin_id)?.is_some() {
+        return Ok(false);
+    }
     upsert(conn, admin_id, cfg)?;
     Ok(true)
 }
 
 /// 启动迁移：旧全局 push.toml 存在且可解析 → 导入首个管理员（幂等）。
 pub fn migrate_legacy_push(conn: &Connection, path: &std::path::Path) -> Result<()> {
-    if !path.exists() { return Ok(()); }
+    if !path.exists() {
+        return Ok(());
+    }
     match super::config::load(path) {
         Ok(cfg) => {
             if import_to_first_admin(conn, &cfg)? {
@@ -138,7 +157,10 @@ mod heartbeat_tests {
     fn never_started_means_dead() {
         let c = db();
         assert_eq!(last_beat(&c).unwrap(), None);
-        assert!(!daemon_alive(&c, chrono::Local::now()), "从未心跳过 → 必须判定为未运行");
+        assert!(
+            !daemon_alive(&c, chrono::Local::now()),
+            "从未心跳过 → 必须判定为未运行"
+        );
     }
 
     #[test]
@@ -157,17 +179,26 @@ mod heartbeat_tests {
         beat(&c).unwrap();
         let now = chrono::Local::now();
         // 守护每 60s 一跳；容忍 180s。刚过阈值 → 死
-        assert!(daemon_alive(&c, now + Duration::seconds(HEARTBEAT_STALE_SECS)), "阈值内仍算活");
-        assert!(!daemon_alive(&c, now + Duration::seconds(HEARTBEAT_STALE_SECS + 1)),
-                "超过 {HEARTBEAT_STALE_SECS}s 无心跳 → 必须判定为已死");
+        assert!(
+            daemon_alive(&c, now + Duration::seconds(HEARTBEAT_STALE_SECS)),
+            "阈值内仍算活"
+        );
+        assert!(
+            !daemon_alive(&c, now + Duration::seconds(HEARTBEAT_STALE_SECS + 1)),
+            "超过 {HEARTBEAT_STALE_SECS}s 无心跳 → 必须判定为已死"
+        );
     }
 
     /// 心跳是单行表：反复 beat 只更新，不堆积。
     #[test]
     fn beat_is_idempotent_single_row() {
         let c = db();
-        for _ in 0..5 { beat(&c).unwrap(); }
-        let n: i64 = c.query_row("SELECT count(*) FROM push_heartbeat", [], |r| r.get(0)).unwrap();
+        for _ in 0..5 {
+            beat(&c).unwrap();
+        }
+        let n: i64 = c
+            .query_row("SELECT count(*) FROM push_heartbeat", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1, "心跳表恒为单行");
     }
 }
@@ -187,7 +218,11 @@ mod tests {
     fn sample_cfg() -> PushConfig {
         let mut c = crate::push::config::default_config();
         c.channel.webhook = "https://open.feishu.cn/x".into();
-        c.holdings = vec![crate::holdings::Holding { code: "161725".into(), amount: 1000.0, profit: 0.0 }];
+        c.holdings = vec![crate::holdings::Holding {
+            code: "161725".into(),
+            amount: 1000.0,
+            profit: 0.0,
+        }];
         c
     }
 
@@ -199,9 +234,13 @@ mod tests {
         let got = get(&conn, uid).unwrap().unwrap();
         assert_eq!(got.channel.webhook, "https://open.feishu.cn/x");
         // 覆盖更新
-        let mut c2 = sample_cfg(); c2.channel.webhook = "https://x2".into();
+        let mut c2 = sample_cfg();
+        c2.channel.webhook = "https://x2".into();
         upsert(&conn, uid, &c2).unwrap();
-        assert_eq!(get(&conn, uid).unwrap().unwrap().channel.webhook, "https://x2");
+        assert_eq!(
+            get(&conn, uid).unwrap().unwrap().channel.webhook,
+            "https://x2"
+        );
     }
 
     #[test]
@@ -236,9 +275,15 @@ mod tests {
         let admin_lo = auth_store::create_user(&conn, "admin1", "h", true).unwrap();
         auth_store::create_user(&conn, "admin2", "h", true).unwrap();
         assert_eq!(auth_store::first_admin_id(&conn).unwrap(), Some(admin_lo));
-        assert!(import_to_first_admin(&conn, &sample_cfg()).unwrap(), "首次导入");
+        assert!(
+            import_to_first_admin(&conn, &sample_cfg()).unwrap(),
+            "首次导入"
+        );
         assert!(get(&conn, admin_lo).unwrap().is_some());
-        assert!(!import_to_first_admin(&conn, &sample_cfg()).unwrap(), "已有配置不覆盖");
+        assert!(
+            !import_to_first_admin(&conn, &sample_cfg()).unwrap(),
+            "已有配置不覆盖"
+        );
     }
 
     #[test]

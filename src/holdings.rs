@@ -119,33 +119,48 @@ pub struct HoldingsReport {
 }
 
 /// 金额四舍五入到整数元。
-pub fn round_yuan(x: f64) -> f64 { x.round() }
+pub fn round_yuan(x: f64) -> f64 {
+    x.round()
+}
 
 /// 该基金的低吸线相对「随便哪天买」的历史超额，以及能否据此下单。
 ///
 /// 返回 (超额%, 说明)。超额为 `None` 表示样本不足、无法检验。
 fn timing_verdict(regime: &RegimeReport) -> (Option<f64>, String) {
     let Some(e) = regime.plan.as_ref().and_then(|p| p.evidence.as_ref()) else {
-        return (None, "历史数据不足，无法检验低吸/高抛线是否有效 —— 不据此给出金额。".into());
+        return (
+            None,
+            "历史数据不足，无法检验低吸/高抛线是否有效 —— 不据此给出金额。".into(),
+        );
     };
     let (Some(buy), Some(base)) = (e.buy_mean_forward, e.baseline_mean_forward) else {
-        return (None, "低吸线在历史上从未触发，无从检验 —— 不据此给出金额。".into());
+        return (
+            None,
+            "低吸线在历史上从未触发，无从检验 —— 不据此给出金额。".into(),
+        );
     };
     if e.buy_signals < MIN_SIGNALS {
-        return (None, format!(
-            "低吸线历史仅触发 {} 次，样本不足以判断有效性 —— 不据此给出金额。", e.buy_signals));
+        return (
+            None,
+            format!(
+                "低吸线历史仅触发 {} 次，样本不足以判断有效性 —— 不据此给出金额。",
+                e.buy_signals
+            ),
+        );
     }
     let edge = buy - base;
     let note = if edge <= MIN_USEFUL_EDGE {
         format!(
             "低吸线触发 {} 次，其后 {} 日平均 {buy:+.2}%，而「随便哪天买」是 {base:+.2}% \
              —— 超额 {edge:+.2}%，没跑赢随便买。这条线不提供择时价值，故不据此给出加仓/减仓金额。",
-            e.buy_signals, e.horizon_days)
+            e.buy_signals, e.horizon_days
+        )
     } else {
         format!(
             "低吸线触发 {} 次，超额 {edge:+.2}%。但这是单只基金的样本内统计、未经样本外检验，\
              仍不足以支撑具体下单金额。",
-            e.buy_signals)
+            e.buy_signals
+        )
     };
     (Some(edge), note)
 }
@@ -156,23 +171,35 @@ fn timing_verdict(regime: &RegimeReport) -> (Option<f64>, String) {
 /// 波动带信号（作为描述）、以及那条线经检验到底有没有用。
 /// 金额留给 `build_report` 按集中度这一条非择时规则来给。
 pub fn advise_holding(
-    h: &Holding, name: &str, points: &[NavPoint], p: &RecommendParams,
+    h: &Holding,
+    name: &str,
+    points: &[NavPoint],
+    p: &RecommendParams,
 ) -> anyhow::Result<HoldingAdvice> {
     let rec = recommend::evaluate_fund(&h.code, name, points, p)?;
-    let plan = rec.regime.plan.as_ref()
+    let plan = rec
+        .regime
+        .plan
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("{} 无择时计划（数据不足）", h.code))?;
     let z = plan.current.z;
     let signal = plan.current.signal.clone();
     let (timing_edge, timing_note) = timing_verdict(&rec.regime);
 
     Ok(HoldingAdvice {
-        code: h.code.clone(), name: name.to_string(),
-        amount: h.amount, profit: h.profit, weight: 0.0,
-        action: "持有".into(),          // 默认状态；集中度超限时由 build_report 改写
-        suggest_amount: None,           // 择时不给金额
-        signal, z,
-        timing_edge, timing_note,
-        best_strategy: rec.best_strategy, all_strategies: rec.all_strategies,
+        code: h.code.clone(),
+        name: name.to_string(),
+        amount: h.amount,
+        profit: h.profit,
+        weight: 0.0,
+        action: "持有".into(), // 默认状态；集中度超限时由 build_report 改写
+        suggest_amount: None,  // 择时不给金额
+        signal,
+        z,
+        timing_edge,
+        timing_note,
+        best_strategy: rec.best_strategy,
+        all_strategies: rec.all_strategies,
         regime: rec.regime,
         rationale: rec.rationale,
     })
@@ -180,7 +207,10 @@ pub fn advise_holding(
 
 /// 组装整份持仓报告：注入 `load` 逐只取净值 → advise_holding → 汇总。
 pub fn build_report<F>(
-    input: &HoldingsInput, names_of: F, today: &str, p: &RecommendParams,
+    input: &HoldingsInput,
+    names_of: F,
+    today: &str,
+    p: &RecommendParams,
     mut load: impl FnMut(&str) -> anyhow::Result<Vec<NavPoint>>,
 ) -> HoldingsReport
 where
@@ -189,7 +219,9 @@ where
     let mut advices = Vec::new();
     let mut skipped = Vec::new();
     for h in &input.holdings {
-        if h.code.trim().is_empty() { continue; }
+        if h.code.trim().is_empty() {
+            continue;
+        }
         match load(&h.code) {
             Ok(points) => match advise_holding(h, &names_of(&h.code), &points, p) {
                 Ok(a) => advices.push(a),
@@ -206,7 +238,9 @@ where
     if sum_amount > 0.0 {
         for a in &mut advices {
             a.weight = a.amount.max(0.0) / sum_amount;
-            if a.weight > max_weight { max_weight = a.weight; }
+            if a.weight > max_weight {
+                max_weight = a.weight;
+            }
         }
     }
 
@@ -228,10 +262,15 @@ where
     }
 
     let concentration_note = if max_weight > CONCENTRATION_LIMIT {
-        format!("单只权重最高达 {:.0}%，超过 {:.0}% 上限 —— 建议减到该线以控制单一标的暴露。\
+        format!(
+            "单只权重最高达 {:.0}%，超过 {:.0}% 上限 —— 建议减到该线以控制单一标的暴露。\
                  这是风险规则，与看涨看跌无关。",
-                max_weight * 100.0, CONCENTRATION_LIMIT * 100.0)
-    } else { String::new() };
+            max_weight * 100.0,
+            CONCENTRATION_LIMIT * 100.0
+        )
+    } else {
+        String::new()
+    };
 
     HoldingsReport {
         generated: today.to_string(),
@@ -262,8 +301,7 @@ pub const TIMING_DISCLOSURE: &str =
 pub fn summarize(report: &HoldingsReport) -> String {
     format!(
         "{} 只 · 集中度减仓 {:.0}",
-        report.summary.holding_count,
-        report.summary.total_trim,
+        report.summary.holding_count, report.summary.total_trim,
     )
 }
 
@@ -299,10 +337,15 @@ mod tests {
     use chrono::NaiveDate;
 
     fn series(vals: &[f64]) -> Vec<NavPoint> {
-        vals.iter().enumerate().map(|(i, v)| NavPoint {
-            date: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap() + chrono::Duration::days(i as i64),
-            nav: *v, acc_nav: *v,
-        }).collect()
+        vals.iter()
+            .enumerate()
+            .map(|(i, v)| NavPoint {
+                date: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap()
+                    + chrono::Duration::days(i as i64),
+                nav: *v,
+                acc_nav: *v,
+            })
+            .collect()
     }
 
     /// 核心不变量：**择时信号绝不产生下单金额**。
@@ -314,20 +357,42 @@ mod tests {
     fn timing_signal_never_produces_a_trade_amount() {
         // 三只均分 → 各 33%，都未超 40% 集中度上限，故不该有任何金额
         let input = HoldingsInput {
-            total_amount: None, total_profit: None, cumulative_profit: None,
+            total_amount: None,
+            total_profit: None,
+            cumulative_profit: None,
             holdings: vec![
-                Holding { code: "000001".into(), amount: 5000.0, profit: 300.0 },
-                Holding { code: "000002".into(), amount: 5000.0, profit: -200.0 },
-                Holding { code: "000003".into(), amount: 5000.0, profit: 0.0 },
+                Holding {
+                    code: "000001".into(),
+                    amount: 5000.0,
+                    profit: 300.0,
+                },
+                Holding {
+                    code: "000002".into(),
+                    amount: 5000.0,
+                    profit: -200.0,
+                },
+                Holding {
+                    code: "000003".into(),
+                    amount: 5000.0,
+                    profit: 0.0,
+                },
             ],
         };
-        let rep = build_report(&input, |c| c.to_string(), "2026-07-12",
-                               &RecommendParams::default(), load_ok);
+        let rep = build_report(
+            &input,
+            |c| c.to_string(),
+            "2026-07-12",
+            &RecommendParams::default(),
+            load_ok,
+        );
         assert_eq!(rep.advices.len(), 3);
         for a in &rep.advices {
             // 权重各 50%，未超集中度上限 → 不该有任何金额
-            assert_eq!(a.suggest_amount, None,
-                       "{} 未超集中度，却给出了金额 —— 择时不得驱动金额", a.code);
+            assert_eq!(
+                a.suggest_amount, None,
+                "{} 未超集中度，却给出了金额 —— 择时不得驱动金额",
+                a.code
+            );
             assert_eq!(a.action, "持有");
             assert!(!a.action.contains("加仓"), "不得再出现「加仓」这类择时指令");
             assert!(!a.action.contains("止盈"));
@@ -339,14 +404,29 @@ mod tests {
     #[test]
     fn only_concentration_produces_an_amount() {
         let input = HoldingsInput {
-            total_amount: None, total_profit: None, cumulative_profit: None,
+            total_amount: None,
+            total_profit: None,
+            cumulative_profit: None,
             holdings: vec![
-                Holding { code: "000001".into(), amount: 9000.0, profit: 0.0 },  // 90%
-                Holding { code: "000002".into(), amount: 1000.0, profit: 0.0 },  // 10%
+                Holding {
+                    code: "000001".into(),
+                    amount: 9000.0,
+                    profit: 0.0,
+                }, // 90%
+                Holding {
+                    code: "000002".into(),
+                    amount: 1000.0,
+                    profit: 0.0,
+                }, // 10%
             ],
         };
-        let rep = build_report(&input, |c| c.to_string(), "2026-07-12",
-                               &RecommendParams::default(), load_ok);
+        let rep = build_report(
+            &input,
+            |c| c.to_string(),
+            "2026-07-12",
+            &RecommendParams::default(),
+            load_ok,
+        );
 
         let big = rep.advices.iter().find(|a| a.code == "000001").unwrap();
         let small = rep.advices.iter().find(|a| a.code == "000002").unwrap();
@@ -368,11 +448,22 @@ mod tests {
     #[test]
     fn discloses_why_timing_amounts_are_gone() {
         let input = HoldingsInput {
-            total_amount: None, total_profit: None, cumulative_profit: None,
-            holdings: vec![Holding { code: "000001".into(), amount: 5000.0, profit: 0.0 }],
+            total_amount: None,
+            total_profit: None,
+            cumulative_profit: None,
+            holdings: vec![Holding {
+                code: "000001".into(),
+                amount: 5000.0,
+                profit: 0.0,
+            }],
         };
-        let rep = build_report(&input, |c| c.to_string(), "2026-07-12",
-                               &RecommendParams::default(), load_ok);
+        let rep = build_report(
+            &input,
+            |c| c.to_string(),
+            "2026-07-12",
+            &RecommendParams::default(),
+            load_ok,
+        );
         let d = &rep.summary.timing_disclosure;
         assert!(d.contains("不再给出"), "须明说不再给择时金额");
         assert!(d.contains("随便哪天买"), "须说明是跑不赢随机买入");
@@ -381,21 +472,48 @@ mod tests {
 
     fn load_ok(_c: &str) -> anyhow::Result<Vec<NavPoint>> {
         // 300 点温和上涨，足够评估与择时
-        Ok(series(&(0..300).map(|i| 1.0 + i as f64 * 0.004).collect::<Vec<_>>()))
+        Ok(series(
+            &(0..300).map(|i| 1.0 + i as f64 * 0.004).collect::<Vec<_>>(),
+        ))
     }
 
     #[test]
     fn build_report_weights_sum_to_one_and_skips_bad() {
         let input = HoldingsInput {
-            total_amount: None, total_profit: Some(1200.0), cumulative_profit: Some(3000.0),
+            total_amount: None,
+            total_profit: Some(1200.0),
+            cumulative_profit: Some(3000.0),
             holdings: vec![
-                Holding { code: "000001".into(), amount: 6000.0, profit: 800.0 },
-                Holding { code: "000002".into(), amount: 4000.0, profit: 400.0 },
-                Holding { code: "BADX".into(), amount: 1000.0, profit: 0.0 },
+                Holding {
+                    code: "000001".into(),
+                    amount: 6000.0,
+                    profit: 800.0,
+                },
+                Holding {
+                    code: "000002".into(),
+                    amount: 4000.0,
+                    profit: 400.0,
+                },
+                Holding {
+                    code: "BADX".into(),
+                    amount: 1000.0,
+                    profit: 0.0,
+                },
             ],
         };
-        let rep = build_report(&input, |c| c.to_string(), "2026-07-02", &RecommendParams::default(),
-            |c| if c == "BADX" { Err(anyhow::anyhow!("加载失败")) } else { load_ok(c) });
+        let rep = build_report(
+            &input,
+            |c| c.to_string(),
+            "2026-07-02",
+            &RecommendParams::default(),
+            |c| {
+                if c == "BADX" {
+                    Err(anyhow::anyhow!("加载失败"))
+                } else {
+                    load_ok(c)
+                }
+            },
+        );
         assert_eq!(rep.advices.len(), 2, "两只成功");
         assert_eq!(rep.skipped, vec!["BADX".to_string()]);
         let wsum: f64 = rep.advices.iter().map(|a| a.weight).sum();
@@ -407,22 +525,47 @@ mod tests {
     #[test]
     fn build_report_flags_concentration() {
         let input = HoldingsInput {
-            total_amount: None, total_profit: None, cumulative_profit: None,
+            total_amount: None,
+            total_profit: None,
+            cumulative_profit: None,
             holdings: vec![
-                Holding { code: "000001".into(), amount: 9000.0, profit: 0.0 },
-                Holding { code: "000002".into(), amount: 1000.0, profit: 0.0 },
+                Holding {
+                    code: "000001".into(),
+                    amount: 9000.0,
+                    profit: 0.0,
+                },
+                Holding {
+                    code: "000002".into(),
+                    amount: 1000.0,
+                    profit: 0.0,
+                },
             ],
         };
-        let rep = build_report(&input, |c| c.to_string(), "2026-07-02", &RecommendParams::default(), load_ok);
+        let rep = build_report(
+            &input,
+            |c| c.to_string(),
+            "2026-07-02",
+            &RecommendParams::default(),
+            load_ok,
+        );
         assert!(!rep.summary.concentration_note.is_empty(), "90% 集中应提示");
     }
 
     #[test]
     fn build_report_empty_is_valid() {
         let input = HoldingsInput {
-            total_amount: None, total_profit: None, cumulative_profit: None, holdings: vec![],
+            total_amount: None,
+            total_profit: None,
+            cumulative_profit: None,
+            holdings: vec![],
         };
-        let rep = build_report(&input, |c| c.to_string(), "2026-07-02", &RecommendParams::default(), load_ok);
+        let rep = build_report(
+            &input,
+            |c| c.to_string(),
+            "2026-07-02",
+            &RecommendParams::default(),
+            load_ok,
+        );
         assert_eq!(rep.summary.holding_count, 0);
         assert!(rep.advices.is_empty());
     }
@@ -430,18 +573,45 @@ mod tests {
     #[test]
     fn report_serializes_frontend_keys() {
         let input = HoldingsInput {
-            total_amount: Some(10000.0), total_profit: Some(500.0), cumulative_profit: Some(900.0),
-            holdings: vec![Holding { code: "000001".into(), amount: 10000.0, profit: 500.0 }],
+            total_amount: Some(10000.0),
+            total_profit: Some(500.0),
+            cumulative_profit: Some(900.0),
+            holdings: vec![Holding {
+                code: "000001".into(),
+                amount: 10000.0,
+                profit: 500.0,
+            }],
         };
-        let rep = build_report(&input, |c| c.to_string(), "2026-07-02", &RecommendParams::default(), load_ok);
+        let rep = build_report(
+            &input,
+            |c| c.to_string(),
+            "2026-07-02",
+            &RecommendParams::default(),
+            load_ok,
+        );
         let j = serde_json::to_string(&rep).unwrap();
-        for key in ["\"summary\"", "\"advices\"", "\"action\"", "\"suggest_amount\"", "\"signal\"",
-                    "\"weight\"", "\"best_strategy\"", "\"total_trim\"", "\"timing_edge\"",
-                    "\"timing_note\"", "\"timing_disclosure\"",
-                    "\"concentration_note\"", "\"disclaimer\"", "\"skipped\""] {
+        for key in [
+            "\"summary\"",
+            "\"advices\"",
+            "\"action\"",
+            "\"suggest_amount\"",
+            "\"signal\"",
+            "\"weight\"",
+            "\"best_strategy\"",
+            "\"total_trim\"",
+            "\"timing_edge\"",
+            "\"timing_note\"",
+            "\"timing_disclosure\"",
+            "\"concentration_note\"",
+            "\"disclaimer\"",
+            "\"skipped\"",
+        ] {
             assert!(j.contains(key), "JSON 应含 {key}");
         }
         // 择时加仓总额已彻底移除，字段不该再存在
-        assert!(!j.contains("\"total_add\""), "total_add 已移除（择时不再驱动金额）");
+        assert!(
+            !j.contains("\"total_add\""),
+            "total_add 已移除（择时不再驱动金额）"
+        );
     }
 }

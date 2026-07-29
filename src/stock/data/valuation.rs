@@ -32,26 +32,39 @@ pub struct ValPoint {
 }
 
 #[derive(Deserialize)]
-struct Resp { result: Option<Res> }
+struct Resp {
+    result: Option<Res>,
+}
 #[derive(Deserialize)]
 struct Res {
-    #[serde(default)] data: Vec<Row>,
-    #[serde(default)] count: usize,
+    #[serde(default)]
+    data: Vec<Row>,
+    #[serde(default)]
+    count: usize,
 }
 #[derive(Deserialize)]
 struct Row {
-    #[serde(rename = "TRADE_DATE")] date: String,
-    #[serde(rename = "PE_TTM")] pe_ttm: Option<f64>,
-    #[serde(rename = "PB_MRQ")] pb_mrq: Option<f64>,
+    #[serde(rename = "TRADE_DATE")]
+    date: String,
+    #[serde(rename = "PE_TTM")]
+    pe_ttm: Option<f64>,
+    #[serde(rename = "PB_MRQ")]
+    pb_mrq: Option<f64>,
 }
 
 pub fn parse_page(body: &str) -> Result<(Vec<ValPoint>, usize)> {
-    let resp: Resp = serde_json::from_str(body).map_err(|e| anyhow!("解析估值历史JSON失败: {e}"))?;
-    let Some(r) = resp.result else { return Ok((Vec::new(), 0)); };
+    let resp: Resp =
+        serde_json::from_str(body).map_err(|e| anyhow!("解析估值历史JSON失败: {e}"))?;
+    let Some(r) = resp.result else {
+        return Ok((Vec::new(), 0));
+    };
     let count = r.count;
     let mut out = Vec::with_capacity(r.data.len());
     for d in r.data {
-        let head = d.date.get(..10).ok_or_else(|| anyhow!("估值日期过短: {}", d.date))?;
+        let head = d
+            .date
+            .get(..10)
+            .ok_or_else(|| anyhow!("估值日期过短: {}", d.date))?;
         out.push(ValPoint {
             date: NaiveDate::parse_from_str(head, "%Y-%m-%d")?,
             pe_ttm: d.pe_ttm,
@@ -78,17 +91,24 @@ pub fn fetch(secid: &Secid) -> Result<Vec<ValPoint>> {
     let mut all = Vec::new();
     let mut total = usize::MAX;
     for page in 1..=MAX_PAGES {
-        if page > 1 { std::thread::sleep(std::time::Duration::from_millis(150)); }
+        if page > 1 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
         let url = format!(
             "{DC_BASE}&columns=SECURITY_CODE%2CTRADE_DATE%2CPE_TTM%2CPB_MRQ\
              &filter=(SECURITY_CODE%3D%22{}%22)&pageNumber={page}&pageSize={PAGE_SIZE}\
              &sortColumns=TRADE_DATE&sortTypes=1",
-            secid.code);
+            secid.code
+        );
         let (rows, count) = parse_page(&get(&c, &url, "https://data.eastmoney.com/")?)?;
-        if page == 1 { total = count; }
+        if page == 1 {
+            total = count;
+        }
         let got = rows.len();
         all.extend(rows);
-        if got < PAGE_SIZE || all.len() >= total { break; }
+        if got < PAGE_SIZE || all.len() >= total {
+            break;
+        }
     }
     all.sort_by_key(|p| p.date);
     Ok(all)
@@ -100,9 +120,13 @@ pub fn fetch(secid: &Secid) -> Result<Vec<ValPoint>> {
 /// 荒谬结论 —— 一只巨亏股的 PE=-0.4 会排到分位 0（"史上最便宜"）。
 /// 故负值一律剔除；样本不足 60 个交易日返回 None（分位本身不可信）。
 pub fn percentile(history: &[f64], v: f64) -> Option<f64> {
-    if v <= 0.0 { return None; }
+    if v <= 0.0 {
+        return None;
+    }
     let mut xs: Vec<f64> = history.iter().copied().filter(|x| *x > 0.0).collect();
-    if xs.len() < 60 { return None; }
+    if xs.len() < 60 {
+        return None;
+    }
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let below = xs.partition_point(|x| *x < v);
     Some(below as f64 / xs.len() as f64)
@@ -110,12 +134,20 @@ pub fn percentile(history: &[f64], v: f64) -> Option<f64> {
 
 /// 序列中所有正的 PE_TTM。
 pub fn positive_pes(points: &[ValPoint]) -> Vec<f64> {
-    points.iter().filter_map(|p| p.pe_ttm).filter(|x| *x > 0.0).collect()
+    points
+        .iter()
+        .filter_map(|p| p.pe_ttm)
+        .filter(|x| *x > 0.0)
+        .collect()
 }
 
 /// 序列中所有正的 PB_MRQ。
 pub fn positive_pbs(points: &[ValPoint]) -> Vec<f64> {
-    points.iter().filter_map(|p| p.pb_mrq).filter(|x| *x > 0.0).collect()
+    points
+        .iter()
+        .filter_map(|p| p.pb_mrq)
+        .filter(|x| *x > 0.0)
+        .collect()
 }
 
 /// 取 `date` 当日或之前最近一个有正 PE 的估值点（停牌/非交易日回溯）。
@@ -127,14 +159,22 @@ pub fn at_or_before(points: &[ValPoint], date: NaiveDate) -> Option<ValPoint> {
 
 const HEADER: &str = "date,pe_ttm,pb_mrq";
 
-fn fmt(v: Option<f64>) -> String { v.map(|x| x.to_string()).unwrap_or_default() }
+fn fmt(v: Option<f64>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_default()
+}
 fn num(s: &str) -> Option<f64> {
     let t = s.trim();
-    if t.is_empty() { None } else { t.parse().ok() }
+    if t.is_empty() {
+        None
+    } else {
+        t.parse().ok()
+    }
 }
 
 pub fn write_csv(path: &Path, points: &[ValPoint]) -> Result<()> {
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).ok(); }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
     let mut s = String::from(HEADER);
     s.push('\n');
     for p in points {
@@ -148,12 +188,17 @@ pub fn read_csv(path: &Path) -> Result<Vec<ValPoint>> {
     let text = std::fs::read_to_string(path).map_err(|e| anyhow!("读估值缓存失败: {e}"))?;
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
-        if i == 0 || line.trim().is_empty() { continue; }
+        if i == 0 || line.trim().is_empty() {
+            continue;
+        }
         let c: Vec<&str> = line.split(',').collect();
-        if c.len() < 3 { continue; }
+        if c.len() < 3 {
+            continue;
+        }
         out.push(ValPoint {
             date: NaiveDate::parse_from_str(c[0], "%Y-%m-%d")?,
-            pe_ttm: num(c[1]), pb_mrq: num(c[2]),
+            pe_ttm: num(c[1]),
+            pb_mrq: num(c[2]),
         });
     }
     out.sort_by_key(|p| p.date);
@@ -172,7 +217,9 @@ pub fn load_or_fetch(input: &str, cache_dir: &Path, upto: NaiveDate) -> Result<V
         }
     }
     let fresh = fetch(&secid)?;
-    if fresh.is_empty() { return Err(anyhow!("股票 {input} 无估值历史")); }
+    if fresh.is_empty() {
+        return Err(anyhow!("股票 {input} 无估值历史"));
+    }
     write_csv(&path, &fresh)?;
     Ok(fresh)
 }
@@ -180,7 +227,9 @@ pub fn load_or_fetch(input: &str, cache_dir: &Path, upto: NaiveDate) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn d(y: i32, m: u32, day: u32) -> NaiveDate { NaiveDate::from_ymd_opt(y, m, day).unwrap() }
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
 
     /// 逐字取自 datacenter 实测响应（600519，回溯到 2018-01-02）
     const BODY: &str = r#"{"result":{"pages":689,"data":[
@@ -211,8 +260,14 @@ mod tests {
         let h: Vec<f64> = (1..=100).map(|i| i as f64).collect();
         // 30 大于 1..29 共 29 个 → 29/100
         assert!((percentile(&h, 30.0).unwrap() - 0.29).abs() < 1e-9);
-        assert!((percentile(&h, 1.0).unwrap() - 0.0).abs() < 1e-9, "史上最低 → 0");
-        assert!((percentile(&h, 101.0).unwrap() - 1.0).abs() < 1e-9, "高于所有历史 → 1");
+        assert!(
+            (percentile(&h, 1.0).unwrap() - 0.0).abs() < 1e-9,
+            "史上最低 → 0"
+        );
+        assert!(
+            (percentile(&h, 101.0).unwrap() - 1.0).abs() < 1e-9,
+            "高于所有历史 → 1"
+        );
     }
 
     #[test]
@@ -221,21 +276,40 @@ mod tests {
         // 巨亏股 PE=-0.42，若不剔除负值，排序后它会落在最低分位 → 被判定为「史上最便宜」
         let mut h: Vec<f64> = (10..=80).map(|i| i as f64).collect();
         h.push(-0.42);
-        assert_eq!(percentile(&h, -0.42), None, "负 PE 无分位可言，必须返回 None 而非 0");
+        assert_eq!(
+            percentile(&h, -0.42),
+            None,
+            "负 PE 无分位可言，必须返回 None 而非 0"
+        );
 
         // 负值也不能污染别人的分位：正常值的分位应只在正 PE 上算
         let with_neg = percentile(&h, 10.0).unwrap();
         let clean: Vec<f64> = (10..=80).map(|i| i as f64).collect();
         let without_neg = percentile(&clean, 10.0).unwrap();
-        assert!((with_neg - without_neg).abs() < 1e-9, "负值须被剔除，不参与分母");
+        assert!(
+            (with_neg - without_neg).abs() < 1e-9,
+            "负值须被剔除，不参与分母"
+        );
     }
 
     #[test]
     fn positive_filters_drop_losses_and_nulls() {
         let ps = vec![
-            ValPoint { date: d(2024,1,1), pe_ttm: Some(20.0), pb_mrq: Some(2.0) },
-            ValPoint { date: d(2024,1,2), pe_ttm: Some(-5.0), pb_mrq: Some(1.5) },
-            ValPoint { date: d(2024,1,3), pe_ttm: None, pb_mrq: None },
+            ValPoint {
+                date: d(2024, 1, 1),
+                pe_ttm: Some(20.0),
+                pb_mrq: Some(2.0),
+            },
+            ValPoint {
+                date: d(2024, 1, 2),
+                pe_ttm: Some(-5.0),
+                pb_mrq: Some(1.5),
+            },
+            ValPoint {
+                date: d(2024, 1, 3),
+                pe_ttm: None,
+                pb_mrq: None,
+            },
         ];
         assert_eq!(positive_pes(&ps), vec![20.0]);
         assert_eq!(positive_pbs(&ps), vec![2.0, 1.5]);
@@ -244,18 +318,39 @@ mod tests {
     #[test]
     fn at_or_before_backtracks_over_holidays() {
         let ps = vec![
-            ValPoint { date: d(2024,1,5), pe_ttm: Some(20.0), pb_mrq: Some(2.0) },
-            ValPoint { date: d(2024,1,8), pe_ttm: Some(21.0), pb_mrq: Some(2.1) },
+            ValPoint {
+                date: d(2024, 1, 5),
+                pe_ttm: Some(20.0),
+                pb_mrq: Some(2.0),
+            },
+            ValPoint {
+                date: d(2024, 1, 8),
+                pe_ttm: Some(21.0),
+                pb_mrq: Some(2.1),
+            },
         ];
         // 1/6、1/7 是周末 → 回溯到 1/5
-        assert_eq!(at_or_before(&ps, d(2024,1,7)).unwrap().date, d(2024,1,5));
-        assert_eq!(at_or_before(&ps, d(2024,1,8)).unwrap().date, d(2024,1,8));
-        assert!(at_or_before(&ps, d(2024,1,1)).is_none(), "早于全部历史 → None");
+        assert_eq!(
+            at_or_before(&ps, d(2024, 1, 7)).unwrap().date,
+            d(2024, 1, 5)
+        );
+        assert_eq!(
+            at_or_before(&ps, d(2024, 1, 8)).unwrap().date,
+            d(2024, 1, 8)
+        );
+        assert!(
+            at_or_before(&ps, d(2024, 1, 1)).is_none(),
+            "早于全部历史 → None"
+        );
     }
 
     #[test]
     fn csv_roundtrip() {
-        let ps = vec![ValPoint { date: d(2018,1,2), pe_ttm: Some(36.48), pb_mrq: None }];
+        let ps = vec![ValPoint {
+            date: d(2018, 1, 2),
+            pe_ttm: Some(36.48),
+            pb_mrq: None,
+        }];
         let tmp = std::env::temp_dir().join("xlh_valuation_test.csv");
         write_csv(&tmp, &ps).unwrap();
         let back = read_csv(&tmp).unwrap();
@@ -266,15 +361,30 @@ mod tests {
 
     #[test]
     fn hk_and_us_have_no_valuation_history() {
-        assert!(fetch(&Secid { market: 116, code: "00700".into() }).is_err(), "港股无估值表");
-        assert!(fetch(&Secid { market: 105, code: "AAPL".into() }).is_err());
+        assert!(
+            fetch(&Secid {
+                market: 116,
+                code: "00700".into()
+            })
+            .is_err(),
+            "港股无估值表"
+        );
+        assert!(fetch(&Secid {
+            market: 105,
+            code: "AAPL".into()
+        })
+        .is_err());
     }
 
     /// 实网测试：`cargo test -- --ignored`
     #[test]
     #[ignore]
     fn live_fetch_moutai_valuation_history() {
-        let ps = fetch(&Secid { market: 1, code: "600519".into() }).expect("抓茅台估值历史");
+        let ps = fetch(&Secid {
+            market: 1,
+            code: "600519".into(),
+        })
+        .expect("抓茅台估值历史");
         assert!(ps.len() > 1500, "应有 2000+ 个交易日，实得 {}", ps.len());
 
         let pes = positive_pes(&ps);
@@ -285,7 +395,13 @@ mod tests {
 
         let lo = pes.iter().cloned().fold(f64::INFINITY, f64::min);
         let hi = pes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        println!("茅台估值历史 {} 天（{} → {}），PE_TTM 区间 {lo:.2}~{hi:.2}，当前 {:.2}（分位 {:.1}%）",
-                 ps.len(), ps[0].date, last.date, last.pe_ttm.unwrap(), pct * 100.0);
+        println!(
+            "茅台估值历史 {} 天（{} → {}），PE_TTM 区间 {lo:.2}~{hi:.2}，当前 {:.2}（分位 {:.1}%）",
+            ps.len(),
+            ps[0].date,
+            last.date,
+            last.pe_ttm.unwrap(),
+            pct * 100.0
+        );
     }
 }

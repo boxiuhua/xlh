@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Result};
+use crate::broker::FeeModel;
 use crate::config::{build_strategy_from, OptimizeCfg};
 use crate::data::NavPoint;
 use crate::runner::{run_one, RunOutcome};
-use crate::broker::FeeModel;
+use anyhow::{anyhow, Result};
 
 /// 把 {参数名 -> 值数组} 的网格展开成每个组合一个 `toml::Value::Table`。
 /// 笛卡尔积按 grid 键的字典序（BTreeMap 迭代序）稳定展开。
@@ -16,7 +16,11 @@ pub fn expand_grid(grid: &toml::Table) -> Result<Vec<toml::Value>> {
         match v {
             toml::Value::Array(arr) if !arr.is_empty() => dims.push((k, arr)),
             toml::Value::Array(_) => return Err(anyhow!("optimize.grid 参数 {k} 的取值数组为空")),
-            _ => return Err(anyhow!("optimize.grid 参数 {k} 必须是数组，例如 {k} = [..]")),
+            _ => {
+                return Err(anyhow!(
+                    "optimize.grid 参数 {k} 必须是数组，例如 {k} = [..]"
+                ))
+            }
         }
     }
     // 笛卡尔积
@@ -93,8 +97,15 @@ fn make_label(combo: &toml::Value, varying: &[String], idx: usize) -> String {
     if varying.is_empty() {
         return format!("#{}", idx + 1);
     }
-    varying.iter()
-        .map(|k| format!("{}={}", k, t.get(k).map(|v| v.to_string()).unwrap_or_default()))
+    varying
+        .iter()
+        .map(|k| {
+            format!(
+                "{}={}",
+                k,
+                t.get(k).map(|v| v.to_string()).unwrap_or_default()
+            )
+        })
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -121,12 +132,17 @@ pub fn run_optimize(
     initial_cash: f64,
 ) -> Result<OptReport> {
     if !METRICS.contains(&cfg.metric.as_str()) {
-        return Err(anyhow!("未知排序 metric: {}，合法取值: {:?}", cfg.metric, METRICS));
+        return Err(anyhow!(
+            "未知排序 metric: {}，合法取值: {:?}",
+            cfg.metric,
+            METRICS
+        ));
     }
     let combos = expand_grid(&cfg.grid)?;
     let n_combos = combos.len();
     let param_keys: Vec<String> = cfg.grid.keys().cloned().collect();
-    let varying: Vec<String> = param_keys.iter()
+    let varying: Vec<String> = param_keys
+        .iter()
         .filter(|k| matches!(cfg.grid.get(k.as_str()), Some(toml::Value::Array(a)) if a.len() > 1))
         .cloned()
         .collect();
@@ -141,23 +157,51 @@ pub fn run_optimize(
     let mut ranked = Vec::with_capacity(n_combos);
     for (i, combo) in combos.into_iter().enumerate() {
         let label = make_label(&combo, &varying, i);
-        let mk = || build_strategy_from(&cfg.strategy, &Some(combo.clone()), &cfg.rules)
-            .map_err(|e| anyhow!("组合 [{label}] 构建策略失败: {e}"));
+        let mk = || {
+            build_strategy_from(&cfg.strategy, &Some(combo.clone()), &cfg.rules)
+                .map_err(|e| anyhow!("组合 [{label}] 构建策略失败: {e}"))
+        };
 
-        let outcome = run_one(label.clone(), fund_code.to_string(), train.to_vec(),
-                              mk()?, fee.clone(), initial_cash);
+        let outcome = run_one(
+            label.clone(),
+            fund_code.to_string(),
+            train.to_vec(),
+            mk()?,
+            fee.clone(),
+            initial_cash,
+        );
         // 检验段用**同一组参数**重跑一遍（策略是有状态的，必须重新构建）
-        let oos = test.map(|te| run_one(label.clone(), fund_code.to_string(), te.to_vec(),
-                                        mk().expect("参数已校验"), fee.clone(), initial_cash));
-        ranked.push(OptOutcome { params: combo, label, outcome, oos });
+        let oos = test.map(|te| {
+            run_one(
+                label.clone(),
+                fund_code.to_string(),
+                te.to_vec(),
+                mk().expect("参数已校验"),
+                fee.clone(),
+                initial_cash,
+            )
+        });
+        ranked.push(OptOutcome {
+            params: combo,
+            label,
+            outcome,
+            oos,
+        });
     }
 
     // 排序用**训练段**指标 —— 这正是真实的参数选择过程：挑参数时你看不到检验段。
     // 若改用检验段排序，就等于在检验集上挑赢家，检验段的成绩也就不再无偏（winner's curse）。
     let descending = cfg.metric != "max_drawdown";
     ranked.sort_by(|a, b| {
-        let (va, vb) = (metric_value(&a.outcome.summary, &cfg.metric), metric_value(&b.outcome.summary, &cfg.metric));
-        if descending { vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal) } else { va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal) }
+        let (va, vb) = (
+            metric_value(&a.outcome.summary, &cfg.metric),
+            metric_value(&b.outcome.summary, &cfg.metric),
+        );
+        if descending {
+            vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
+        } else {
+            va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
+        }
     });
 
     Ok(OptReport {
@@ -182,14 +226,20 @@ fn build_caveat(n_combos: usize, has_oos: bool, ranked: &[OptOutcome], metric: &
              下列全部为「in-sample（样本内）」结果：参数是在这同一段数据上挑出来的，\
              绩效也是在这同一段上算的 —— 这是纯粹的数据窥探，那个\"最优\"值是 {} 个组合里\
              argmax 出来的最大值，不可外推、不代表任何预期收益。请拉长时间区间后重试。",
-            crate::recommend::MIN_TRAIN, crate::recommend::MIN_TEST, n_combos));
+            crate::recommend::MIN_TRAIN,
+            crate::recommend::MIN_TEST,
+            n_combos
+        ));
         return s;
     }
 
     s.push_str(&format!(
         "参数在「训练段」（前 {:.0}%）上从 {} 个组合里选出，绩效在「检验段」（后 {:.0}%，\
          选参数时未见过）上实测。请只看检验段的数字做判断。",
-        SPLIT_RATIO * 100.0, n_combos, (1.0 - SPLIT_RATIO) * 100.0));
+        SPLIT_RATIO * 100.0,
+        n_combos,
+        (1.0 - SPLIT_RATIO) * 100.0
+    ));
 
     // 把过拟合的量级直接算给用户看
     if let Some(best) = ranked.first() {
@@ -198,11 +248,18 @@ fn build_caveat(n_combos: usize, has_oos: bool, ranked: &[OptOutcome], metric: &
             let oos_v = metric_value(&oos.summary, metric);
             s.push_str(&format!(
                 "\n本次最优组合 [{}] 的 {metric}：训练段 {:.3} → 检验段 {:.3}。",
-                best.label, is_v, oos_v));
+                best.label, is_v, oos_v
+            ));
             // max_drawdown 越小越好，方向相反
-            let degraded = if metric == "max_drawdown" { oos_v > is_v } else { oos_v < is_v };
+            let degraded = if metric == "max_drawdown" {
+                oos_v > is_v
+            } else {
+                oos_v < is_v
+            };
             if degraded {
-                s.push_str("训练段明显更好看 —— 这个落差就是过拟合的量度，是挑参数这个动作本身造出来的。");
+                s.push_str(
+                    "训练段明显更好看 —— 这个落差就是过拟合的量度，是挑参数这个动作本身造出来的。",
+                );
             }
         }
     }
@@ -210,7 +267,8 @@ fn build_caveat(n_combos: usize, has_oos: bool, ranked: &[OptOutcome], metric: &
     if n_combos > 50 {
         s.push_str(&format!(
             "\n⚠ 你搜了 {n_combos} 个组合。组合越多，仅靠运气就能在训练段跑出漂亮数字的\
-             概率越高（多重比较问题）—— 训练段的\"最优\"很可能只是噪声。"));
+             概率越高（多重比较问题）—— 训练段的\"最优\"很可能只是噪声。"
+        ));
     }
     s
 }
@@ -218,29 +276,47 @@ fn build_caveat(n_combos: usize, has_oos: bool, ranked: &[OptOutcome], metric: &
 #[cfg(test)]
 mod overfit_guard_tests {
     use super::*;
-    use crate::config::OptimizeCfg;
     use crate::broker::SellTier;
+    use crate::config::OptimizeCfg;
     use chrono::NaiveDate;
 
     fn pts(n: usize) -> Vec<NavPoint> {
-        (0..n).map(|i| {
-            let nav = 1.0 + (i as f64) * 0.001;
-            NavPoint {
-                date: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap() + chrono::Duration::days(i as i64),
-                nav, acc_nav: nav,
-            }
-        }).collect()
+        (0..n)
+            .map(|i| {
+                let nav = 1.0 + (i as f64) * 0.001;
+                NavPoint {
+                    date: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap()
+                        + chrono::Duration::days(i as i64),
+                    nav,
+                    acc_nav: nav,
+                }
+            })
+            .collect()
     }
 
     fn cfg(values: Vec<i64>) -> OptimizeCfg {
         let mut grid = toml::Table::new();
         // smart_dca 的必填参数（固定值放单元素数组，只让 ma_window 变化）
-        grid.insert("period".into(), toml::Value::Array(vec![toml::Value::String("monthly".into())]));
-        grid.insert("day".into(), toml::Value::Array(vec![toml::Value::Integer(1)]));
-        grid.insert("base_amount".into(), toml::Value::Array(vec![toml::Value::Float(1000.0)]));
-        grid.insert("k".into(), toml::Value::Array(vec![toml::Value::Float(1.0)]));
-        grid.insert("ma_window".into(),
-                    toml::Value::Array(values.into_iter().map(toml::Value::Integer).collect()));
+        grid.insert(
+            "period".into(),
+            toml::Value::Array(vec![toml::Value::String("monthly".into())]),
+        );
+        grid.insert(
+            "day".into(),
+            toml::Value::Array(vec![toml::Value::Integer(1)]),
+        );
+        grid.insert(
+            "base_amount".into(),
+            toml::Value::Array(vec![toml::Value::Float(1000.0)]),
+        );
+        grid.insert(
+            "k".into(),
+            toml::Value::Array(vec![toml::Value::Float(1.0)]),
+        );
+        grid.insert(
+            "ma_window".into(),
+            toml::Value::Array(values.into_iter().map(toml::Value::Integer).collect()),
+        );
         OptimizeCfg {
             strategy: "smart_dca".into(),
             metric: "total_return".into(),
@@ -251,7 +327,13 @@ mod overfit_guard_tests {
     }
 
     fn fee() -> FeeModel {
-        FeeModel { buy_rate: 0.0, sell_tiers: vec![SellTier { max_days: 0, rate: 0.0 }] }
+        FeeModel {
+            buy_rate: 0.0,
+            sell_tiers: vec![SellTier {
+                max_days: 0,
+                rate: 0.0,
+            }],
+        }
     }
 
     /// 寻优必须在训练段选参数、在检验段实测 —— 而不是在同一段上既选又报。
@@ -261,14 +343,23 @@ mod overfit_guard_tests {
 
         assert_eq!(r.split_ratio, Some(SPLIT_RATIO), "数据充足时必须切分");
         assert_eq!(r.combos, 3);
-        assert!(r.ranked.iter().all(|o| o.oos.is_some()), "每个组合都要有检验段实测");
+        assert!(
+            r.ranked.iter().all(|o| o.oos.is_some()),
+            "每个组合都要有检验段实测"
+        );
 
         // 检验段绝不能与训练段是同一段数据（否则切分形同虚设）
         let best = &r.ranked[0];
         let tr_days = best.outcome.daily.len();
         let te_days = best.oos.as_ref().unwrap().daily.len();
-        assert!(tr_days > te_days && te_days > 0, "训练 {tr_days} 天 / 检验 {te_days} 天");
-        assert!((tr_days + te_days).abs_diff(400) <= 1, "两段合起来应覆盖全样本");
+        assert!(
+            tr_days > te_days && te_days > 0,
+            "训练 {tr_days} 天 / 检验 {te_days} 天"
+        );
+        assert!(
+            (tr_days + te_days).abs_diff(400) <= 1,
+            "两段合起来应覆盖全样本"
+        );
     }
 
     /// 警示是这个 tab 的核心产出之一 —— 它天然会被当成"可用的最优参数"，不警示就是误导。
@@ -283,7 +374,7 @@ mod overfit_guard_tests {
     /// 组合数多 → 多重比较问题，必须额外点名。
     #[test]
     fn warns_louder_when_the_grid_is_large() {
-        let many: Vec<i64> = (5..=60).collect();      // 56 个组合
+        let many: Vec<i64> = (5..=60).collect(); // 56 个组合
         let r = run_optimize(&cfg(many), "161725", &pts(400), fee(), 0.0).unwrap();
         assert!(r.combos > 50);
         assert!(r.caveat.contains("多重比较"), "大网格须点名多重比较问题");
@@ -295,10 +386,16 @@ mod overfit_guard_tests {
         let r = run_optimize(&cfg(vec![10, 20]), "161725", &pts(100), fee(), 0.0).unwrap();
         assert_eq!(r.split_ratio, None);
         assert!(r.ranked.iter().all(|o| o.oos.is_none()));
-        assert!(r.caveat.contains("in-sample") || r.caveat.contains("样本内"),
-                "须明说是样本内: {}", r.caveat);
-        assert!(r.caveat.contains("数据窥探") || r.caveat.contains("不可外推"),
-                "须说清后果: {}", r.caveat);
+        assert!(
+            r.caveat.contains("in-sample") || r.caveat.contains("样本内"),
+            "须明说是样本内: {}",
+            r.caveat
+        );
+        assert!(
+            r.caveat.contains("数据窥探") || r.caveat.contains("不可外推"),
+            "须说清后果: {}",
+            r.caveat
+        );
     }
 }
 
@@ -310,20 +407,43 @@ mod tests {
     use crate::data::NavPoint;
     use chrono::NaiveDate;
 
-    fn d(y: i32, m: u32, day: u32) -> NaiveDate { NaiveDate::from_ymd_opt(y, m, day).unwrap() }
-    fn no_fee() -> FeeModel { FeeModel { buy_rate: 0.0, sell_tiers: vec![SellTier { max_days: 0, rate: 0.0 }] } }
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+    fn no_fee() -> FeeModel {
+        FeeModel {
+            buy_rate: 0.0,
+            sell_tiers: vec![SellTier {
+                max_days: 0,
+                rate: 0.0,
+            }],
+        }
+    }
 
     fn sample_points() -> Vec<NavPoint> {
         vec![
-            NavPoint { date: d(2024, 1, 1), nav: 1.0, acc_nav: 1.0 },
-            NavPoint { date: d(2024, 2, 1), nav: 1.0, acc_nav: 1.0 },
-            NavPoint { date: d(2024, 2, 15), nav: 2.0, acc_nav: 2.0 },
+            NavPoint {
+                date: d(2024, 1, 1),
+                nav: 1.0,
+                acc_nav: 1.0,
+            },
+            NavPoint {
+                date: d(2024, 2, 1),
+                nav: 1.0,
+                acc_nav: 1.0,
+            },
+            NavPoint {
+                date: d(2024, 2, 15),
+                nav: 2.0,
+                acc_nav: 2.0,
+            },
         ]
     }
 
     // grid: smart_dca，ma_window 取两值（其余固定单值）
     fn smart_dca_cfg(metric: &str) -> OptimizeCfg {
-        let toml_text = format!(r#"
+        let toml_text = format!(
+            r#"
 strategy = "smart_dca"
 metric = "{metric}"
 [grid]
@@ -332,7 +452,8 @@ day = [1]
 base_amount = [1000.0]
 ma_window = [1, 2]
 k = [1.0]
-"#);
+"#
+        );
         toml::from_str(&toml_text).unwrap()
     }
 
@@ -341,14 +462,27 @@ k = [1.0]
         let cfg = smart_dca_cfg("total_return");
         let report = run_optimize(&cfg, "161725", &sample_points(), no_fee(), 0.0).unwrap();
         assert_eq!(report.ranked.len(), 2, "ma_window 两值 → 2 组合");
-        assert_eq!(report.param_keys, vec!["base_amount", "day", "k", "ma_window", "period"],
-            "param_keys 按字典序");
+        assert_eq!(
+            report.param_keys,
+            vec!["base_amount", "day", "k", "ma_window", "period"],
+            "param_keys 按字典序"
+        );
         // total_return 降序：第一个 >= 第二个
-        assert!(report.ranked[0].outcome.summary.total_return
-            >= report.ranked[1].outcome.summary.total_return);
+        assert!(
+            report.ranked[0].outcome.summary.total_return
+                >= report.ranked[1].outcome.summary.total_return
+        );
         // label 只含变化维度 ma_window
-        assert!(report.ranked[0].label.contains("ma_window"), "label: {}", report.ranked[0].label);
-        assert!(!report.ranked[0].label.contains("period"), "固定维度不入 label: {}", report.ranked[0].label);
+        assert!(
+            report.ranked[0].label.contains("ma_window"),
+            "label: {}",
+            report.ranked[0].label
+        );
+        assert!(
+            !report.ranked[0].label.contains("period"),
+            "固定维度不入 label: {}",
+            report.ranked[0].label
+        );
     }
 
     #[test]
@@ -356,21 +490,32 @@ k = [1.0]
         let cfg = smart_dca_cfg("max_drawdown");
         let report = run_optimize(&cfg, "161725", &sample_points(), no_fee(), 0.0).unwrap();
         // max_drawdown 越小越优 → 升序：第一个 <= 第二个
-        assert!(report.ranked[0].outcome.summary.max_drawdown
-            <= report.ranked[1].outcome.summary.max_drawdown);
+        assert!(
+            report.ranked[0].outcome.summary.max_drawdown
+                <= report.ranked[1].outcome.summary.max_drawdown
+        );
     }
 
     #[test]
     fn rejects_bad_metric() {
         let cfg = smart_dca_cfg("bogus");
         let err = run_optimize(&cfg, "161725", &sample_points(), no_fee(), 0.0).unwrap_err();
-        assert!(err.to_string().contains("metric"), "error should mention metric: {err}");
+        assert!(
+            err.to_string().contains("metric"),
+            "error should mention metric: {err}"
+        );
     }
 
     fn arr_table() -> toml::Table {
         let mut t = toml::Table::new();
-        t.insert("a".into(), toml::Value::Array(vec![toml::Value::Integer(1), toml::Value::Integer(2)]));
-        t.insert("b".into(), toml::Value::Array(vec![toml::Value::String("x".into())]));
+        t.insert(
+            "a".into(),
+            toml::Value::Array(vec![toml::Value::Integer(1), toml::Value::Integer(2)]),
+        );
+        t.insert(
+            "b".into(),
+            toml::Value::Array(vec![toml::Value::String("x".into())]),
+        );
         t
     }
 
@@ -385,15 +530,28 @@ k = [1.0]
             assert_eq!(t["b"].as_str(), Some("x"));
         }
         // a 取值覆盖 1 和 2
-        let a_vals: Vec<i64> = combos.iter().map(|c| c.as_table().unwrap()["a"].as_integer().unwrap()).collect();
+        let a_vals: Vec<i64> = combos
+            .iter()
+            .map(|c| c.as_table().unwrap()["a"].as_integer().unwrap())
+            .collect();
         assert!(a_vals.contains(&1) && a_vals.contains(&2));
     }
 
     #[test]
     fn expands_multiple_varying_dims() {
         let mut t = toml::Table::new();
-        t.insert("a".into(), toml::Value::Array(vec![toml::Value::Integer(1), toml::Value::Integer(2)]));
-        t.insert("b".into(), toml::Value::Array(vec![toml::Value::Integer(1), toml::Value::Integer(2), toml::Value::Integer(3)]));
+        t.insert(
+            "a".into(),
+            toml::Value::Array(vec![toml::Value::Integer(1), toml::Value::Integer(2)]),
+        );
+        t.insert(
+            "b".into(),
+            toml::Value::Array(vec![
+                toml::Value::Integer(1),
+                toml::Value::Integer(2),
+                toml::Value::Integer(3),
+            ]),
+        );
         let combos = expand_grid(&t).unwrap();
         assert_eq!(combos.len(), 6, "2x3 = 6 combos");
         // 所有组合两两不同（(a,b) 对去重后仍是 6）
@@ -411,7 +569,10 @@ k = [1.0]
         let mut t = toml::Table::new();
         t.insert("a".into(), toml::Value::Integer(1)); // 非数组
         let err = expand_grid(&t).unwrap_err();
-        assert!(err.to_string().contains("a"), "error should name param a: {err}");
+        assert!(
+            err.to_string().contains("a"),
+            "error should name param a: {err}"
+        );
     }
 
     #[test]
@@ -419,12 +580,18 @@ k = [1.0]
         let mut t = toml::Table::new();
         t.insert("a".into(), toml::Value::Array(vec![]));
         let err = expand_grid(&t).unwrap_err();
-        assert!(err.to_string().contains("a"), "error should name param a: {err}");
+        assert!(
+            err.to_string().contains("a"),
+            "error should name param a: {err}"
+        );
     }
 
     #[test]
     fn rejects_empty_grid() {
         let err = expand_grid(&toml::Table::new()).unwrap_err();
-        assert!(err.to_string().contains("grid"), "error should mention grid: {err}");
+        assert!(
+            err.to_string().contains("grid"),
+            "error should mention grid: {err}"
+        );
     }
 }

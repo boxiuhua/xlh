@@ -1,18 +1,22 @@
 //! 定时推送模块：按 cron 定时同步基金净值，生成持仓建议 + 诊断，推送到
 //! 钉钉/飞书/企业微信 群机器人或 Server酱（个人微信）。
-pub mod config;
-pub mod store;
-pub mod message;
 pub mod channels;
-pub mod stock_advice;
-pub mod schedule;
+pub mod config;
 pub mod job;
+pub mod message;
+pub mod schedule;
+pub mod stock_advice;
+pub mod store;
 
 pub use config::{load, PushConfig};
 pub use job::build_message;
 use rusqlite::Connection;
 
-pub fn run_once(cfg: &PushConfig, hist: Option<&Connection>, user_id: Option<i64>) -> anyhow::Result<()> {
+pub fn run_once(
+    cfg: &PushConfig,
+    hist: Option<&Connection>,
+    user_id: Option<i64>,
+) -> anyhow::Result<()> {
     job::run_forced(cfg, hist, user_id)
 }
 

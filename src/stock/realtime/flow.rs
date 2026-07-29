@@ -19,9 +19,9 @@
 //!
 //! 本模块失败**不得**影响榜单产出。资金流是佐证，佐证拿不到不影响价量
 //! 主判定成立。调用方应把资金流留空并照常出榜。
-use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 
 /// 一只股票的资金流。
 #[derive(Debug, Clone, PartialEq)]
@@ -37,15 +37,23 @@ pub struct Flow {
 }
 
 #[derive(Deserialize)]
-struct Resp { data: Option<Data> }
+struct Resp {
+    data: Option<Data>,
+}
 #[derive(Deserialize)]
-struct Data { #[serde(default)] diff: Option<Diff> }
+struct Data {
+    #[serde(default)]
+    diff: Option<Diff>,
+}
 
 /// `diff` 形状随参数而变：数组或 `{"0":{...}}` 的 map。两种都接住。
 /// 同 `universe.rs:193` 的处理。
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum Diff { List(Vec<Row>), Map(HashMap<String, Row>) }
+enum Diff {
+    List(Vec<Row>),
+    Map(HashMap<String, Row>),
+}
 
 impl Diff {
     fn into_rows(self) -> Vec<Row> {
@@ -60,20 +68,30 @@ impl Diff {
 /// 变体顺序有意义：先试 Num，落不进去的由 Other 兜住。同 `universe.rs:214`。
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum Cell { Num(f64), Other(serde::de::IgnoredAny) }
+enum Cell {
+    Num(f64),
+    Other(serde::de::IgnoredAny),
+}
 
 impl Cell {
     fn num(&self) -> Option<f64> {
-        match self { Cell::Num(v) => Some(*v), Cell::Other(_) => None }
+        match self {
+            Cell::Num(v) => Some(*v),
+            Cell::Other(_) => None,
+        }
     }
 }
 
 #[derive(Deserialize)]
 struct Row {
-    #[serde(rename = "f12")] code: String,
-    #[serde(rename = "f14")] name: String,
-    #[serde(rename = "f62")] main_net: Option<Cell>,
-    #[serde(rename = "f184")] main_net_pct: Option<Cell>,
+    #[serde(rename = "f12")]
+    code: String,
+    #[serde(rename = "f14")]
+    name: String,
+    #[serde(rename = "f62")]
+    main_net: Option<Cell>,
+    #[serde(rename = "f184")]
+    main_net_pct: Option<Cell>,
 }
 
 /// 东财单次 secids 上限。保守取值：候选股通常只有几十只，用不到上限，
@@ -88,21 +106,28 @@ pub const BATCH: usize = 200;
 /// 只能靠调用方带对参数 + 哨兵测试守住。
 pub fn parse(body: &str) -> Result<Vec<Flow>> {
     let resp: Resp = serde_json::from_str(body).map_err(|e| anyhow!("解析资金流JSON失败: {e}"))?;
-    let rows = resp.data.and_then(|d| d.diff).map(|d| d.into_rows()).unwrap_or_default();
-    Ok(rows.into_iter().filter_map(|r| {
-        // 资金流缺失的标的（停牌等）直接丢弃：调用方会把它当「资金流不可用」，
-        // 那是正确的语义 —— 强行填 0 会伪造出「主力零流入」的假事实
-        let main_net = r.main_net.as_ref().and_then(|c| c.num())?;
-        let pct = r.main_net_pct.as_ref().and_then(|c| c.num())?;
-        Some(Flow {
-            code: r.code,
-            name: r.name.trim().replace(['　', ' '], ""),
-            main_net,
-            // f184 是百分数（-1.32 = -1.32%），配置里的阈值是小数（0.05 = 5%）。
-            // 忘了这一步，5% 的阈值会被当成 500%，背离标记永远不触发且完全静默。
-            main_net_pct: pct / 100.0,
+    let rows = resp
+        .data
+        .and_then(|d| d.diff)
+        .map(|d| d.into_rows())
+        .unwrap_or_default();
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            // 资金流缺失的标的（停牌等）直接丢弃：调用方会把它当「资金流不可用」，
+            // 那是正确的语义 —— 强行填 0 会伪造出「主力零流入」的假事实
+            let main_net = r.main_net.as_ref().and_then(|c| c.num())?;
+            let pct = r.main_net_pct.as_ref().and_then(|c| c.num())?;
+            Some(Flow {
+                code: r.code,
+                name: r.name.trim().replace(['　', ' '], ""),
+                main_net,
+                // f184 是百分数（-1.32 = -1.32%），配置里的阈值是小数（0.05 = 5%）。
+                // 忘了这一步，5% 的阈值会被当成 500%，背离标记永远不触发且完全静默。
+                main_net_pct: pct / 100.0,
+            })
         })
-    }).collect())
+        .collect())
 }
 
 /// 抓候选股资金流。`secids` 形如 `["1.600519", "0.000001"]`。
@@ -128,19 +153,25 @@ fn client() -> Result<reqwest::blocking::Client> {
 }
 
 pub fn fetch(secids: &[String]) -> Result<Vec<Flow>> {
-    if secids.is_empty() { return Ok(Vec::new()) }
+    if secids.is_empty() {
+        return Ok(Vec::new());
+    }
     let c = client()?;
     let mut all = Vec::with_capacity(secids.len());
     for (i, chunk) in secids.chunks(BATCH).enumerate() {
-        if i > 0 { std::thread::sleep(std::time::Duration::from_millis(300)); }
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
         let url = format!(
             "https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&secids={}&fields=f12,f14,f2,f3,f6,f62,f184",
             chunk.join(","));
         // 单发不重试 —— 见上方注释
-        let body = c.get(&url)
+        let body = c
+            .get(&url)
             .header("Referer", "https://quote.eastmoney.com/")
             .header("User-Agent", "Mozilla/5.0")
-            .send().and_then(|r| r.text())
+            .send()
+            .and_then(|r| r.text())
             .map_err(|e| anyhow!("资金流请求失败（东财可能限流）: {e}"))?;
         all.extend(parse(&body)?);
     }
@@ -166,16 +197,25 @@ mod tests {
         // 验算：f62 -79273120 元 ÷ f6 5987570858 元 = -1.324% ✓
         let f = parse(RESP).unwrap();
         let mt = f.iter().find(|f| f.code == "600519").unwrap();
-        assert!((mt.main_net_pct - (-0.0132)).abs() < 1e-9,
-            "f184 须 ÷100 转小数，实得 {}", mt.main_net_pct);
-        assert!(mt.main_net_pct.abs() < 1.0, "小数口径下占比不可能超过 1.0（100%）");
+        assert!(
+            (mt.main_net_pct - (-0.0132)).abs() < 1e-9,
+            "f184 须 ÷100 转小数，实得 {}",
+            mt.main_net_pct
+        );
+        assert!(
+            mt.main_net_pct.abs() < 1.0,
+            "小数口径下占比不可能超过 1.0（100%）"
+        );
     }
 
     #[test]
     fn main_net_stays_in_yuan() {
         let f = parse(RESP).unwrap();
         let mt = f.iter().find(|f| f.code == "600519").unwrap();
-        assert!((mt.main_net - (-79_273_120.0)).abs() < 1.0, "净流入额是元，不做换算");
+        assert!(
+            (mt.main_net - (-79_273_120.0)).abs() < 1.0,
+            "净流入额是元，不做换算"
+        );
     }
 
     #[test]
@@ -186,8 +226,12 @@ mod tests {
         let pa = f.iter().find(|f| f.code == "000001").unwrap();
         let amount = 864_435_895.0_f64;
         let derived = pa.main_net / amount;
-        assert!((derived - pa.main_net_pct).abs() < 1e-3,
-            "f62/f6={:.5} 应约等于 f184/100={:.5}", derived, pa.main_net_pct);
+        assert!(
+            (derived - pa.main_net_pct).abs() < 1e-3,
+            "f62/f6={:.5} 应约等于 f184/100={:.5}",
+            derived,
+            pa.main_net_pct
+        );
     }
 
     #[test]
@@ -202,7 +246,10 @@ mod tests {
     fn names_are_utf8_and_trimmed() {
         // 东财这里给 UTF-8 名称，正好补上腾讯（GBK，我们不取名）缺的那块
         let f = parse(RESP).unwrap();
-        assert_eq!(f.iter().find(|f| f.code == "600519").unwrap().name, "贵州茅台");
+        assert_eq!(
+            f.iter().find(|f| f.code == "600519").unwrap().name,
+            "贵州茅台"
+        );
     }
 
     #[test]
@@ -216,7 +263,8 @@ mod tests {
     #[test]
     fn map_shaped_diff_is_accepted() {
         // diff 形状随参数而变（数组 or map），两种都得接住
-        let body = r#"{"data":{"diff":{"0":{"f12":"600519","f14":"贵州茅台","f62":100.0,"f184":2.0}}}}"#;
+        let body =
+            r#"{"data":{"diff":{"0":{"f12":"600519","f14":"贵州茅台","f62":100.0,"f184":2.0}}}}"#;
         let f = parse(body).unwrap();
         assert_eq!(f.len(), 1);
         assert!((f[0].main_net_pct - 0.02).abs() < 1e-9);
@@ -246,12 +294,21 @@ mod tests {
         let f = fetch(&["1.600519".to_string(), "0.000001".to_string()]).unwrap();
         assert!(!f.is_empty(), "实网应返回数据（若为空可能已被封禁）");
         for x in &f {
-            println!("{} {} 主力净流入={:.0}元 占比={:.2}%", x.code, x.name, x.main_net, x.main_net_pct * 100.0);
+            println!(
+                "{} {} 主力净流入={:.0}元 占比={:.2}%",
+                x.code,
+                x.name,
+                x.main_net,
+                x.main_net_pct * 100.0
+            );
             // 量纲哨兵：小数口径下占比的绝对值不可能超过 1.0。
             // 若 fltt=2 失效返回定点整数，这里会得到 ±1.32 而非 ±0.0132 → 炸
-            assert!(x.main_net_pct.abs() < 1.0,
+            assert!(
+                x.main_net_pct.abs() < 1.0,
                 "{} 占比 {} 超出小数口径 —— fltt=2 可能已失效，东财改回了 ×100 定点整数",
-                x.code, x.main_net_pct);
+                x.code,
+                x.main_net_pct
+            );
         }
     }
 }

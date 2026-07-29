@@ -61,8 +61,12 @@ impl Exclusion {
     pub fn reason(&self) -> String {
         match self {
             Self::RiskyShell => "ST/退市/PT 壳股：财务数据失真、流动性枯竭".into(),
-            Self::LossMaking => "近四季度归母净利为负：该组历史平均最大回撤近38%，显著劣于有盈利支撑组".into(),
-            Self::InsufficientHistory { years } => format!("财报历史仅 {years} 年，不足以判断经营持续性"),
+            Self::LossMaking => {
+                "近四季度归母净利为负：该组历史平均最大回撤近38%，显著劣于有盈利支撑组".into()
+            }
+            Self::InsufficientHistory { years } => {
+                format!("财报历史仅 {years} 年，不足以判断经营持续性")
+            }
             Self::TooSmall => "市值低于下限：小微盘财报噪声与操纵风险显著上升".into(),
             Self::NoValuation => "缺少估值数据（停牌或数据缺失）".into(),
         }
@@ -126,20 +130,30 @@ pub struct Profile {
 
 /// 复合年均增长率 %。首尾任一为非正 → None（负数开根号无意义）。
 pub fn cagr(first: f64, last: f64, years: f64) -> Option<f64> {
-    if first <= 0.0 || last <= 0.0 || years <= 0.0 { return None; }
+    if first <= 0.0 || last <= 0.0 || years <= 0.0 {
+        return None;
+    }
     Some(((last / first).powf(1.0 / years) - 1.0) * 100.0)
 }
 
 fn median(mut xs: Vec<f64>) -> Option<f64> {
-    if xs.is_empty() { return None; }
+    if xs.is_empty() {
+        return None;
+    }
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = xs.len();
-    Some(if n.is_multiple_of(2) { (xs[n/2 - 1] + xs[n/2]) / 2.0 } else { xs[n/2] })
+    Some(if n.is_multiple_of(2) {
+        (xs[n / 2 - 1] + xs[n / 2]) / 2.0
+    } else {
+        xs[n / 2]
+    })
 }
 
 /// 从最近年报往回数，ROE 连续 ≥ `floor`% 的年数。
 fn roe_streak(annuals: &[&FinReport], floor: f64) -> usize {
-    annuals.iter().rev()
+    annuals
+        .iter()
+        .rev()
         .take_while(|r| r.roe.map(|v| v >= floor).unwrap_or(false))
         .count()
 }
@@ -150,7 +164,11 @@ fn roe_streak(annuals: &[&FinReport], floor: f64) -> usize {
 /// 直接看它的符号即可判断「今年到目前为止是否亏损」。这里采用更保守的口径：
 /// 最新一期累计净利 < 0 即视为亏损。
 fn is_loss_making(reports: &[FinReport]) -> bool {
-    reports.last().and_then(|r| r.net_profit).map(|v| v < 0.0).unwrap_or(false)
+    reports
+        .last()
+        .and_then(|r| r.net_profit)
+        .map(|v| v < 0.0)
+        .unwrap_or(false)
 }
 
 /// 对单只股票做排除判定 + 质量画像。
@@ -163,16 +181,24 @@ pub fn evaluate(
     vals: &[ValPoint],
     p: &ScreenParams,
 ) -> Result<Profile, Exclusion> {
-    if listing.is_risky_shell() { return Err(Exclusion::RiskyShell); }
+    if listing.is_risky_shell() {
+        return Err(Exclusion::RiskyShell);
+    }
 
     let cap = listing.market_cap.ok_or(Exclusion::NoValuation)?;
-    if cap < p.min_market_cap { return Err(Exclusion::TooSmall); }
+    if cap < p.min_market_cap {
+        return Err(Exclusion::TooSmall);
+    }
 
-    if is_loss_making(reports) { return Err(Exclusion::LossMaking); }
+    if is_loss_making(reports) {
+        return Err(Exclusion::LossMaking);
+    }
 
     let annuals = fundamentals::annuals(reports);
     if annuals.len() < p.min_years {
-        return Err(Exclusion::InsufficientHistory { years: annuals.len() });
+        return Err(Exclusion::InsufficientHistory {
+            years: annuals.len(),
+        });
     }
 
     let roes: Vec<f64> = annuals.iter().filter_map(|r| r.roe).collect();
@@ -183,15 +209,21 @@ pub fn evaluate(
     let window = annuals.len().min(6);
     let slice = &annuals[annuals.len() - window..];
     let span = (window - 1) as f64;
-    let revenue_cagr = slice.first().and_then(|f| f.revenue)
+    let revenue_cagr = slice
+        .first()
+        .and_then(|f| f.revenue)
         .zip(slice.last().and_then(|l| l.revenue))
         .and_then(|(f, l)| cagr(f, l, span));
-    let profit_cagr = slice.first().and_then(|f| f.net_profit)
+    let profit_cagr = slice
+        .first()
+        .and_then(|f| f.net_profit)
         .zip(slice.last().and_then(|l| l.net_profit))
         .and_then(|(f, l)| cagr(f, l, span));
 
     let pes = valuation::positive_pes(vals);
-    let pe_percentile = listing.pe_ttm.and_then(|pe| valuation::percentile(&pes, pe));
+    let pe_percentile = listing
+        .pe_ttm
+        .and_then(|pe| valuation::percentile(&pes, pe));
 
     let note = build_note(streak, profit_cagr, pe_percentile);
 
@@ -319,9 +351,12 @@ where
     // 排序只是为了让人先看到样本量最足的，**不是**优劣排名。
     // 按 ROE 持续年数降序，同则按净利 CAGR 降序。
     passed.sort_by(|a, b| {
-        b.roe_streak.cmp(&a.roe_streak)
-            .then(b.profit_cagr.unwrap_or(f64::MIN)
-                .partial_cmp(&a.profit_cagr.unwrap_or(f64::MIN)).unwrap())
+        b.roe_streak.cmp(&a.roe_streak).then(
+            b.profit_cagr
+                .unwrap_or(f64::MIN)
+                .partial_cmp(&a.profit_cagr.unwrap_or(f64::MIN))
+                .unwrap(),
+        )
     });
     passed.truncate(p.top_n);
 
@@ -343,39 +378,55 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
 
-    fn d(y: i32, m: u32, day: u32) -> NaiveDate { NaiveDate::from_ymd_opt(y, m, day).unwrap() }
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
 
     fn listing(code: &str, name: &str, cap: f64, pe: Option<f64>) -> Listing {
         Listing {
-            market: 1, code: code.into(), name: name.into(),
-            market_cap: Some(cap), pe_ttm: pe, pb_mrq: Some(5.0),
+            market: 1,
+            code: code.into(),
+            name: name.into(),
+            market_cap: Some(cap),
+            pe_ttm: pe,
+            pb_mrq: Some(5.0),
         }
     }
 
     /// n 年年报，ROE 固定，营收/净利按 rate 复合增长
-    fn annual_reports(n: i32, roe: f64, first_rev: f64, first_np: f64, rate: f64) -> Vec<FinReport> {
-        (0..n).map(|i| {
-            let g = (1.0 + rate).powi(i);
-            FinReport {
-                date: d(2020 - n + 1 + i, 12, 31),
-                revenue: Some(first_rev * g),
-                revenue_yoy: Some(rate * 100.0),
-                net_profit: Some(first_np * g),
-                net_profit_yoy: Some(rate * 100.0),
-                roe: Some(roe),
-                gross_margin: Some(90.0),
-                bps: Some(100.0),
-                eps: Some(10.0),
-            }
-        }).collect()
+    fn annual_reports(
+        n: i32,
+        roe: f64,
+        first_rev: f64,
+        first_np: f64,
+        rate: f64,
+    ) -> Vec<FinReport> {
+        (0..n)
+            .map(|i| {
+                let g = (1.0 + rate).powi(i);
+                FinReport {
+                    date: d(2020 - n + 1 + i, 12, 31),
+                    revenue: Some(first_rev * g),
+                    revenue_yoy: Some(rate * 100.0),
+                    net_profit: Some(first_np * g),
+                    net_profit_yoy: Some(rate * 100.0),
+                    roe: Some(roe),
+                    gross_margin: Some(90.0),
+                    bps: Some(100.0),
+                    eps: Some(10.0),
+                }
+            })
+            .collect()
     }
 
     fn vals(pe: f64, n: i64) -> Vec<ValPoint> {
-        (0..n).map(|i| ValPoint {
-            date: d(2018, 1, 1) + chrono::Duration::days(i),
-            pe_ttm: Some(pe + (i % 20) as f64),
-            pb_mrq: Some(5.0),
-        }).collect()
+        (0..n)
+            .map(|i| ValPoint {
+                date: d(2018, 1, 1) + chrono::Duration::days(i),
+                pe_ttm: Some(pe + (i % 20) as f64),
+                pb_mrq: Some(5.0),
+            })
+            .collect()
     }
 
     #[test]
@@ -441,7 +492,10 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         assert!(!json.contains("\"score\""), "不得出现总分字段");
         assert!(!json.contains("\"signal\""), "不得出现买卖信号字段");
-        assert!(p.note.contains("不含对未来的预测"), "措辞必须堵死「这只会涨」的错觉");
+        assert!(
+            p.note.contains("不含对未来的预测"),
+            "措辞必须堵死「这只会涨」的错觉"
+        );
     }
 
     #[test]
@@ -461,11 +515,19 @@ mod tests {
             listing("000004", "国华退", 1e10, Some(5.0)),
             listing("600010", "包钢股份", 1e11, Some(-53.0)),
         ];
-        let rep = build_report(&listings, "2026-07-10", "2026-07-12", &ScreenParams::default(), |l| {
-            let mut r = annual_reports(10, 30.0, 1e10, 4e9, 0.2);
-            if l.code == "600010" { r.last_mut().unwrap().net_profit = Some(-5e8); }
-            Ok((r, vals(20.0, 200)))
-        });
+        let rep = build_report(
+            &listings,
+            "2026-07-10",
+            "2026-07-12",
+            &ScreenParams::default(),
+            |l| {
+                let mut r = annual_reports(10, 30.0, 1e10, 4e9, 0.2);
+                if l.code == "600010" {
+                    r.last_mut().unwrap().net_profit = Some(-5e8);
+                }
+                Ok((r, vals(20.0, 200)))
+            },
+        );
 
         assert_eq!(rep.pool_size, 3);
         assert_eq!(rep.passed, 1);
@@ -481,17 +543,27 @@ mod tests {
 
     #[test]
     fn every_report_carries_base_rates_and_disclaimer() {
-        let rep = build_report(&[], "2026-07-10", "2026-07-12", &ScreenParams::default(), |_| {
-            Ok((vec![], vec![]))
-        });
+        let rep = build_report(
+            &[],
+            "2026-07-10",
+            "2026-07-12",
+            &ScreenParams::default(),
+            |_| Ok((vec![], vec![])),
+        );
         assert!(rep.disclaimer.contains("不构成"));
 
         // 没有基础发生率，一份「优质股清单」天然会被读成「翻倍名单」
         let joined = rep.base_rate.facts.join("");
         assert!(joined.contains("4.9%"), "须给出十倍股基础发生率");
         assert!(joined.contains("72%"), "须说明多数十倍股把涨幅还了回去");
-        assert!(joined.contains("8 年") || joined.contains("8–20 年"), "须说明所需年限");
-        assert!(joined.contains("Bessembinder"), "须给出个股回报分布的硬先验");
+        assert!(
+            joined.contains("8 年") || joined.contains("8–20 年"),
+            "须说明所需年限"
+        );
+        assert!(
+            joined.contains("Bessembinder"),
+            "须给出个股回报分布的硬先验"
+        );
         assert!(joined.contains("10.3 倍"), "须点破茅台70倍的口径陷阱");
         assert!(rep.base_rate.headline.contains("不是可稳定复制的策略"));
     }
@@ -510,34 +582,56 @@ mod tests {
         // 全市场逐只抓财报要几千次请求，实测里取一个有代表性的小样本：
         // 白马、银行(无毛利率)、亏损股、退市壳、次新股 —— 每一类都该走到不同的排除分支
         let want = ["600519", "600036", "600010", "000004", "300750"];
-        let pool: Vec<Listing> = all.iter()
+        let pool: Vec<Listing> = all
+            .iter()
             .filter(|l| want.contains(&l.code.as_str()))
-            .cloned().collect();
+            .cloned()
+            .collect();
         assert_eq!(pool.len(), want.len(), "样本股应都在全集里");
 
-        let rep = build_report(&pool, &date.to_string(), &date.to_string(),
-                               &ScreenParams::default(), |l| {
-            let secid = l.secid();
-            let reports = fu::fetch(&secid)?;
-            let vals = va::fetch(&secid).unwrap_or_default(); // 港股无估值历史 → 空
-            Ok((reports, vals))
-        });
+        let rep = build_report(
+            &pool,
+            &date.to_string(),
+            &date.to_string(),
+            &ScreenParams::default(),
+            |l| {
+                let secid = l.secid();
+                let reports = fu::fetch(&secid)?;
+                let vals = va::fetch(&secid).unwrap_or_default(); // 港股无估值历史 → 空
+                Ok((reports, vals))
+            },
+        );
 
-        println!("\n交易日 {date}｜池 {} 只｜通过 {} 只", rep.pool_size, rep.passed);
+        println!(
+            "\n交易日 {date}｜池 {} 只｜通过 {} 只",
+            rep.pool_size, rep.passed
+        );
         for (reason, n) in &rep.excluded {
             println!("  排除 {n} 只：{reason}");
         }
         for p in &rep.top {
-            println!("\n{} {} ｜{} 年年报｜ROE中位数 {:?}｜ROE连续≥15% {} 年｜净利CAGR {:?}",
-                     p.code, p.name, p.years, p.roe_median.map(|v| (v*10.0).round()/10.0),
-                     p.roe_streak, p.profit_cagr.map(|v| (v*10.0).round()/10.0));
-            println!("  PE {:?}｜历史分位 {:?}", p.pe_ttm.map(|v| (v*100.0).round()/100.0),
-                     p.pe_percentile.map(|v| format!("{:.0}%", v*100.0)));
+            println!(
+                "\n{} {} ｜{} 年年报｜ROE中位数 {:?}｜ROE连续≥15% {} 年｜净利CAGR {:?}",
+                p.code,
+                p.name,
+                p.years,
+                p.roe_median.map(|v| (v * 10.0).round() / 10.0),
+                p.roe_streak,
+                p.profit_cagr.map(|v| (v * 10.0).round() / 10.0)
+            );
+            println!(
+                "  PE {:?}｜历史分位 {:?}",
+                p.pe_ttm.map(|v| (v * 100.0).round() / 100.0),
+                p.pe_percentile.map(|v| format!("{:.0}%", v * 100.0))
+            );
             println!("  {}", p.note);
         }
 
         // 退市壳必须被名称挡掉（它的财务指标是漂亮的：PE 5.17、PB 0.70）
-        assert!(rep.excluded.iter().any(|(r, _)| r.contains("壳股")), "国华退应被排除");
+        assert!(
+            rep.excluded.iter().any(|(r, _)| r.contains("壳股")),
+            "国华退应被排除"
+        );
         // 茅台应通过（10+ 年年报、ROE 长期 >15%、盈利）
         assert!(rep.top.iter().any(|p| p.code == "600519"), "茅台应通过筛选");
         // 报告必须自带基础发生率与免责声明，否则会被读成「翻倍名单」
@@ -551,11 +645,22 @@ mod tests {
             listing("600519", "贵州茅台", 1.5e12, Some(18.0)),
             listing("600036", "招商银行", 1e12, Some(6.0)),
         ];
-        let rep = build_report(&listings, "2026-07-10", "2026-07-12", &ScreenParams::default(), |l| {
-            if l.code == "600036" { anyhow::bail!("网络抖动"); }
-            Ok((annual_reports(10, 30.0, 1e10, 4e9, 0.2), vals(20.0, 200)))
-        });
+        let rep = build_report(
+            &listings,
+            "2026-07-10",
+            "2026-07-12",
+            &ScreenParams::default(),
+            |l| {
+                if l.code == "600036" {
+                    anyhow::bail!("网络抖动");
+                }
+                Ok((annual_reports(10, 30.0, 1e10, 4e9, 0.2), vals(20.0, 200)))
+            },
+        );
         assert_eq!(rep.passed, 1, "一只失败不该毁掉整轮");
-        assert!(rep.excluded.iter().any(|(r, n)| r == "数据获取失败" && *n == 1));
+        assert!(rep
+            .excluded
+            .iter()
+            .any(|(r, n)| r == "数据获取失败" && *n == 1));
     }
 }

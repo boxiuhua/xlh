@@ -80,19 +80,34 @@ pub fn parse(body: &str) -> Vec<Tick> {
     for line in body.split(';') {
         let Some(eq) = line.find('=') else { continue };
         let rest = &line[eq + 1..];
-        let Some(start) = rest.find('"') else { continue };
+        let Some(start) = rest.find('"') else {
+            continue;
+        };
         let Some(end) = rest.rfind('"') else { continue };
-        if end <= start { continue }
+        if end <= start {
+            continue;
+        }
         let fields: Vec<&str> = rest[start + 1..end].split('~').collect();
-        if fields.len() < MIN_FIELDS { continue }
+        if fields.len() < MIN_FIELDS {
+            continue;
+        }
 
         let num = |i: usize| fields[i].trim().parse::<f64>().ok();
-        let (Some(price), Some(volume)) = (num(I_PRICE), num(I_VOLUME)) else { continue };
+        let (Some(price), Some(volume)) = (num(I_PRICE), num(I_VOLUME)) else {
+            continue;
+        };
         // 停牌：成交量为 0。PT金田A(000003) 实测即此形态，价 2.71、量 0、时间戳停在 09:00:00。
-        if volume <= 0.0 { continue }
-        let Some(ts) = NaiveDateTime::parse_from_str(fields[I_TS].trim(), "%Y%m%d%H%M%S").ok() else { continue };
+        if volume <= 0.0 {
+            continue;
+        }
+        let Some(ts) = NaiveDateTime::parse_from_str(fields[I_TS].trim(), "%Y%m%d%H%M%S").ok()
+        else {
+            continue;
+        };
         let code = fields[I_CODE].trim();
-        if code.is_empty() { continue }
+        if code.is_empty() {
+            continue;
+        }
 
         out.push(Tick {
             code: code.to_string(),
@@ -126,7 +141,12 @@ fn fetch_batch(c: &reqwest::blocking::Client, symbols: &[String]) -> Result<Vec<
         }
         // 用 bytes() + lossy 而非 text()：腾讯是 GBK，text() 在未启用 charset feature 时
         // 按 UTF-8 强解。数值字段是 ASCII，lossy 后完好；名称我们本就不取。
-        match c.get(&url).header("User-Agent", "Mozilla/5.0").send().and_then(|r| r.bytes()) {
+        match c
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0")
+            .send()
+            .and_then(|r| r.bytes())
+        {
             Ok(b) => return Ok(parse(&String::from_utf8_lossy(&b))),
             Err(e) => last_err = Some(e),
         }
@@ -139,11 +159,15 @@ fn fetch_batch(c: &reqwest::blocking::Client, symbols: &[String]) -> Result<Vec<
 /// 单批失败即整体失败：残缺的「全市场扫描」是静默错误 —— 少一半股票的异动榜
 /// 看起来完全正常，但你不知道漏了什么。同 `universe::fetch_a_snapshot` 的取舍。
 pub fn fetch(symbols: &[String]) -> Result<Vec<Tick>> {
-    if symbols.is_empty() { return Ok(Vec::new()) }
+    if symbols.is_empty() {
+        return Ok(Vec::new());
+    }
     let c = client()?;
     let mut all = Vec::with_capacity(symbols.len());
     for (i, chunk) in symbols.chunks(BATCH).enumerate() {
-        if i > 0 { std::thread::sleep(std::time::Duration::from_millis(200)); }
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         all.extend(fetch_batch(&c, chunk)?);
     }
     Ok(all)
@@ -168,29 +192,45 @@ mod tests {
     fn symbol_maps_only_a_share_markets() {
         assert_eq!(symbol(1, "600519").unwrap(), "sh600519");
         assert_eq!(symbol(0, "000001").unwrap(), "sz000001");
-        assert!(symbol(116, "00700").is_none(), "本模块只做 A 股，港股应返回 None");
+        assert!(
+            symbol(116, "00700").is_none(),
+            "本模块只做 A 股，港股应返回 None"
+        );
         assert!(symbol(105, "AAPL").is_none(), "美股应返回 None");
     }
 
     #[test]
     fn parses_price_volume_and_timestamp_at_correct_indices() {
         let ticks = parse(SNAP);
-        let t = ticks.iter().find(|t| t.code == "600519").expect("应解析出 600519");
+        let t = ticks
+            .iter()
+            .find(|t| t.code == "600519")
+            .expect("应解析出 600519");
         assert!((t.price - 1258.99).abs() < 1e-9, "现价在下标 3");
         assert!((t.volume - 47611.0).abs() < 1e-9, "成交量(手)在下标 6");
         assert!((t.change_pct - 0.63).abs() < 1e-9, "涨跌幅在下标 32");
         assert!((t.turnover - 0.38).abs() < 1e-9, "换手率在下标 38");
         assert!((t.vol_ratio - 0.98).abs() < 1e-9, "量比在下标 49");
-        assert_eq!(t.ts.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-07-16 16:14:40",
-            "时间戳在下标 30，格式 YYYYMMDDHHMMSS");
+        assert_eq!(
+            t.ts.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-07-16 16:14:40",
+            "时间戳在下标 30，格式 YYYYMMDDHHMMSS"
+        );
     }
 
     #[test]
     fn amount_is_converted_from_wan_to_yuan() {
         // 下标 37 单位是万元(598757)，实际成交额约 59.88 亿。若忘了 ×10000，
         // 资金流占比会算大 10000 倍，「大量流入」阈值形同虚设
-        let t = parse(SNAP).into_iter().find(|t| t.code == "600519").unwrap();
-        assert!((t.amount - 5_987_570_000.0).abs() < 1.0, "598757 万元 → 元，实得 {}", t.amount);
+        let t = parse(SNAP)
+            .into_iter()
+            .find(|t| t.code == "600519")
+            .unwrap();
+        assert!(
+            (t.amount - 5_987_570_000.0).abs() < 1.0,
+            "598757 万元 → 元，实得 {}",
+            t.amount
+        );
     }
 
     #[test]
@@ -198,14 +238,20 @@ mod tests {
         // PT金田A(000003)：价 2.71、量 0、时间戳停在 09:00:00。
         // 若不跳过，它会以「涨跌幅 0」进榜污染数据，且其陈旧时间戳会干扰交易日自证
         let ticks = parse(SNAP);
-        assert!(!ticks.iter().any(|t| t.code == "000003"), "停牌股(量=0)必须跳过");
+        assert!(
+            !ticks.iter().any(|t| t.code == "000003"),
+            "停牌股(量=0)必须跳过"
+        );
         assert_eq!(ticks.len(), 2, "3 行输入，停牌 1 只，应得 2 条");
     }
 
     #[test]
     fn negative_change_pct_is_preserved() {
         // 000001 涨跌幅 -0.65 —— 下跌也是异动，符号不能丢
-        let t = parse(SNAP).into_iter().find(|t| t.code == "000001").unwrap();
+        let t = parse(SNAP)
+            .into_iter()
+            .find(|t| t.code == "000001")
+            .unwrap();
         assert!((t.change_pct - (-0.65)).abs() < 1e-9, "跌幅须保留负号");
     }
 
@@ -223,7 +269,10 @@ mod tests {
         assert!(parse("").is_empty());
         assert!(parse("garbage").is_empty());
         assert!(parse(r#"v_sh600519="";"#).is_empty(), "空引号行应跳过");
-        assert!(parse(r#"v_sh600519="1~n~600519~1.0";"#).is_empty(), "字段不足应跳过");
+        assert!(
+            parse(r#"v_sh600519="1~n~600519~1.0";"#).is_empty(),
+            "字段不足应跳过"
+        );
     }
 
     #[test]
@@ -241,10 +290,16 @@ mod tests {
         let ticks = fetch(&["sh600519".to_string(), "sz000001".to_string()]).unwrap();
         assert!(!ticks.is_empty(), "实网应返回数据");
         let t = &ticks[0];
-        println!("{} 价={} 量={}手 额={:.0}元 换手={}% 量比={} 时间={}",
-            t.code, t.price, t.volume, t.amount, t.turnover, t.vol_ratio, t.ts);
+        println!(
+            "{} 价={} 量={}手 额={:.0}元 换手={}% 量比={} 时间={}",
+            t.code, t.price, t.volume, t.amount, t.turnover, t.vol_ratio, t.ts
+        );
         // 量纲哨兵：茅台价在 100~10000 之间。若腾讯改成分为单位，这里会炸
-        assert!(t.price > 100.0 && t.price < 10000.0, "600519 价格量纲异常: {}", t.price);
+        assert!(
+            t.price > 100.0 && t.price < 10000.0,
+            "600519 价格量纲异常: {}",
+            t.price
+        );
         assert!(t.amount > 1e6, "成交额应为元量级(已×10000): {}", t.amount);
     }
 }

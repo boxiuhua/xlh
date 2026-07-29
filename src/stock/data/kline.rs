@@ -1,27 +1,41 @@
+use super::secid::Secid;
+use super::StockBar;
 use anyhow::{anyhow, Result};
 use chrono::NaiveDate;
 use serde::Deserialize;
-use super::StockBar;
-use super::secid::Secid;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub date: NaiveDate,
-    pub open: f64, pub high: f64, pub low: f64, pub close: f64, pub volume: f64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
 }
 
 #[derive(Deserialize)]
-struct KlineResp { data: Option<KlineData> }
+struct KlineResp {
+    data: Option<KlineData>,
+}
 #[derive(Deserialize)]
-struct KlineData { #[serde(default)] klines: Vec<String> }
+struct KlineData {
+    #[serde(default)]
+    klines: Vec<String>,
+}
 
 pub fn parse_one(body: &str) -> Result<Vec<Row>> {
-    let resp: KlineResp = serde_json::from_str(body).map_err(|e| anyhow!("解析K线JSON失败: {e}"))?;
-    let Some(data) = resp.data else { return Ok(Vec::new()); };
+    let resp: KlineResp =
+        serde_json::from_str(body).map_err(|e| anyhow!("解析K线JSON失败: {e}"))?;
+    let Some(data) = resp.data else {
+        return Ok(Vec::new());
+    };
     let mut rows = Vec::with_capacity(data.klines.len());
     for line in &data.klines {
         let c: Vec<&str> = line.split(',').collect();
-        if c.len() < 6 { continue; }
+        if c.len() < 6 {
+            continue;
+        }
         let date = NaiveDate::parse_from_str(c[0], "%Y-%m-%d")?;
         rows.push(Row {
             date,
@@ -38,12 +52,21 @@ pub fn parse_one(body: &str) -> Result<Vec<Row>> {
 
 pub fn merge(raw: Vec<Row>, adj: Vec<Row>) -> Vec<StockBar> {
     let mut adj_map = std::collections::HashMap::new();
-    for r in &adj { adj_map.insert(r.date, r.close); }
-    let mut bars: Vec<StockBar> = raw.into_iter().map(|r| StockBar {
-        date: r.date,
-        open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume,
-        adj_close: adj_map.get(&r.date).copied().unwrap_or(r.close),
-    }).collect();
+    for r in &adj {
+        adj_map.insert(r.date, r.close);
+    }
+    let mut bars: Vec<StockBar> = raw
+        .into_iter()
+        .map(|r| StockBar {
+            date: r.date,
+            open: r.open,
+            high: r.high,
+            low: r.low,
+            close: r.close,
+            volume: r.volume,
+            adj_close: adj_map.get(&r.date).copied().unwrap_or(r.close),
+        })
+        .collect();
     bars.sort_by_key(|b| b.date);
     bars
 }
@@ -62,7 +85,8 @@ fn fetch_body(secid: &Secid, fqt: u8) -> Result<String> {
     // 东财已降为兜底源（腾讯为主）：短超时快速失败，避免主源已挂时的长时间空转。
     let mut last_err = None;
     for _ in 0..2 {
-        let attempt = client.get(&url)
+        let attempt = client
+            .get(&url)
             .header("Referer", "https://www.eastmoney.com/")
             .header("User-Agent", "Mozilla/5.0")
             .send()
@@ -78,7 +102,9 @@ fn fetch_body(secid: &Secid, fqt: u8) -> Result<String> {
 /// 东财 push2his 抓取（不复权 + 后复权，merge）。现为兜底源。
 pub fn eastmoney_fetch(secid: &Secid) -> Result<Vec<StockBar>> {
     let raw = parse_one(&fetch_body(secid, 0)?)?;
-    if raw.is_empty() { return Err(anyhow!("{} 无K线数据", secid.param())); }
+    if raw.is_empty() {
+        return Err(anyhow!("{} 无K线数据", secid.param()));
+    }
     let adj = parse_one(&fetch_body(secid, 2)?)?;
     Ok(merge(raw, adj))
 }
@@ -87,7 +113,9 @@ pub fn eastmoney_fetch(secid: &Secid) -> Result<Vec<StockBar>> {
 pub fn fetch(secid: &Secid) -> Result<Vec<StockBar>> {
     let primary = super::tencent::fetch(secid);
     if let Ok(bars) = &primary {
-        if !bars.is_empty() { return Ok(primary.unwrap()); }
+        if !bars.is_empty() {
+            return Ok(primary.unwrap());
+        }
     }
     match eastmoney_fetch(secid) {
         Ok(bars) => Ok(bars),
@@ -101,7 +129,9 @@ pub fn fetch(secid: &Secid) -> Result<Vec<StockBar>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn d(y: i32, m: u32, day: u32) -> NaiveDate { NaiveDate::from_ymd_opt(y, m, day).unwrap() }
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
 
     // 东财 fields2=f51..f57 顺序：date,open,close,high,low,volume,amount
     const RAW: &str = r#"{"rc":0,"data":{"code":"600519","name":"贵州茅台","klines":[
@@ -115,7 +145,7 @@ mod tests {
     fn parse_one_reads_ohlcv_in_eastmoney_order() {
         let rows = parse_one(RAW).unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].date, d(2024,1,2));
+        assert_eq!(rows[0].date, d(2024, 1, 2));
         assert!((rows[0].open - 100.0).abs() < 1e-9);
         assert!((rows[0].close - 110.0).abs() < 1e-9, "close 是第2个字段");
         assert!((rows[0].high - 112.0).abs() < 1e-9);

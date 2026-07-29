@@ -1,6 +1,6 @@
-use std::path::Path;
 use anyhow::{anyhow, Context, Result};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FundInfo {
@@ -17,12 +17,19 @@ pub fn parse_fund_list(body: &str) -> Result<Vec<FundInfo>> {
     let rest = &body[start..];
     let open = rest.find('[').ok_or_else(|| anyhow!("未找到数组开括号"))?;
     let close = rest.rfind(']').ok_or_else(|| anyhow!("未找到数组闭括号"))?;
-    if close < open { return Err(anyhow!("数组括号位置异常")); }
-    let rows: Vec<Vec<String>> = serde_json::from_str(&rest[open..=close])
-        .context("解析基金清单 JSON 失败")?;
-    let funds = rows.into_iter()
+    if close < open {
+        return Err(anyhow!("数组括号位置异常"));
+    }
+    let rows: Vec<Vec<String>> =
+        serde_json::from_str(&rest[open..=close]).context("解析基金清单 JSON 失败")?;
+    let funds = rows
+        .into_iter()
         .filter(|r| r.len() >= 3)
-        .map(|r| FundInfo { code: r[0].clone(), pinyin: r[1].clone(), name: r[2].clone() })
+        .map(|r| FundInfo {
+            code: r[0].clone(),
+            pinyin: r[1].clone(),
+            name: r[2].clone(),
+        })
         .collect();
     Ok(funds)
 }
@@ -73,7 +80,14 @@ mod tests {
     fn parses_sample() {
         let funds = parse_fund_list(SAMPLE).unwrap();
         assert_eq!(funds.len(), 2, "列数不足的 [\"bad\"] 行应被跳过");
-        assert_eq!(funds[0], FundInfo { code: "000001".into(), pinyin: "HXCZHH".into(), name: "华夏成长混合".into() });
+        assert_eq!(
+            funds[0],
+            FundInfo {
+                code: "000001".into(),
+                pinyin: "HXCZHH".into(),
+                name: "华夏成长混合".into()
+            }
+        );
         assert_eq!(funds[1].code, "161725");
         assert_eq!(funds[1].name, "招商中证白酒指数");
     }
@@ -88,8 +102,16 @@ mod tests {
         // 写一份临时 fundlist.json，断言 load_or_fetch 读盘（不联网）
         let dir = std::env::temp_dir().join("xlh_fundlist_test");
         std::fs::create_dir_all(&dir).unwrap();
-        let funds = vec![FundInfo { code: "161725".into(), name: "招商中证白酒指数".into(), pinyin: "ZSZZBJ".into() }];
-        std::fs::write(dir.join("fundlist.json"), serde_json::to_string(&funds).unwrap()).unwrap();
+        let funds = vec![FundInfo {
+            code: "161725".into(),
+            name: "招商中证白酒指数".into(),
+            pinyin: "ZSZZBJ".into(),
+        }];
+        std::fs::write(
+            dir.join("fundlist.json"),
+            serde_json::to_string(&funds).unwrap(),
+        )
+        .unwrap();
         let loaded = load_or_fetch_fund_list(&dir).unwrap();
         assert_eq!(loaded, funds);
         let _ = std::fs::remove_dir_all(&dir);

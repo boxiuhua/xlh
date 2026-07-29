@@ -14,12 +14,23 @@ const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // 去掉易混 O0I
 
 pub fn gen_code() -> String {
     let mut rng = rand::thread_rng();
-    let raw: String = (0..16).map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char).collect();
-    format!("{}-{}-{}-{}", &raw[0..4], &raw[4..8], &raw[8..12], &raw[12..16])
+    let raw: String = (0..16)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect();
+    format!(
+        "{}-{}-{}-{}",
+        &raw[0..4],
+        &raw[4..8],
+        &raw[8..12],
+        &raw[12..16]
+    )
 }
 
 #[derive(Deserialize)]
-pub struct CreateCodes { pub days: i64, pub count: u32 }
+pub struct CreateCodes {
+    pub days: i64,
+    pub count: u32,
+}
 
 pub async fn create_codes(State(st): State<AuthState>, Json(req): Json<CreateCodes>) -> Response {
     if req.days <= 0 || req.count == 0 || req.count > 500 {
@@ -37,7 +48,10 @@ pub async fn create_codes(State(st): State<AuthState>, Json(req): Json<CreateCod
 }
 
 #[derive(Deserialize)]
-pub struct CodesQuery { #[serde(default)] pub filter: Option<String> }
+pub struct CodesQuery {
+    #[serde(default)]
+    pub filter: Option<String>,
+}
 
 pub async fn list_codes(State(st): State<AuthState>, Query(q): Query<CodesQuery>) -> Response {
     let filter = match q.filter.as_deref() {
@@ -53,7 +67,9 @@ pub async fn list_codes(State(st): State<AuthState>, Query(q): Query<CodesQuery>
 }
 
 #[derive(Deserialize)]
-pub struct CodeReq { pub code: String }
+pub struct CodeReq {
+    pub code: String,
+}
 
 pub async fn revoke_code(State(st): State<AuthState>, Json(req): Json<CodeReq>) -> Response {
     let conn = st.db.lock().unwrap();
@@ -66,14 +82,18 @@ pub async fn list_users(State(st): State<AuthState>) -> Response {
     let conn = st.db.lock().unwrap();
     match store::list_users(&conn) {
         Ok(users) => {
-            let rows: Vec<_> = users.into_iter().map(|u| {
-                let status = LicenseStatus::of(u.expires_at, now, st.cfg.warn_days, st.cfg.grace_days);
-                json!({
-                    "id": u.id, "username": u.username, "expires_at": u.expires_at,
-                    "is_admin": u.is_admin, "disabled": u.disabled, "cancelled": u.cancelled,
-                    "status": status,
+            let rows: Vec<_> = users
+                .into_iter()
+                .map(|u| {
+                    let status =
+                        LicenseStatus::of(u.expires_at, now, st.cfg.warn_days, st.cfg.grace_days);
+                    json!({
+                        "id": u.id, "username": u.username, "expires_at": u.expires_at,
+                        "is_admin": u.is_admin, "disabled": u.disabled, "cancelled": u.cancelled,
+                        "status": status,
+                    })
                 })
-            }).collect();
+                .collect();
             Json(json!({"users": rows})).into_response()
         }
         Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "list_failed", None),
@@ -81,7 +101,10 @@ pub async fn list_users(State(st): State<AuthState>) -> Response {
 }
 
 #[derive(Deserialize)]
-pub struct ExtendReq { pub user_id: i64, pub days: i64 }
+pub struct ExtendReq {
+    pub user_id: i64,
+    pub days: i64,
+}
 
 pub async fn extend_user(State(st): State<AuthState>, Json(req): Json<ExtendReq>) -> Response {
     let now = chrono::Local::now().date_naive();
@@ -98,7 +121,10 @@ pub async fn extend_user(State(st): State<AuthState>, Json(req): Json<ExtendReq>
 }
 
 #[derive(Deserialize)]
-pub struct DisableReq { pub user_id: i64, pub disabled: bool }
+pub struct DisableReq {
+    pub user_id: i64,
+    pub disabled: bool,
+}
 
 pub async fn disable_user(State(st): State<AuthState>, Json(req): Json<DisableReq>) -> Response {
     let conn = st.db.lock().unwrap();
@@ -117,7 +143,10 @@ pub async fn disable_user(State(st): State<AuthState>, Json(req): Json<DisableRe
 }
 
 #[derive(Deserialize)]
-pub struct SetAdminReq { pub user_id: i64, pub is_admin: bool }
+pub struct SetAdminReq {
+    pub user_id: i64,
+    pub is_admin: bool,
+}
 
 pub async fn set_admin(State(st): State<AuthState>, Json(req): Json<SetAdminReq>) -> Response {
     let conn = st.db.lock().unwrap();
@@ -136,9 +165,15 @@ pub async fn set_admin(State(st): State<AuthState>, Json(req): Json<SetAdminReq>
 }
 
 #[derive(Deserialize)]
-pub struct ResetPasswordReq { pub user_id: i64, pub new_password: String }
+pub struct ResetPasswordReq {
+    pub user_id: i64,
+    pub new_password: String,
+}
 
-pub async fn reset_password(State(st): State<AuthState>, Json(req): Json<ResetPasswordReq>) -> Response {
+pub async fn reset_password(
+    State(st): State<AuthState>,
+    Json(req): Json<ResetPasswordReq>,
+) -> Response {
     if req.new_password.chars().count() < 6 {
         return json_error(StatusCode::BAD_REQUEST, "invalid_password", None);
     }
@@ -160,14 +195,21 @@ pub async fn reset_password(State(st): State<AuthState>, Json(req): Json<ResetPa
 }
 
 #[derive(Deserialize)]
-pub struct CancelReq { pub user_id: i64, pub cancelled: bool }
+pub struct CancelReq {
+    pub user_id: i64,
+    pub cancelled: bool,
+}
 
 pub async fn cancel_user(State(st): State<AuthState>, Json(req): Json<CancelReq>) -> Response {
     let conn = st.db.lock().unwrap();
     // 注销启用中的唯一管理员会锁死后台，拒绝。
     if req.cancelled {
         if let Ok(Some(u)) = store::find_user_by_id(&conn, req.user_id) {
-            if u.is_admin && !u.disabled && !u.cancelled && store::count_admins(&conn).unwrap_or(0) <= 1 {
+            if u.is_admin
+                && !u.disabled
+                && !u.cancelled
+                && store::count_admins(&conn).unwrap_or(0) <= 1
+            {
                 return json_error(StatusCode::BAD_REQUEST, "last_admin", None);
             }
         }
@@ -184,7 +226,9 @@ pub async fn cancel_user(State(st): State<AuthState>, Json(req): Json<CancelReq>
 }
 
 #[derive(Deserialize)]
-pub struct DeleteReq { pub user_id: i64 }
+pub struct DeleteReq {
+    pub user_id: i64,
+}
 
 pub async fn delete_user(State(st): State<AuthState>, Json(req): Json<DeleteReq>) -> Response {
     let mut conn = st.db.lock().unwrap();
@@ -227,7 +271,11 @@ pub async fn push_history_detail(
         crate::history::get_push(&conn, id).ok().flatten()
     };
     match found {
-        Some(payload) => ([(axum::http::header::CONTENT_TYPE, "application/json")], payload).into_response(),
+        Some(payload) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            payload,
+        )
+            .into_response(),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
@@ -295,8 +343,12 @@ pub async fn overview(State(st): State<AuthState>) -> Response {
     let mut warning = 0;
     for u in &users {
         let s = LicenseStatus::of(u.expires_at, now, st.cfg.warn_days, st.cfg.grace_days);
-        if s.allows_access() { active += 1; }
-        if s == LicenseStatus::Warning { warning += 1; }
+        if s.allows_access() {
+            active += 1;
+        }
+        if s == LicenseStatus::Warning {
+            warning += 1;
+        }
     }
     Json(json!({"total": total, "active": active, "warning": warning})).into_response()
 }

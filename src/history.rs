@@ -1,8 +1,8 @@
 //! 持仓建议历史：Web(按用户) + 推送(全局，仅管理员) 的保存与查询，复用同一 SQLite 库。
-use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
+use std::path::Path;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS advice_history (
@@ -51,7 +51,13 @@ fn now_ts() -> String {
 }
 
 /// 保存一条历史，返回 id。source=="web" 时插入后删除该用户超出最新 WEB_KEEP 条的旧记录。
-pub fn save(conn: &Connection, user_id: Option<i64>, source: &str, summary: &str, payload: &str) -> Result<i64> {
+pub fn save(
+    conn: &Connection,
+    user_id: Option<i64>,
+    source: &str,
+    summary: &str,
+    payload: &str,
+) -> Result<i64> {
     conn.execute(
         "INSERT INTO advice_history (user_id, source, created_at, summary, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![user_id, source, now_ts(), summary, payload],
@@ -74,14 +80,20 @@ pub fn save(conn: &Connection, user_id: Option<i64>, source: &str, summary: &str
 }
 
 fn row_to_record(r: &rusqlite::Row) -> rusqlite::Result<AdviceRecord> {
-    Ok(AdviceRecord { id: r.get(0)?, created_at: r.get(1)?, summary: r.get(2)? })
+    Ok(AdviceRecord {
+        id: r.get(0)?,
+        created_at: r.get(1)?,
+        summary: r.get(2)?,
+    })
 }
 
 pub fn list_web(conn: &Connection, user_id: i64, limit: i64) -> Result<Vec<AdviceRecord>> {
     let mut stmt = conn.prepare(
         "SELECT id, created_at, summary FROM advice_history
-          WHERE source='web' AND user_id=?1 ORDER BY created_at DESC, id DESC LIMIT ?2")?;
-    let rows = stmt.query_map(rusqlite::params![user_id, limit], row_to_record)?
+          WHERE source='web' AND user_id=?1 ORDER BY created_at DESC, id DESC LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![user_id, limit], row_to_record)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -89,8 +101,10 @@ pub fn list_web(conn: &Connection, user_id: i64, limit: i64) -> Result<Vec<Advic
 pub fn list_push(conn: &Connection, limit: i64) -> Result<Vec<AdviceRecord>> {
     let mut stmt = conn.prepare(
         "SELECT id, created_at, summary FROM advice_history
-          WHERE source='push' ORDER BY created_at DESC, id DESC LIMIT ?1")?;
-    let rows = stmt.query_map(rusqlite::params![limit], row_to_record)?
+          WHERE source='push' ORDER BY created_at DESC, id DESC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![limit], row_to_record)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -98,15 +112,21 @@ pub fn list_push(conn: &Connection, limit: i64) -> Result<Vec<AdviceRecord>> {
 pub fn get_web(conn: &Connection, id: i64, user_id: i64) -> Result<Option<String>> {
     conn.query_row(
         "SELECT payload FROM advice_history WHERE id=?1 AND source='web' AND user_id=?2",
-        rusqlite::params![id, user_id], |r| r.get(0),
-    ).optional().context("查历史失败")
+        rusqlite::params![id, user_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .context("查历史失败")
 }
 
 pub fn get_push(conn: &Connection, id: i64) -> Result<Option<String>> {
     conn.query_row(
         "SELECT payload FROM advice_history WHERE id=?1 AND source='push'",
-        [id], |r| r.get(0),
-    ).optional().context("查历史失败")
+        [id],
+        |r| r.get(0),
+    )
+    .optional()
+    .context("查历史失败")
 }
 
 #[cfg(test)]

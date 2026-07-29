@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthCfg {
@@ -13,13 +13,26 @@ pub struct AuthCfg {
     pub grace_days: i64,
     #[serde(default = "default_session_ttl")]
     pub session_ttl_days: i64,
+    /// HTTPS 反向代理部署时必须开启，避免会话 Cookie 被明文 HTTP 请求带出。
+    #[serde(default)]
+    pub secure_cookie: bool,
 }
 
-fn default_db_path() -> PathBuf { PathBuf::from("data/xlh.db") }
-fn default_true() -> bool { true }
-fn default_warn() -> i64 { 7 }
-fn default_grace() -> i64 { 3 }
-fn default_session_ttl() -> i64 { 30 }
+fn default_db_path() -> PathBuf {
+    PathBuf::from("data/xlh.db")
+}
+fn default_true() -> bool {
+    true
+}
+fn default_warn() -> i64 {
+    7
+}
+fn default_grace() -> i64 {
+    3
+}
+fn default_session_ttl() -> i64 {
+    30
+}
 
 impl Default for AuthCfg {
     fn default() -> Self {
@@ -29,6 +42,7 @@ impl Default for AuthCfg {
             warn_days: default_warn(),
             grace_days: default_grace(),
             session_ttl_days: default_session_ttl(),
+            secure_cookie: false,
         }
     }
 }
@@ -41,11 +55,16 @@ struct AuthFile {
 
 /// 从 config.toml 宽松读取 `[auth]` 段；文件不存在或段缺失时返回默认值。
 pub fn load_auth(path: &Path) -> AuthCfg {
-    std::fs::read_to_string(path)
+    let mut cfg = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| toml::from_str::<AuthFile>(&s).ok())
         .map(|f| f.auth)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // 容器/反向代理部署可不用改只读 config.toml，显式环境变量优先。
+    if let Ok(v) = std::env::var("XLH_COOKIE_SECURE") {
+        cfg.secure_cookie = matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES");
+    }
+    cfg
 }
 
 #[cfg(test)]

@@ -1,10 +1,13 @@
+use crate::data::NavPoint;
 use anyhow::{anyhow, Result};
 use chrono::{FixedOffset, TimeZone};
 use serde::Deserialize;
-use crate::data::NavPoint;
 
 #[derive(Deserialize)]
-struct NetWorth { x: i64, y: f64 }
+struct NetWorth {
+    x: i64,
+    y: f64,
+}
 
 /// 从 body 中截取 `var <name> = <array>;` 的数组文本。
 /// 通过括号深度计数定位匹配的 `]`，忽略双引号字符串内的括号（支持 `\` 转义），
@@ -15,13 +18,15 @@ fn extract_array(body: &str, name: &str) -> Result<String> {
     let rest = &body[start..];
 
     // 找到开头的 '['
-    let open = rest.find('[').ok_or_else(|| anyhow!("{name} 未找到开括号 ["))?;
+    let open = rest
+        .find('[')
+        .ok_or_else(|| anyhow!("{name} 未找到开括号 ["))?;
     let chars: Vec<char> = rest[open..].chars().collect();
 
     let mut depth: usize = 0;
     let mut in_string = false;
     let mut escape = false;
-    let mut close_pos: Option<usize> = None;  // byte offset relative to rest[open..]
+    let mut close_pos: Option<usize> = None; // byte offset relative to rest[open..]
 
     let mut byte_offset = 0usize;
     for &ch in &chars {
@@ -63,17 +68,25 @@ pub fn parse_pingzhongdata(body: &str) -> Result<Vec<NavPoint>> {
     let ac: Vec<(i64, f64)> = serde_json::from_str(&ac_text)?;
 
     let mut acc_map = std::collections::HashMap::new();
-    for (ts, v) in ac { acc_map.insert(ts, v); }
+    for (ts, v) in ac {
+        acc_map.insert(ts, v);
+    }
 
     let cst = FixedOffset::east_opt(8 * 3600).unwrap();
 
     let mut points = Vec::with_capacity(nw.len());
     for n in nw {
-        let dt = cst.timestamp_millis_opt(n.x).single()
+        let dt = cst
+            .timestamp_millis_opt(n.x)
+            .single()
             .ok_or_else(|| anyhow!("非法时间戳 {}", n.x))?;
         let date = dt.date_naive();
         let acc_nav = *acc_map.get(&n.x).unwrap_or(&n.y);
-        points.push(NavPoint { date, nav: n.y, acc_nav });
+        points.push(NavPoint {
+            date,
+            nav: n.y,
+            acc_nav,
+        });
     }
     points.sort_by_key(|p| p.date);
     Ok(points)
@@ -120,10 +133,18 @@ var Data_grandTotal = [];
     fn cst_date_regression() {
         // ts 1577808000000 must parse as 2020-01-01 in CST, NOT 2019-12-31
         let pts = parse_pingzhongdata(SAMPLE).unwrap();
-        assert_eq!(pts[0].date, NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
-            "首个数据点日期应为 2020-01-01 (CST), 实际得到 {}", pts[0].date);
-        assert_eq!(pts[1].date, NaiveDate::from_ymd_opt(2020, 1, 2).unwrap(),
-            "第二个数据点日期应为 2020-01-02 (CST), 实际得到 {}", pts[1].date);
+        assert_eq!(
+            pts[0].date,
+            NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
+            "首个数据点日期应为 2020-01-01 (CST), 实际得到 {}",
+            pts[0].date
+        );
+        assert_eq!(
+            pts[1].date,
+            NaiveDate::from_ymd_opt(2020, 1, 2).unwrap(),
+            "第二个数据点日期应为 2020-01-02 (CST), 实际得到 {}",
+            pts[1].date
+        );
     }
 
     #[test]

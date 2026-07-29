@@ -12,7 +12,12 @@ pub enum LicenseStatus {
 }
 
 impl LicenseStatus {
-    pub fn of(expires_at: Option<NaiveDate>, now: NaiveDate, warn_days: i64, grace_days: i64) -> Self {
+    pub fn of(
+        expires_at: Option<NaiveDate>,
+        now: NaiveDate,
+        warn_days: i64,
+        grace_days: i64,
+    ) -> Self {
         match expires_at {
             None => LicenseStatus::Inactive,
             Some(exp) => {
@@ -30,7 +35,10 @@ impl LicenseStatus {
     }
 
     pub fn allows_access(self) -> bool {
-        matches!(self, LicenseStatus::Active | LicenseStatus::Warning | LicenseStatus::Grace)
+        matches!(
+            self,
+            LicenseStatus::Active | LicenseStatus::Warning | LicenseStatus::Grace
+        )
     }
 }
 
@@ -63,22 +71,45 @@ pub struct CodeRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn d(s: &str) -> NaiveDate { s.parse().unwrap() }
+    fn d(s: &str) -> NaiveDate {
+        s.parse().unwrap()
+    }
 
     #[test]
     fn inactive_when_no_expiry() {
-        assert_eq!(LicenseStatus::of(None, d("2026-07-05"), 7, 3), LicenseStatus::Inactive);
+        assert_eq!(
+            LicenseStatus::of(None, d("2026-07-05"), 7, 3),
+            LicenseStatus::Inactive
+        );
     }
 
     #[test]
     fn status_boundaries() {
         let exp = d("2026-07-10");
-        assert_eq!(LicenseStatus::of(Some(exp), d("2026-07-03"), 7, 3), LicenseStatus::Active);  // == exp-7
-        assert_eq!(LicenseStatus::of(Some(exp), d("2026-07-04"), 7, 3), LicenseStatus::Warning); // 进入临期
-        assert_eq!(LicenseStatus::of(Some(exp), d("2026-07-10"), 7, 3), LicenseStatus::Warning); // == exp
-        assert_eq!(LicenseStatus::of(Some(exp), d("2026-07-11"), 7, 3), LicenseStatus::Grace);   // exp+1
-        assert_eq!(LicenseStatus::of(Some(exp), d("2026-07-13"), 7, 3), LicenseStatus::Grace);   // == exp+3
-        assert_eq!(LicenseStatus::of(Some(exp), d("2026-07-14"), 7, 3), LicenseStatus::Expired); // exp+4
+        assert_eq!(
+            LicenseStatus::of(Some(exp), d("2026-07-03"), 7, 3),
+            LicenseStatus::Active
+        ); // == exp-7
+        assert_eq!(
+            LicenseStatus::of(Some(exp), d("2026-07-04"), 7, 3),
+            LicenseStatus::Warning
+        ); // 进入临期
+        assert_eq!(
+            LicenseStatus::of(Some(exp), d("2026-07-10"), 7, 3),
+            LicenseStatus::Warning
+        ); // == exp
+        assert_eq!(
+            LicenseStatus::of(Some(exp), d("2026-07-11"), 7, 3),
+            LicenseStatus::Grace
+        ); // exp+1
+        assert_eq!(
+            LicenseStatus::of(Some(exp), d("2026-07-13"), 7, 3),
+            LicenseStatus::Grace
+        ); // == exp+3
+        assert_eq!(
+            LicenseStatus::of(Some(exp), d("2026-07-14"), 7, 3),
+            LicenseStatus::Expired
+        ); // exp+4
     }
 
     #[test]
@@ -94,12 +125,18 @@ mod tests {
     fn renew_from_now_when_inactive_or_expired() {
         let now = d("2026-07-05");
         assert_eq!(renew_expiry(None, now, 30), d("2026-08-04"));
-        assert_eq!(renew_expiry(Some(d("2026-06-01")), now, 30), d("2026-08-04")); // 过期→从今天
+        assert_eq!(
+            renew_expiry(Some(d("2026-06-01")), now, 30),
+            d("2026-08-04")
+        ); // 过期→从今天
     }
 
     #[test]
     fn renew_stacks_when_still_valid() {
         let now = d("2026-07-05");
-        assert_eq!(renew_expiry(Some(d("2026-08-01")), now, 30), d("2026-08-31")); // 未过期→叠加
+        assert_eq!(
+            renew_expiry(Some(d("2026-08-01")), now, 30),
+            d("2026-08-31")
+        ); // 未过期→叠加
     }
 }

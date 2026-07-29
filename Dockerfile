@@ -37,6 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libfontconfig1 \
         fonts-dejavu-core \
         ca-certificates \
+        curl \
         tzdata \
         sqlite3 \
     && rm -rf /var/lib/apt/lists/*

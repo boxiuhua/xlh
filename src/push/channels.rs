@@ -1,8 +1,8 @@
 //! 四渠道请求构造（钉钉/飞书/企业微信/Server酱）+ 加签 + 发送。
 //! 构造(build_request)与发送(send)分离，前者纯函数便于测试。
 use anyhow::{anyhow, Result};
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -23,7 +23,10 @@ fn is_uuid(s: &str) -> bool {
     let groups = [8usize, 4, 4, 4, 12];
     let parts: Vec<&str> = s.split('-').collect();
     parts.len() == groups.len()
-        && parts.iter().zip(groups).all(|(p, n)| p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit()))
+        && parts
+            .iter()
+            .zip(groups)
+            .all(|(p, n)| p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// 规范化 webhook：飞书若填的是裸 hook token(UUID)，自动补全为完整 URL；其余原样返回。
@@ -48,7 +51,9 @@ fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -62,11 +67,20 @@ pub fn build_request(cfg: &ChannelCfg, title: &str, md: &str, ts_ms: i64) -> Htt
         "dingtalk" => {
             let mut url = cfg.webhook.clone();
             if !cfg.secret.is_empty() {
-                let sign = hmac_b64(cfg.secret.as_bytes(), format!("{ts_ms}\n{}", cfg.secret).as_bytes());
+                let sign = hmac_b64(
+                    cfg.secret.as_bytes(),
+                    format!("{ts_ms}\n{}", cfg.secret).as_bytes(),
+                );
                 url.push_str(&format!("&timestamp={ts_ms}&sign={}", urlencode(&sign)));
             }
-            let body = serde_json::json!({"msgtype":"markdown","markdown":{"title":title,"text":md}}).to_string();
-            HttpReq { url, body, form: false }
+            let body =
+                serde_json::json!({"msgtype":"markdown","markdown":{"title":title,"text":md}})
+                    .to_string();
+            HttpReq {
+                url,
+                body,
+                form: false,
+            }
         }
         // 飞书：文本消息；加签走 body，timestamp 用秒，sign=HMAC(key="{ts}\n{secret}", data="")。
         "feishu" => {
@@ -77,20 +91,37 @@ pub fn build_request(cfg: &ChannelCfg, title: &str, md: &str, ts_ms: i64) -> Htt
                 obj["timestamp"] = serde_json::Value::String(ts_s.to_string());
                 obj["sign"] = serde_json::Value::String(sign);
             }
-            HttpReq { url: canonical_webhook(&cfg.kind, &cfg.webhook), body: obj.to_string(), form: false }
+            HttpReq {
+                url: canonical_webhook(&cfg.kind, &cfg.webhook),
+                body: obj.to_string(),
+                form: false,
+            }
         }
         // 企业微信：markdown 消息，无加签（密钥在 URL 的 key 参数里）。
         "wework" => {
-            let body = serde_json::json!({"msgtype":"markdown","markdown":{"content": md}}).to_string();
-            HttpReq { url: cfg.webhook.clone(), body, form: false }
+            let body =
+                serde_json::json!({"msgtype":"markdown","markdown":{"content": md}}).to_string();
+            HttpReq {
+                url: cfg.webhook.clone(),
+                body,
+                form: false,
+            }
         }
         // Server酱：webhook 字段即 sendkey。
         "serverchan" => {
             let url = format!("https://sctapi.ftqq.com/{}.send", cfg.webhook);
             let body = format!("title={}&desp={}", urlencode(title), urlencode(md));
-            HttpReq { url, body, form: true }
+            HttpReq {
+                url,
+                body,
+                form: true,
+            }
         }
-        _ => HttpReq { url: cfg.webhook.clone(), body: md.to_string(), form: false },
+        _ => HttpReq {
+            url: cfg.webhook.clone(),
+            body: md.to_string(),
+            form: false,
+        },
     }
 }
 
@@ -104,9 +135,17 @@ fn send_once(req: &HttpReq) -> Result<()> {
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| anyhow!("构建HTTP客户端失败: {e}"))?;
-    let ct = if req.form { "application/x-www-form-urlencoded" } else { "application/json" };
-    let resp = client.post(&req.url).header("Content-Type", ct).body(req.body.clone())
-        .send().map_err(|e| anyhow!("推送请求失败: {e}"))?;
+    let ct = if req.form {
+        "application/x-www-form-urlencoded"
+    } else {
+        "application/json"
+    };
+    let resp = client
+        .post(&req.url)
+        .header("Content-Type", ct)
+        .body(req.body.clone())
+        .send()
+        .map_err(|e| anyhow!("推送请求失败: {e}"))?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     let snippet: String = text.chars().take(200).collect();
@@ -114,9 +153,14 @@ fn send_once(req: &HttpReq) -> Result<()> {
         return Err(anyhow!("推送 HTTP {status}：{snippet}"));
     }
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-        let code = v.get("errcode").or_else(|| v.get("code")).and_then(|c| c.as_i64());
+        let code = v
+            .get("errcode")
+            .or_else(|| v.get("code"))
+            .and_then(|c| c.as_i64());
         if let Some(c) = code {
-            if c != 0 { return Err(anyhow!("推送返回错误码 {c}：{snippet}")); }
+            if c != 0 {
+                return Err(anyhow!("推送返回错误码 {c}：{snippet}"));
+            }
         }
     }
     Ok(())
@@ -148,7 +192,12 @@ mod tests {
     use std::path::PathBuf;
 
     fn cfg(kind: &str, secret: &str) -> ChannelCfg {
-        ChannelCfg { kind: kind.into(), webhook: "https://hook/xyz".into(), secret: secret.into(), cache_dir: PathBuf::from(".cache") }
+        ChannelCfg {
+            kind: kind.into(),
+            webhook: "https://hook/xyz".into(),
+            secret: secret.into(),
+            cache_dir: PathBuf::from(".cache"),
+        }
     }
 
     #[test]
@@ -172,7 +221,10 @@ mod tests {
         let mut c = cfg("feishu", "");
         c.webhook = "097074dc-0f9c-44c0-a7ab-af8942e24143".into();
         let r = build_request(&c, "t", "正文", 0);
-        assert_eq!(r.url, "https://open.feishu.cn/open-apis/bot/v2/hook/097074dc-0f9c-44c0-a7ab-af8942e24143");
+        assert_eq!(
+            r.url,
+            "https://open.feishu.cn/open-apis/bot/v2/hook/097074dc-0f9c-44c0-a7ab-af8942e24143"
+        );
     }
 
     #[test]
@@ -186,8 +238,10 @@ mod tests {
     #[test]
     fn feishu_chat_id_not_expanded() {
         // oc_ 群会话ID 不是 UUID → 不补全，保持原样以便被上层校验拦下
-        assert_eq!(canonical_webhook("feishu", "oc_f1103754b002dc17b290d470b9b1d05c"),
-            "oc_f1103754b002dc17b290d470b9b1d05c");
+        assert_eq!(
+            canonical_webhook("feishu", "oc_f1103754b002dc17b290d470b9b1d05c"),
+            "oc_f1103754b002dc17b290d470b9b1d05c"
+        );
     }
 
     #[test]
@@ -228,7 +282,9 @@ mod tests {
     #[test]
     fn hmac_known_vector() {
         // 固定 key/data 的 HMAC-SHA256 base64，防止实现回归
-        assert_eq!(hmac_b64(b"key", b"The quick brown fox jumps over the lazy dog"),
-            "97yD9DBThCSxMpjmqm+xQ+9NWaFJRhdZl0edvC0aPNg=");
+        assert_eq!(
+            hmac_b64(b"key", b"The quick brown fox jumps over the lazy dog"),
+            "97yD9DBThCSxMpjmqm+xQ+9NWaFJRhdZl0edvC0aPNg="
+        );
     }
 }

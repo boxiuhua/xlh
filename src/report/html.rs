@@ -1,7 +1,7 @@
-use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 
 use crate::portfolio::Portfolio;
 use crate::result::{DailyRecord, TradeRecord};
@@ -104,10 +104,19 @@ fn fmt_pct(v: f64) -> String {
 }
 
 fn sign_class(v: f64) -> &'static str {
-    if v >= 0.0 { "pos" } else { "neg" }
+    if v >= 0.0 {
+        "pos"
+    } else {
+        "neg"
+    }
 }
 
-fn build_html(meta: &ReportMeta, m: &MetricsJson, trades: &[TradeRecord], data_json: &str) -> String {
+fn build_html(
+    meta: &ReportMeta,
+    m: &MetricsJson,
+    trades: &[TradeRecord],
+    data_json: &str,
+) -> String {
     // ── metric cards (server-rendered) ──────────────────────────────────────
     let metrics_cards = format!(
         r#"<div class="card metric-grid">
@@ -151,10 +160,11 @@ fn build_html(meta: &ReportMeta, m: &MetricsJson, trades: &[TradeRecord], data_j
 
     let trade_count = trades.len();
 
-    let fund_code_esc     = super::html_escape(&meta.fund_code);
+    let fund_code_esc = super::html_escape(&meta.fund_code);
     let strategy_desc_esc = super::html_escape(&meta.strategy_desc);
 
-    format!(r#"<!DOCTYPE html>
+    format!(
+        r#"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8"/>
@@ -363,14 +373,14 @@ td.sell{{color:#27ae60;font-weight:600}}
 </body>
 </html>
 "#,
-        fund_code_esc     = fund_code_esc,
-        start             = meta.start,
-        end               = meta.end,
+        fund_code_esc = fund_code_esc,
+        start = meta.start,
+        end = meta.end,
         strategy_desc_esc = strategy_desc_esc,
-        metrics_cards     = metrics_cards,
-        trade_count       = trade_count,
-        trade_rows        = trade_rows,
-        data_json         = data_json,
+        metrics_cards = metrics_cards,
+        trade_count = trade_count,
+        trade_rows = trade_rows,
+        data_json = data_json,
     )
 }
 
@@ -379,10 +389,10 @@ td.sell{{color:#27ae60;font-weight:600}}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
     use crate::event::Direction;
     use crate::portfolio::{EquityPoint, Portfolio};
     use crate::result::{DailyRecord, TradeRecord};
+    use chrono::NaiveDate;
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
@@ -392,26 +402,78 @@ mod tests {
         let mut pf = Portfolio::new(0.0);
         pf.total_contributed = 2000.0;
         pf.curve = vec![
-            EquityPoint { date: d(2024, 1, 1), equity: 1000.0, contribution: 1000.0 },
-            EquityPoint { date: d(2024, 2, 1), equity: 2000.0, contribution: 1000.0 },
-            EquityPoint { date: d(2024, 2, 15), equity: 4000.0, contribution: 0.0 },
+            EquityPoint {
+                date: d(2024, 1, 1),
+                equity: 1000.0,
+                contribution: 1000.0,
+            },
+            EquityPoint {
+                date: d(2024, 2, 1),
+                equity: 2000.0,
+                contribution: 1000.0,
+            },
+            EquityPoint {
+                date: d(2024, 2, 15),
+                equity: 4000.0,
+                contribution: 0.0,
+            },
         ];
-        pf.flows = vec![(d(2024, 1, 1), -1000.0), (d(2024, 2, 1), -1000.0), (d(2024, 2, 15), 4000.0)];
+        pf.flows = vec![
+            (d(2024, 1, 1), -1000.0),
+            (d(2024, 2, 1), -1000.0),
+            (d(2024, 2, 15), 4000.0),
+        ];
         pf
     }
 
     fn make_daily() -> Vec<DailyRecord> {
         vec![
-            DailyRecord { date: d(2024, 1, 1),  nav: 1.0, adj_nav: 1.0, equity: 1000.0, contribution: 1000.0, shares: 1000.0, cash: 0.0 },
-            DailyRecord { date: d(2024, 2, 1),  nav: 1.0, adj_nav: 1.0, equity: 2000.0, contribution: 1000.0, shares: 2000.0, cash: 0.0 },
-            DailyRecord { date: d(2024, 2, 15), nav: 2.0, adj_nav: 2.0, equity: 4000.0, contribution: 0.0,    shares: 2000.0, cash: 0.0 },
+            DailyRecord {
+                date: d(2024, 1, 1),
+                nav: 1.0,
+                adj_nav: 1.0,
+                equity: 1000.0,
+                contribution: 1000.0,
+                shares: 1000.0,
+                cash: 0.0,
+            },
+            DailyRecord {
+                date: d(2024, 2, 1),
+                nav: 1.0,
+                adj_nav: 1.0,
+                equity: 2000.0,
+                contribution: 1000.0,
+                shares: 2000.0,
+                cash: 0.0,
+            },
+            DailyRecord {
+                date: d(2024, 2, 15),
+                nav: 2.0,
+                adj_nav: 2.0,
+                equity: 4000.0,
+                contribution: 0.0,
+                shares: 2000.0,
+                cash: 0.0,
+            },
         ]
     }
 
     fn make_trades() -> Vec<TradeRecord> {
         vec![
-            TradeRecord { date: d(2024, 1, 1), direction: Direction::Buy, shares: 1000.0, price: 1.0, fee: 0.0 },
-            TradeRecord { date: d(2024, 2, 1), direction: Direction::Buy, shares: 1000.0, price: 1.0, fee: 0.0 },
+            TradeRecord {
+                date: d(2024, 1, 1),
+                direction: Direction::Buy,
+                shares: 1000.0,
+                price: 1.0,
+                fee: 0.0,
+            },
+            TradeRecord {
+                date: d(2024, 2, 1),
+                direction: Direction::Buy,
+                shares: 1000.0,
+                price: 1.0,
+                fee: 0.0,
+            },
         ]
     }
 
@@ -439,10 +501,16 @@ mod tests {
         assert!(content.contains("const DATA"), "should embed const DATA");
         assert!(content.contains("161725"), "should contain fund code");
         assert!(content.contains("总收益"), "should contain 总收益 label");
-        assert!(content.contains("最大回撤"), "should contain 最大回撤 label");
+        assert!(
+            content.contains("最大回撤"),
+            "should contain 最大回撤 label"
+        );
         assert!(content.contains("echarts"), "should reference echarts");
         // Trades are embedded in data JSON and in rendered HTML rows
-        assert!(content.contains("buy") || content.contains("买入"), "should contain a trade entry");
+        assert!(
+            content.contains("buy") || content.contains("买入"),
+            "should contain a trade entry"
+        );
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp);
@@ -482,31 +550,55 @@ mod tests {
         // Note: <XSS> (without `/`) may appear inside the <script> DATA block
         // because serde_json does not escape `<`; that is safe since it's not
         // a closing tag. What matters is that the HTML body markup is escaped.
-        assert!(content.contains("&lt;XSS&gt;"), "escaped <XSS> must appear in HTML markup");
-        assert!(content.contains("dca &amp; params"), "escaped & must appear in HTML markup");
+        assert!(
+            content.contains("&lt;XSS&gt;"),
+            "escaped <XSS> must appear in HTML markup"
+        );
+        assert!(
+            content.contains("dca &amp; params"),
+            "escaped & must appear in HTML markup"
+        );
 
         // The title and h1 must not contain unescaped angle brackets
         // (check the title tag specifically)
         let title_start = content.find("<title>").expect("title tag");
-        let title_end   = content.find("</title>").expect("/title tag");
-        let title_text  = &content[title_start..title_end];
-        assert!(!title_text.contains("<XSS>"), "raw <XSS> must not appear inside <title>");
-        assert!(title_text.contains("&lt;XSS&gt;"), "<title> must contain escaped form");
+        let title_end = content.find("</title>").expect("/title tag");
+        let title_text = &content[title_start..title_end];
+        assert!(
+            !title_text.contains("<XSS>"),
+            "raw <XSS> must not appear inside <title>"
+        );
+        assert!(
+            title_text.contains("&lt;XSS&gt;"),
+            "<title> must contain escaped form"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn render_report_html_contains_core_markup() {
-        use crate::portfolio::{Portfolio, EquityPoint};
+        use crate::portfolio::{EquityPoint, Portfolio};
         let mut pf = Portfolio::new(0.0);
-        pf.curve.push(EquityPoint { date: d(2024,1,1), equity: 1000.0, contribution: 1000.0 });
-        pf.curve.push(EquityPoint { date: d(2024,2,1), equity: 1500.0, contribution: 0.0 });
+        pf.curve.push(EquityPoint {
+            date: d(2024, 1, 1),
+            equity: 1000.0,
+            contribution: 1000.0,
+        });
+        pf.curve.push(EquityPoint {
+            date: d(2024, 2, 1),
+            equity: 1500.0,
+            contribution: 0.0,
+        });
         pf.total_contributed = 1000.0;
-        pf.flows = vec![(d(2024,1,1), -1000.0), (d(2024,2,1), 1500.0)];
+        pf.flows = vec![(d(2024, 1, 1), -1000.0), (d(2024, 2, 1), 1500.0)];
         let meta = ReportMeta {
-            fund_code: "161725".into(), start: d(2024,1,1), end: d(2024,2,1),
-            strategy: "dca".into(), strategy_desc: "dca".into(), initial_cash: 0.0,
+            fund_code: "161725".into(),
+            start: d(2024, 1, 1),
+            end: d(2024, 2, 1),
+            strategy: "dca".into(),
+            strategy_desc: "dca".into(),
+            initial_cash: 0.0,
         };
         let html = render_report_html(&meta, &pf, &[], &[]);
         assert!(html.contains("const DATA"), "应内嵌 const DATA");
@@ -536,7 +628,10 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
 
         // The raw `</script>` must not appear anywhere in the output
-        assert!(!content.contains("</script><script>"), "unescaped </script> injection must not appear");
+        assert!(
+            !content.contains("</script><script>"),
+            "unescaped </script> injection must not appear"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -28,6 +28,7 @@ services:
       - "${XLH_BIND_ADDR:-127.0.0.1}:${XLH_PORT:-8080}:8080"
     environment:
       - TZ=${TZ:-Asia/Shanghai}
+      - XLH_COOKIE_SECURE=${XLH_COOKIE_SECURE:-true}
     volumes:
       # 绝对路径、部署目录之外 —— 这是「重新部署不丢数据」的关键
       - ${XLH_STATE_DIR:?请在 .env 里设置 XLH_STATE_DIR（绝对路径）}/data:/app/data
@@ -38,8 +39,8 @@ services:
     restart: unless-stopped
     command: ["serve", "--port", "8080"]
     healthcheck:
-      # 未登录会 303 跳登录页 —— 能跳就说明进程活着、路由正常
-      test: ["CMD-SHELL", "xlh --help >/dev/null 2>&1 || exit 1"]
+      # 探测 HTTP 路由、主库与实时库，而非仅确认二进制还能打印帮助。
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -4,10 +4,10 @@
 //! 便于测试」、`schedule.rs` 的 `due_users` 纯函数）：**决策逻辑是纯函数，
 //! IO 在外层**。`select_pushable` / `render_movers` / `render_summary` 全都
 //! 不碰网络不碰库，可直接单测。
-use std::collections::HashSet;
 use anyhow::{anyhow, Result};
 use chrono::{Local, NaiveDate, NaiveDateTime};
 use rusqlite::Connection;
+use std::collections::HashSet;
 
 use super::config::RealtimeCfg;
 use super::movers::{self, Baseline, Divergence, Horizon, Mover};
@@ -52,9 +52,15 @@ pub enum Skip {
 
 /// 纯函数：给定当前时刻与库状态，判断这一 tick 该不该抓。
 pub fn should_run(conn: &Connection, now: NaiveDateTime) -> Result<Option<Skip>> {
-    if calendar::is_weekend(now.date()) { return Ok(Some(Skip::Weekend)) }
-    if !calendar::is_tick_time(now.time()) { return Ok(Some(Skip::NotTickTime)) }
-    if store::is_non_trading(conn, now.date())? { return Ok(Some(Skip::KnownHoliday)) }
+    if calendar::is_weekend(now.date()) {
+        return Ok(Some(Skip::Weekend));
+    }
+    if !calendar::is_tick_time(now.time()) {
+        return Ok(Some(Skip::NotTickTime));
+    }
+    if store::is_non_trading(conn, now.date())? {
+        return Ok(Some(Skip::KnownHoliday));
+    }
     Ok(None)
 }
 
@@ -66,21 +72,43 @@ pub fn should_run(conn: &Connection, now: NaiveDateTime) -> Result<Option<Skip>>
 ///
 /// 没有这三层，一天 20 时点 × 数十只 = 数百条，飞书会被刷到静音 ——
 /// 那等于这个功能白做。
-pub fn select_pushable(movers: &[Mover], already: &HashSet<String>, cfg: &RealtimeCfg) -> Vec<Mover> {
-    let strong: Vec<Mover> = movers.iter()
+pub fn select_pushable(
+    movers: &[Mover],
+    already: &HashSet<String>,
+    cfg: &RealtimeCfg,
+) -> Vec<Mover> {
+    let strong: Vec<Mover> = movers
+        .iter()
         .filter(|m| !already.contains(&m.code))
-        .filter(|m| movers::is_strong(
-            m.jump_pct, m.vol_surge_x, cfg.price_jump_pct, cfg.volume_surge_x, cfg.strong_signal_x))
+        .filter(|m| {
+            movers::is_strong(
+                m.jump_pct,
+                m.vol_surge_x,
+                cfg.price_jump_pct,
+                cfg.volume_surge_x,
+                cfg.strong_signal_x,
+            )
+        })
         .cloned()
         .collect();
     movers::rank_top(strong, cfg.max_push_per_tick)
 }
 
-fn dir_arrow(pct: f64) -> &'static str { if pct >= 0.0 { "涨" } else { "跌" } }
+fn dir_arrow(pct: f64) -> &'static str {
+    if pct >= 0.0 {
+        "涨"
+    } else {
+        "跌"
+    }
+}
 
 fn flow_text(m: &Mover) -> String {
     match m.main_net_pct {
-        Some(p) => format!("主力{}{:.1}%", if p >= 0.0 { "净流入" } else { "净流出" }, p.abs() * 100.0),
+        Some(p) => format!(
+            "主力{}{:.1}%",
+            if p >= 0.0 { "净流入" } else { "净流出" },
+            p.abs() * 100.0
+        ),
         None => "资金流暂不可用".to_string(),
     }
 }
@@ -94,7 +122,10 @@ fn divergence_text(d: Divergence) -> &'static str {
 }
 
 fn horizon_text(h: Horizon) -> &'static str {
-    match h { Horizon::Short => "短线", Horizon::Long => "长线" }
+    match h {
+        Horizon::Short => "短线",
+        Horizon::Long => "长线",
+    }
 }
 
 /// 免责声明。与 `StockRecommendReport.disclaimer` 一致的立场，并额外点明
@@ -112,10 +143,18 @@ pub fn render_movers(movers: &[Mover], flow_ok: bool) -> String {
     for m in movers {
         s.push_str(&format!(
             "**{} {}** {} {:+.2}% | 量能 {:.1}× | {} | {}\n",
-            m.code, m.name, dir_arrow(m.jump_pct), m.jump_pct * 100.0,
-            m.vol_surge_x, flow_text(m), horizon_text(m.horizon)));
+            m.code,
+            m.name,
+            dir_arrow(m.jump_pct),
+            m.jump_pct * 100.0,
+            m.vol_surge_x,
+            flow_text(m),
+            horizon_text(m.horizon)
+        ));
         let d = divergence_text(m.divergence);
-        if !d.is_empty() { s.push_str(&format!("　{}\n", d)); }
+        if !d.is_empty() {
+            s.push_str(&format!("　{}\n", d));
+        }
         if m.baseline == Baseline::Fallback {
             s.push_str("　（量能基准历史样本不足，已降级为当日均值）\n");
         }
@@ -130,7 +169,10 @@ pub fn render_movers(movers: &[Mover], flow_ok: bool) -> String {
 /// 异动发出后到收盘是涨是跌，数月后即可回答「这套阈值到底有没有用」。
 pub fn render_summary(rows: &[SignalRow], day: NaiveDate) -> String {
     if rows.is_empty() {
-        return format!("**{} 盘中异动汇总**\n\n今日无异动信号。\n\n{}", day, DISCLAIMER);
+        return format!(
+            "**{} 盘中异动汇总**\n\n今日无异动信号。\n\n{}",
+            day, DISCLAIMER
+        );
     }
     let mut s = format!("**{} 盘中异动汇总**（{} 条）\n\n", day, rows.len());
     for r in rows {
@@ -145,8 +187,16 @@ pub fn render_summary(rows: &[SignalRow], day: NaiveDate) -> String {
         };
         s.push_str(&format!(
             "- {} **{} {}** 触发 {:+.2}% @{:.2} | 量能 {:.1}× | {} | {} | 至收盘 {}\n",
-            r.ts.format("%H:%M"), r.code, r.name, r.jump_pct * 100.0, r.trigger_price,
-            r.vol_surge_x, flow, tag_cn(&r.horizon_tag), ret));
+            r.ts.format("%H:%M"),
+            r.code,
+            r.name,
+            r.jump_pct * 100.0,
+            r.trigger_price,
+            r.vol_surge_x,
+            flow,
+            tag_cn(&r.horizon_tag),
+            ret
+        ));
     }
     let known: Vec<f64> = rows.iter().filter_map(|r| r.close_ret).collect();
     if !known.is_empty() {
@@ -154,20 +204,28 @@ pub fn render_summary(rows: &[SignalRow], day: NaiveDate) -> String {
         let avg = known.iter().sum::<f64>() / known.len() as f64;
         s.push_str(&format!(
             "\n信号后至收盘：{}/{} 上涨，均值 {:+.2}%（样本 {} 条，尚不足以证明有效性）\n",
-            win, known.len(), avg * 100.0, known.len()));
+            win,
+            known.len(),
+            avg * 100.0,
+            known.len()
+        ));
     }
     s.push_str(&format!("\n{}", DISCLAIMER));
     s
 }
 
 fn tag_cn(tag: &str) -> &str {
-    match tag { "long" => "长线", _ => "短线" }
+    match tag {
+        "long" => "长线",
+        _ => "短线",
+    }
 }
 
 /// 全市场 A 股符号表（腾讯格式）。从既有的 universe 清单派生 ——
 /// 不重复造轮子，也不硬编码股票池。
 pub fn a_share_symbols(listings: &[crate::stock::data::universe::Listing]) -> Vec<String> {
-    listings.iter()
+    listings
+        .iter()
         .filter(|l| !l.is_risky_shell())
         .filter_map(|l| snapshot::symbol(l.market, &l.code))
         .collect()
@@ -185,7 +243,9 @@ pub fn run_tick(
     now: NaiveDateTime,
 ) -> Result<TickOutcome> {
     let ticks = snapshot::fetch(symbols)?;
-    if ticks.is_empty() { return Err(anyhow!("快照为空")) }
+    if ticks.is_empty() {
+        return Err(anyhow!("快照为空"));
+    }
 
     // 快照自证：拿到的是今天的行情吗？
     let tss: Vec<NaiveDateTime> = ticks.iter().map(|t| t.ts).collect();
@@ -195,18 +255,24 @@ pub fn run_tick(
         // 把当天这个真实交易日毒化了）。只有开盘后仍陈旧才是真节假日。
         if calendar::stale_means_holiday(now) {
             store::mark_non_trading(conn, now.date())?;
-            return Err(anyhow!("{} 非交易日（开盘后行情仍非今日），已标记", now.date()));
+            return Err(anyhow!(
+                "{} 非交易日（开盘后行情仍非今日），已标记",
+                now.date()
+            ));
         }
         return Err(anyhow!(
             "{} 行情尚未更新（当前 {}，早于开盘），未做任何标记",
-            now.date(), now.format("%H:%M")));
+            now.date(),
+            now.format("%H:%M")
+        ));
     }
 
     let n = store::insert_ticks(conn, &ticks)?;
     let candidates = detect(conn, cfg, &ticks, now)?;
 
     // 资金流：只查候选。失败不致命 —— 佐证拿不到不影响价量主判定成立。
-    let secids: Vec<String> = candidates.iter()
+    let secids: Vec<String> = candidates
+        .iter()
         .filter_map(|m| secid_of(&m.code).map(|s| s.param()))
         .collect();
     let (flows, flow_ok) = match flow::fetch(&secids) {
@@ -217,18 +283,21 @@ pub fn run_tick(
         }
     };
 
-    let mut out: Vec<Mover> = candidates.into_iter().map(|mut m| {
-        if let Some(f) = flows.get(&m.code) {
-            m.main_net = Some(f.main_net);
-            m.main_net_pct = Some(f.main_net_pct);
-            m.name = f.name.clone();
-        } else if let Some(n) = names.get(&m.code) {
-            m.name = n.clone();
-        }
-        m.divergence = movers::divergence(m.jump_pct, m.main_net_pct, cfg.main_flow_pct);
-        m.horizon = classify_one(&m.code, now.date());
-        m
-    }).collect();
+    let mut out: Vec<Mover> = candidates
+        .into_iter()
+        .map(|mut m| {
+            if let Some(f) = flows.get(&m.code) {
+                m.main_net = Some(f.main_net);
+                m.main_net_pct = Some(f.main_net_pct);
+                m.name = f.name.clone();
+            } else if let Some(n) = names.get(&m.code) {
+                m.name = n.clone();
+            }
+            m.divergence = movers::divergence(m.jump_pct, m.main_net_pct, cfg.main_flow_pct);
+            m.horizon = classify_one(&m.code, now.date());
+            m
+        })
+        .collect();
     out = movers::rank_top(out, usize::MAX);
 
     let already = store::pushed_today(conn, now.date())?;
@@ -239,7 +308,12 @@ pub fn run_tick(
     }
     store::prune(conn, now, cfg.retain_days)?;
 
-    Ok(TickOutcome { ticks: n, movers: out, pushed: pushable, flow_ok })
+    Ok(TickOutcome {
+        ticks: n,
+        movers: out,
+        pushed: pushable,
+        flow_ok,
+    })
 }
 
 fn secid_of(code: &str) -> Option<crate::stock::data::secid::Secid> {
@@ -248,7 +322,10 @@ fn secid_of(code: &str) -> Option<crate::stock::data::secid::Secid> {
 
 /// 对全市场快照跑异动检测。
 fn detect(
-    conn: &Connection, cfg: &RealtimeCfg, ticks: &[snapshot::Tick], now: NaiveDateTime,
+    conn: &Connection,
+    cfg: &RealtimeCfg,
+    ticks: &[snapshot::Tick],
+    now: NaiveDateTime,
 ) -> Result<Vec<Mover>> {
     let since = now.date() - chrono::Duration::days(cfg.baseline_days);
     let slot = movers::slot_of(now);
@@ -259,13 +336,22 @@ fn detect(
         // 冷启动兜底：无历史同时点样本时用当日累计均量。
         // 当日均量 = 累计量 ÷ 已过时点数，粗糙但总比不判定强。
         let today_avg = today_average(conn, &t.code, now)?;
-        let Some((jump, surge, base, ts, price)) = movers::compute(&recent, &history, today_avg) else { continue };
-        if !movers::is_mover(jump, surge, cfg.price_jump_pct, cfg.volume_surge_x) { continue }
+        let Some((jump, surge, base, ts, price)) = movers::compute(&recent, &history, today_avg)
+        else {
+            continue;
+        };
+        if !movers::is_mover(jump, surge, cfg.price_jump_pct, cfg.volume_surge_x) {
+            continue;
+        }
         out.push(Mover {
             code: t.code.clone(),
             name: t.code.clone(), // 稍后由 flow/names 补齐
-            ts, price, jump_pct: jump, vol_surge_x: surge,
-            main_net: None, main_net_pct: None,
+            ts,
+            price,
+            jump_pct: jump,
+            vol_surge_x: surge,
+            main_net: None,
+            main_net_pct: None,
             divergence: Divergence::Unknown,
             horizon: Horizon::Short,
             baseline: base,
@@ -277,9 +363,14 @@ fn detect(
 /// 当日已过时点的平均每时点成交量增量。仅作冷启动兜底。
 fn today_average(conn: &Connection, code: &str, now: NaiveDateTime) -> Result<Option<f64>> {
     let all = store::recent_ticks(conn, code, calendar::ticks_per_day())?;
-    let today: Vec<f64> = all.iter().filter(|(ts, _, _)| ts.date() == now.date())
-        .map(|(_, _, v)| *v).collect();
-    if today.len() < 2 { return Ok(None) }
+    let today: Vec<f64> = all
+        .iter()
+        .filter(|(ts, _, _)| ts.date() == now.date())
+        .map(|(_, _, v)| *v)
+        .collect();
+    if today.len() < 2 {
+        return Ok(None);
+    }
     // 累计量的首尾差 ÷ 间隔数
     let (max, min) = (today[0], today[today.len() - 1]);
     let spans = (today.len() - 1) as f64;
@@ -293,7 +384,9 @@ fn today_average(conn: &Connection, code: &str, now: NaiveDateTime) -> Result<Op
 fn classify_one(code: &str, today: NaiveDate) -> Horizon {
     let cache = std::path::Path::new(".cache");
     let pe_pct = (|| {
-        let points = crate::stock::data::valuation::load_or_fetch(code, &cache.join("valuation"), today).ok()?;
+        let points =
+            crate::stock::data::valuation::load_or_fetch(code, &cache.join("valuation"), today)
+                .ok()?;
         let cur = crate::stock::data::valuation::at_or_before(&points, today)?;
         let pe = cur.pe_ttm?;
         let hist = crate::stock::data::valuation::positive_pes(&points);
@@ -301,12 +394,19 @@ fn classify_one(code: &str, today: NaiveDate) -> Horizon {
     })();
     let trend = (|| {
         let start = today - chrono::Duration::days(800);
-        let bars = crate::stock::data::cache::load_or_fetch(code, &cache.join("stock"), start, today).ok()?;
+        let bars =
+            crate::stock::data::cache::load_or_fetch(code, &cache.join("stock"), start, today)
+                .ok()?;
         let d = crate::stock::diagnose::diagnose(
-            code.to_string(), code.to_string(), &bars,
-            &crate::stock::diagnose::DiagnoseParams::default()).ok()?;
+            code.to_string(),
+            code.to_string(),
+            &bars,
+            &crate::stock::diagnose::DiagnoseParams::default(),
+        )
+        .ok()?;
         Some(d.trend)
-    })().unwrap_or_default();
+    })()
+    .unwrap_or_default();
     movers::classify(pe_pct, &trend, LOW_PE_PCT)
 }
 
@@ -323,9 +423,16 @@ fn backfill_close(conn: &Connection, day: NaiveDate) -> Result<()> {
     for s in store::signals_missing_close(conn, day)? {
         let ret = (|| {
             let bars = crate::stock::data::cache::load_or_fetch(
-                &s.code, cache, day - chrono::Duration::days(10), day).ok()?;
+                &s.code,
+                cache,
+                day - chrono::Duration::days(10),
+                day,
+            )
+            .ok()?;
             let close = bars.iter().find(|b| b.date == day)?.close;
-            if s.trigger_price <= 0.0 { return None }
+            if s.trigger_price <= 0.0 {
+                return None;
+            }
             Some((close - s.trigger_price) / s.trigger_price)
         })();
         // ret 为 None 时写 NULL 而非 0：日线还没同步到 / 该股当日停牌，
@@ -342,7 +449,9 @@ pub fn is_summary_time(now: NaiveDateTime) -> bool {
 }
 
 /// 今天（本地时区）。
-pub fn today() -> NaiveDate { Local::now().date_naive() }
+pub fn today() -> NaiveDate {
+    Local::now().date_naive()
+}
 
 /// 守护侧状态：缓存全市场符号表，每日刷新一次。
 ///
@@ -358,12 +467,19 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new(cfg: RealtimeCfg) -> Self {
-        Self { cfg, symbols: Vec::new(), names: Default::default(), loaded_for: None }
+        Self {
+            cfg,
+            symbols: Vec::new(),
+            names: Default::default(),
+            loaded_for: None,
+        }
     }
 
     /// 全市场符号表，按天惰性加载。
     fn ensure_universe(&mut self, today: NaiveDate) -> Result<()> {
-        if self.loaded_for == Some(today) && !self.symbols.is_empty() { return Ok(()) }
+        if self.loaded_for == Some(today) && !self.symbols.is_empty() {
+            return Ok(());
+        }
         let cache = std::path::Path::new(".cache");
         // universe 按「最近已收盘交易日」组织，盘中要用昨天的清单 ——
         // 今天的估值快照要等收盘后才有。清单本身（代码+名称）不受影响。
@@ -373,13 +489,23 @@ impl Daemon {
         self.symbols = a_share_symbols(&listings);
         self.names = crate::stock::data::universe::name_map(&listings);
         self.loaded_for = Some(today);
-        println!("实时抓取：已加载 {} 只 A 股符号（清单日 {}）", self.symbols.len(), date);
+        println!(
+            "实时抓取：已加载 {} 只 A 股符号（清单日 {}）",
+            self.symbols.len(),
+            date
+        );
         Ok(())
     }
 
     /// 跑一个 tick。返回 None 表示本轮无需动作（非抓取时点/周末/已知节假日）。
-    pub fn tick(&mut self, conn: &mut Connection, now: NaiveDateTime) -> Result<Option<TickOutcome>> {
-        if should_run(conn, now)?.is_some() { return Ok(None) }
+    pub fn tick(
+        &mut self,
+        conn: &mut Connection,
+        now: NaiveDateTime,
+    ) -> Result<Option<TickOutcome>> {
+        if should_run(conn, now)?.is_some() {
+            return Ok(None);
+        }
         self.ensure_universe(now.date())?;
         let names = std::mem::take(&mut self.names);
         let r = run_tick(conn, &self.cfg, &self.symbols, &names, now);
@@ -393,18 +519,31 @@ mod tests {
     use super::*;
 
     fn dt(h: u32, mi: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(2026, 7, 16).unwrap().and_hms_opt(h, mi, 0).unwrap()
+        NaiveDate::from_ymd_opt(2026, 7, 16)
+            .unwrap()
+            .and_hms_opt(h, mi, 0)
+            .unwrap()
     }
 
     fn mv(code: &str, jump: f64, surge: f64, pct: Option<f64>) -> Mover {
         Mover {
-            code: code.into(), name: format!("股{code}"), ts: dt(10, 0), price: 10.0,
-            jump_pct: jump, vol_surge_x: surge, main_net: pct.map(|p| p * 1e8), main_net_pct: pct,
-            divergence: Divergence::None, horizon: Horizon::Short, baseline: Baseline::History,
+            code: code.into(),
+            name: format!("股{code}"),
+            ts: dt(10, 0),
+            price: 10.0,
+            jump_pct: jump,
+            vol_surge_x: surge,
+            main_net: pct.map(|p| p * 1e8),
+            main_net_pct: pct,
+            divergence: Divergence::None,
+            horizon: Horizon::Short,
+            baseline: Baseline::History,
         }
     }
 
-    fn cfg() -> RealtimeCfg { RealtimeCfg::default() }
+    fn cfg() -> RealtimeCfg {
+        RealtimeCfg::default()
+    }
 
     #[test]
     fn weak_signals_are_stored_but_not_pushed() {
@@ -433,7 +572,9 @@ mod tests {
     #[test]
     fn push_is_capped_per_tick_and_ranked_by_flow() {
         // 6 只强信号 → 只推资金流占比最高的 5 只
-        let ms: Vec<Mover> = (0..6).map(|i| mv(&format!("C{i}"), 0.04, 5.0, Some(i as f64 * 0.01))).collect();
+        let ms: Vec<Mover> = (0..6)
+            .map(|i| mv(&format!("C{i}"), 0.04, 5.0, Some(i as f64 * 0.01)))
+            .collect();
         let out = select_pushable(&ms, &HashSet::new(), &cfg());
         assert_eq!(out.len(), 5, "每时点上限 5 只");
         assert_eq!(out[0].code, "C5", "资金流占比最高的排第一");
@@ -456,10 +597,16 @@ mod tests {
         let pushable = select_pushable(&all, &already, &cfg());
 
         assert_eq!(pushable.len(), 1);
-        assert_eq!(pushable[0].code, "SECOND", "已推过的 TOP 须被过滤，只推 SECOND");
+        assert_eq!(
+            pushable[0].code, "SECOND",
+            "已推过的 TOP 须被过滤，只推 SECOND"
+        );
         // 这行演示了那个 bug：按数量截取会拿到 TOP —— 完全错误的那只
-        assert_eq!(all.iter().take(pushable.len()).next().unwrap().code, "TOP",
-            "take(n) 会拿到 TOP，证明按数量截取是错的");
+        assert_eq!(
+            all.iter().take(pushable.len()).next().unwrap().code,
+            "TOP",
+            "take(n) 会拿到 TOP，证明按数量截取是错的"
+        );
     }
 
     #[test]
@@ -475,7 +622,10 @@ mod tests {
         let mut m = mv("600519", 0.04, 5.0, Some(-0.08));
         m.divergence = Divergence::RetailChasing;
         let s = render_movers(&[m], true);
-        assert!(s.contains("散户抬轿"), "背离须显式标出，这是资金流最有信息量的用途");
+        assert!(
+            s.contains("散户抬轿"),
+            "背离须显式标出，这是资金流最有信息量的用途"
+        );
     }
 
     #[test]
@@ -499,9 +649,16 @@ mod tests {
     fn summary_shows_unknown_outcome_not_zero() {
         // 「结局未知」不能显示成 0.00% —— 那是在伪造数据
         let rows = vec![SignalRow {
-            id: 1, code: "A".into(), name: "股A".into(), ts: dt(10, 0),
-            trigger_price: 10.0, jump_pct: 0.04, vol_surge_x: 5.0,
-            main_net_pct: None, divergence: "none".into(), horizon_tag: "short".into(),
+            id: 1,
+            code: "A".into(),
+            name: "股A".into(),
+            ts: dt(10, 0),
+            trigger_price: 10.0,
+            jump_pct: 0.04,
+            vol_surge_x: 5.0,
+            main_net_pct: None,
+            divergence: "none".into(),
+            horizon_tag: "short".into(),
             close_ret: None,
         }];
         let s = render_summary(&rows, NaiveDate::from_ymd_opt(2026, 7, 16).unwrap());
@@ -514,9 +671,16 @@ mod tests {
         // 这是本项目最有价值的输出：几个月后靠它回答「阈值有没有用」。
         // 但必须同时说清样本量不足，否则 2/3 会被误读成 67% 胜率
         let mk = |code: &str, ret: f64| SignalRow {
-            id: 1, code: code.into(), name: "x".into(), ts: dt(10, 0),
-            trigger_price: 10.0, jump_pct: 0.04, vol_surge_x: 5.0,
-            main_net_pct: Some(0.06), divergence: "none".into(), horizon_tag: "short".into(),
+            id: 1,
+            code: code.into(),
+            name: "x".into(),
+            ts: dt(10, 0),
+            trigger_price: 10.0,
+            jump_pct: 0.04,
+            vol_surge_x: 5.0,
+            main_net_pct: Some(0.06),
+            divergence: "none".into(),
+            horizon_tag: "short".into(),
             close_ret: Some(ret),
         };
         let rows = vec![mk("A", 0.02), mk("B", -0.01), mk("C", 0.03)];
@@ -535,7 +699,10 @@ mod tests {
     #[test]
     fn should_run_skips_weekend_and_off_hours() {
         let c = store::open_in_memory().unwrap();
-        let sat = NaiveDate::from_ymd_opt(2026, 7, 18).unwrap().and_hms_opt(10, 0, 0).unwrap();
+        let sat = NaiveDate::from_ymd_opt(2026, 7, 18)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
         assert_eq!(should_run(&c, sat).unwrap(), Some(Skip::Weekend));
         assert_eq!(should_run(&c, dt(12, 0)).unwrap(), Some(Skip::NotTickTime));
         assert_eq!(should_run(&c, dt(10, 0)).unwrap(), None, "周四 10:00 应抓");
@@ -553,7 +720,10 @@ mod tests {
     #[test]
     fn summary_time_is_after_close() {
         assert!(is_summary_time(dt(15, 10)));
-        assert!(!is_summary_time(dt(15, 0)), "15:00 还是抓取时点，不是汇总时刻");
+        assert!(
+            !is_summary_time(dt(15, 0)),
+            "15:00 还是抓取时点，不是汇总时刻"
+        );
         assert!(!is_summary_time(dt(14, 10)));
     }
 }

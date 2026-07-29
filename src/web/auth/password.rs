@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Result};
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
 use argon2::Argon2;
 
 /// 生成 argon2 PHC 串（含随机盐）。
@@ -15,7 +17,9 @@ pub fn hash(plain: &str) -> Result<String> {
 /// 校验明文口令与 PHC 串是否匹配；任何解析/校验错误都视为不匹配。
 pub fn verify(plain: &str, phc: &str) -> bool {
     match PasswordHash::new(phc) {
-        Ok(parsed) => Argon2::default().verify_password(plain.as_bytes(), &parsed).is_ok(),
+        Ok(parsed) => Argon2::default()
+            .verify_password(plain.as_bytes(), &parsed)
+            .is_ok(),
         Err(_) => false,
     }
 }

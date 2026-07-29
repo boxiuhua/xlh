@@ -1,16 +1,16 @@
-use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use chrono::NaiveDate;
 use serde::Deserialize;
+use std::path::PathBuf;
 
 use crate::broker::{FeeModel, SellTier};
-use crate::strategy::{Period, Strategy};
+use crate::strategy::adaptive::Adaptive;
 use crate::strategy::dca::Dca;
+use crate::strategy::rsi::Rsi;
+use crate::strategy::rules::{Rule, RuleLayer};
 use crate::strategy::smart_dca::SmartDca;
 use crate::strategy::trend::Trend;
-use crate::strategy::rsi::Rsi;
-use crate::strategy::adaptive::Adaptive;
-use crate::strategy::rules::{Rule, RuleLayer};
+use crate::strategy::{Period, Strategy};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -39,7 +39,9 @@ pub struct OptimizeCfg {
     pub rules: Vec<RuleCfg>,
 }
 
-fn default_top_n() -> usize { 5 }
+fn default_top_n() -> usize {
+    5
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CompareRun {
@@ -68,7 +70,10 @@ pub struct FeesCfg {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct SellTierCfg { pub max_days: i64, pub rate: f64 }
+pub struct SellTierCfg {
+    pub max_days: i64,
+    pub rate: f64,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct StrategyCfg {
@@ -102,20 +107,46 @@ pub struct ReportCfg {
 
 // 各策略参数结构
 #[derive(Debug, Deserialize)]
-struct DcaParams { period: String, day: u32, base_amount: f64 }
+struct DcaParams {
+    period: String,
+    day: u32,
+    base_amount: f64,
+}
 
 #[derive(Debug, Deserialize)]
-struct SmartDcaParams { period: String, day: u32, base_amount: f64, ma_window: usize, #[serde(default = "one")] k: f64 }
-fn one() -> f64 { 1.0 }
+struct SmartDcaParams {
+    period: String,
+    day: u32,
+    base_amount: f64,
+    ma_window: usize,
+    #[serde(default = "one")]
+    k: f64,
+}
+fn one() -> f64 {
+    1.0
+}
 
 #[derive(Debug, Deserialize)]
-struct TrendParams { short_window: usize, long_window: usize, amount: f64 }
+struct TrendParams {
+    short_window: usize,
+    long_window: usize,
+    amount: f64,
+}
 
 #[derive(Debug, Deserialize)]
-struct RsiParams { rsi_window: usize, oversold: f64, overbought: f64, amount: f64 }
+struct RsiParams {
+    rsi_window: usize,
+    oversold: f64,
+    overbought: f64,
+    amount: f64,
+}
 
 #[derive(Debug, Deserialize)]
-struct AdaptiveParams { period: String, day: u32, base_amount: f64 }
+struct AdaptiveParams {
+    period: String,
+    day: u32,
+    base_amount: f64,
+}
 
 fn parse_period(s: &str) -> Result<Period> {
     match s.to_lowercase().as_str() {
@@ -137,7 +168,8 @@ fn validate(cfg: &Config) -> Result<()> {
     if cfg.data.start >= cfg.data.end {
         return Err(anyhow!(
             "配置错误: data.start ({}) 必须早于 data.end ({})",
-            cfg.data.start, cfg.data.end
+            cfg.data.start,
+            cfg.data.end
         ));
     }
     if !(0.0..1.0).contains(&cfg.fees.buy_rate) {
@@ -160,18 +192,31 @@ fn validate(cfg: &Config) -> Result<()> {
 pub fn build_fee(cfg: &Config) -> FeeModel {
     FeeModel {
         buy_rate: cfg.fees.buy_rate,
-        sell_tiers: cfg.fees.sell_tiers.iter()
-            .map(|t| SellTier { max_days: t.max_days, rate: t.rate })
+        sell_tiers: cfg
+            .fees
+            .sell_tiers
+            .iter()
+            .map(|t| SellTier {
+                max_days: t.max_days,
+                rate: t.rate,
+            })
             .collect(),
     }
 }
 
 fn build_rules_from(rules: &[RuleCfg]) -> Result<Vec<Rule>> {
-    rules.iter().map(|r| match r.kind.as_str() {
-        "take_profit" => Ok(Rule::TakeProfit { target_return: r.target_return }),
-        "stop_loss" => Ok(Rule::StopLoss { max_drawdown: r.max_drawdown }),
-        other => Err(anyhow!("未知规则: {other}")),
-    }).collect()
+    rules
+        .iter()
+        .map(|r| match r.kind.as_str() {
+            "take_profit" => Ok(Rule::TakeProfit {
+                target_return: r.target_return,
+            }),
+            "stop_loss" => Ok(Rule::StopLoss {
+                max_drawdown: r.max_drawdown,
+            }),
+            other => Err(anyhow!("未知规则: {other}")),
+        })
+        .collect()
 }
 
 pub fn build_strategy_from(
@@ -179,7 +224,9 @@ pub fn build_strategy_from(
     params: &Option<toml::Value>,
     rules: &[RuleCfg],
 ) -> Result<Box<dyn Strategy>> {
-    let params = params.clone().unwrap_or(toml::Value::Table(toml::Table::new()));
+    let params = params
+        .clone()
+        .unwrap_or(toml::Value::Table(toml::Table::new()));
     let base: Box<dyn Strategy> = match kind {
         "dca" => {
             let p: DcaParams = params.try_into()?;
@@ -188,19 +235,32 @@ pub fn build_strategy_from(
         "smart_dca" => {
             let p: SmartDcaParams = params.try_into()?;
             if p.ma_window < 1 {
-                return Err(anyhow!("配置错误: smart_dca.ma_window 必须 >= 1，当前值: {}", p.ma_window));
+                return Err(anyhow!(
+                    "配置错误: smart_dca.ma_window 必须 >= 1，当前值: {}",
+                    p.ma_window
+                ));
             }
-            Box::new(SmartDca::new(parse_period(&p.period)?, p.day, p.base_amount, p.ma_window, p.k))
+            Box::new(SmartDca::new(
+                parse_period(&p.period)?,
+                p.day,
+                p.base_amount,
+                p.ma_window,
+                p.k,
+            ))
         }
         "trend" => {
             let p: TrendParams = params.try_into()?;
             if p.short_window < 1 {
-                return Err(anyhow!("配置错误: trend.short_window 必须 >= 1，当前值: {}", p.short_window));
+                return Err(anyhow!(
+                    "配置错误: trend.short_window 必须 >= 1，当前值: {}",
+                    p.short_window
+                ));
             }
             if p.short_window >= p.long_window {
                 return Err(anyhow!(
                     "配置错误: trend.short_window ({}) 必须小于 long_window ({})",
-                    p.short_window, p.long_window
+                    p.short_window,
+                    p.long_window
                 ));
             }
             Box::new(Trend::new(p.short_window, p.long_window, p.amount))
@@ -208,30 +268,51 @@ pub fn build_strategy_from(
         "rsi" => {
             let p: RsiParams = params.try_into()?;
             if p.rsi_window < 1 {
-                return Err(anyhow!("配置错误: rsi.rsi_window 必须 >= 1，当前值: {}", p.rsi_window));
+                return Err(anyhow!(
+                    "配置错误: rsi.rsi_window 必须 >= 1，当前值: {}",
+                    p.rsi_window
+                ));
             }
             if !(0.0..=100.0).contains(&p.oversold) || !(0.0..=100.0).contains(&p.overbought) {
                 return Err(anyhow!("配置错误: rsi.oversold/overbought 必须在 [0,100]"));
             }
             if p.oversold >= p.overbought {
-                return Err(anyhow!("配置错误: rsi.oversold ({}) 必须小于 overbought ({})", p.oversold, p.overbought));
+                return Err(anyhow!(
+                    "配置错误: rsi.oversold ({}) 必须小于 overbought ({})",
+                    p.oversold,
+                    p.overbought
+                ));
             }
             if p.amount <= 0.0 {
-                return Err(anyhow!("配置错误: rsi.amount 必须 > 0，当前值: {}", p.amount));
+                return Err(anyhow!(
+                    "配置错误: rsi.amount 必须 > 0，当前值: {}",
+                    p.amount
+                ));
             }
             Box::new(Rsi::new(p.rsi_window, p.oversold, p.overbought, p.amount))
         }
         "adaptive" => {
             let p: AdaptiveParams = params.try_into()?;
             if p.base_amount <= 0.0 {
-                return Err(anyhow!("配置错误: adaptive.base_amount 必须 > 0，当前值: {}", p.base_amount));
+                return Err(anyhow!(
+                    "配置错误: adaptive.base_amount 必须 > 0，当前值: {}",
+                    p.base_amount
+                ));
             }
-            Box::new(Adaptive::new(parse_period(&p.period)?, p.day, p.base_amount))
+            Box::new(Adaptive::new(
+                parse_period(&p.period)?,
+                p.day,
+                p.base_amount,
+            ))
         }
         other => return Err(anyhow!("未知策略: {other}")),
     };
     let rules = build_rules_from(rules)?;
-    if rules.is_empty() { Ok(base) } else { Ok(Box::new(RuleLayer::new(base, rules))) }
+    if rules.is_empty() {
+        Ok(base)
+    } else {
+        Ok(Box::new(RuleLayer::new(base, rules)))
+    }
 }
 
 pub fn build_strategy(cfg: &Config) -> Result<Box<dyn Strategy>> {
@@ -323,7 +404,8 @@ out_dir="output"
     }
 
     fn base_cfg_text(start: &str, end: &str, buy_rate: &str, tier_rate: &str) -> String {
-        format!(r#"
+        format!(
+            r#"
 [data]
 fund_code="000001"
 start="{start}"
@@ -341,7 +423,8 @@ base_amount=500.0
 [report]
 chart=false
 out_dir="output"
-"#)
+"#
+        )
     }
 
     #[test]
@@ -349,7 +432,10 @@ out_dir="output"
         let text = base_cfg_text("2024-12-31", "2024-01-01", "0.0015", "0.0");
         let cfg: Config = toml::from_str(&text).unwrap();
         let err = validate(&cfg).unwrap_err();
-        assert!(err.to_string().contains("start"), "error should mention start: {err}");
+        assert!(
+            err.to_string().contains("start"),
+            "error should mention start: {err}"
+        );
     }
 
     #[test]
@@ -358,13 +444,19 @@ out_dir="output"
         let text = base_cfg_text("2020-01-01", "2024-12-31", "1.5", "0.0");
         let cfg: Config = toml::from_str(&text).unwrap();
         let err = validate(&cfg).unwrap_err();
-        assert!(err.to_string().contains("buy_rate"), "error should mention buy_rate: {err}");
+        assert!(
+            err.to_string().contains("buy_rate"),
+            "error should mention buy_rate: {err}"
+        );
 
         // sell tier rate >= 1.0 is invalid
         let text2 = base_cfg_text("2020-01-01", "2024-12-31", "0.0015", "1.0");
         let cfg2: Config = toml::from_str(&text2).unwrap();
         let err2 = validate(&cfg2).unwrap_err();
-        assert!(err2.to_string().contains("sell_tiers"), "error should mention sell_tiers: {err2}");
+        assert!(
+            err2.to_string().contains("sell_tiers"),
+            "error should mention sell_tiers: {err2}"
+        );
     }
 
     #[test]
@@ -419,7 +511,10 @@ amount = 1000.0
     fn build_strategy_from_dca_ok() {
         let params = toml::Value::Table({
             let mut t = toml::Table::new();
-            t.insert("period".to_string(), toml::Value::String("monthly".to_string()));
+            t.insert(
+                "period".to_string(),
+                toml::Value::String("monthly".to_string()),
+            );
             t.insert("day".to_string(), toml::Value::Integer(1));
             t.insert("base_amount".to_string(), toml::Value::Float(500.0));
             t
@@ -451,9 +546,15 @@ out_dir="output"
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         let result = build_strategy(&cfg);
-        assert!(result.is_err(), "build_strategy should fail when short_window >= long_window");
+        assert!(
+            result.is_err(),
+            "build_strategy should fail when short_window >= long_window"
+        );
         let err = result.err().unwrap();
-        assert!(err.to_string().contains("short_window"), "error should mention short_window: {err}");
+        assert!(
+            err.to_string().contains("short_window"),
+            "error should mention short_window: {err}"
+        );
     }
 
     #[test]
@@ -537,7 +638,12 @@ k = [0.5, 1.0, 1.5]
             t.insert("amount".into(), toml::Value::Float(1000.0));
             t
         });
-        let err = build_strategy_from("rsi", &Some(params), &[]).err().unwrap();
-        assert!(err.to_string().contains("oversold"), "应提示 oversold: {err}");
+        let err = build_strategy_from("rsi", &Some(params), &[])
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("oversold"),
+            "应提示 oversold: {err}"
+        );
     }
 }
