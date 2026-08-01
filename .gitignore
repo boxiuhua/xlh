@@ -13,3 +13,7 @@ xlh-latest.tar.gz
 build.log
 *.gz
 *.sha256
+*.tar
+*.gz
+*.sha256
+*.zip
