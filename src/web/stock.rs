@@ -93,6 +93,14 @@ fn diagnose_blocking(q: DiagnoseQuery) -> Result<StockDiagnosis> {
     )
 }
 
+/// AI 只使用这份既有诊断结果作为上下文，避免浏览器自行拼装或传入无关数据。
+pub fn ai_context(code: &str) -> Result<serde_json::Value> {
+    let diagnosis = diagnose_blocking(DiagnoseQuery {
+        code: code.trim().to_string(),
+    })?;
+    serde_json::to_value(diagnosis).map_err(Into::into)
+}
+
 /// 显式市场前缀让指数与同名个股（如 000001）不会混淆。
 fn market_benchmark(code: &str) -> Option<(&'static str, &'static str)> {
     match code.trim().chars().next()? {

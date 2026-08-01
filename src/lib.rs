@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod event;
 // 后续任务逐个取消注释：
 pub mod analyze;

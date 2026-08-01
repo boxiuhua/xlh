@@ -370,6 +370,9 @@ fn push_user_routes() -> Router<auth::AuthState> {
         .route("/api/push/status", get(push_status))
         .route("/api/push/preview", post(push_preview))
         .route("/api/push/test", post(push_test))
+        .route("/api/ai/config", get(ai_config_get).post(ai_config_save))
+        .route("/api/ai/analyze", post(ai_analyze))
+        .route("/api/ai/optimize-prompt", post(ai_optimize_prompt))
 }
 
 /// 无授权的业务路由（首页 + 全部核心 API），供既有单元测试直连 `.oneshot`。
@@ -982,6 +985,110 @@ async fn push_config_save(
     let conn = st.db.lock().unwrap();
     crate::push::store::upsert(&conn, user.id, &cfg)?;
     Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
+#[derive(Debug, Deserialize)]
+struct AiAnalyzeInput {
+    asset_type: String,
+    code: String,
+}
+
+async fn ai_config_get(
+    State(st): State<auth::AuthState>,
+    axum::Extension(user): axum::Extension<auth::CurrentUser>,
+) -> axum::Json<crate::ai::AiConfig> {
+    let cfg = {
+        let conn = st.db.lock().unwrap();
+        crate::push::store::get(&conn, user.id).ok().flatten()
+    }
+    .and_then(|c| c.ai)
+    .unwrap_or_default();
+    axum::Json(cfg)
+}
+
+async fn ai_config_save(
+    State(st): State<auth::AuthState>,
+    axum::Extension(user): axum::Extension<auth::CurrentUser>,
+    axum::Json(ai): axum::Json<crate::ai::AiConfig>,
+) -> std::result::Result<axum::Json<serde_json::Value>, AppError> {
+    crate::ai::validate_config(&ai)?;
+    let mut cfg = {
+        let conn = st.db.lock().unwrap();
+        crate::push::store::get(&conn, user.id)?
+    }
+    .unwrap_or_else(crate::push::config::default_config);
+    cfg.ai = Some(ai);
+    crate::push::config::harden(&mut cfg);
+    let conn = st.db.lock().unwrap();
+    crate::push::store::upsert(&conn, user.id, &cfg)?;
+    Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
+async fn ai_analyze(
+    State(st): State<auth::AuthState>,
+    axum::Extension(user): axum::Extension<auth::CurrentUser>,
+    axum::Json(input): axum::Json<AiAnalyzeInput>,
+) -> std::result::Result<axum::Json<serde_json::Value>, AppError> {
+    let cfg = {
+        let conn = st.db.lock().unwrap();
+        crate::push::store::get(&conn, user.id)?
+    }
+    .and_then(|c| c.ai)
+    .unwrap_or_default();
+    let asset = input.asset_type.trim().to_string();
+    let code = input.code.trim().to_string();
+    let (asset_cn, context) =
+        tokio::task::spawn_blocking(move || -> Result<(&'static str, serde_json::Value)> {
+            match asset.as_str() {
+                "stock" => Ok(("股票", crate::web::stock::ai_context(&code)?)),
+                "fund" => {
+                    let report = regime_blocking(RegimeQuery {
+                        fund_code: code,
+                        window: None,
+                        band_window: None,
+                        base_amount: None,
+                        sell_pct: None,
+                    })?;
+                    Ok(("基金", serde_json::to_value(report)?))
+                }
+                _ => Err(anyhow!("asset_type 仅支持 stock 或 fund")),
+            }
+        })
+        .await
+        .map_err(|e| anyhow!("任务执行失败: {e}"))??;
+    let model = cfg.model.clone();
+    let code_for_reply = input.code.trim().to_string();
+    let text = tokio::task::spawn_blocking(move || {
+        crate::ai::analyze(&cfg, asset_cn, &code_for_reply, &context)
+    })
+    .await
+    .map_err(|e| anyhow!("任务执行失败: {e}"))??;
+    Ok(axum::Json(
+        serde_json::json!({"ok": true, "model": model, "analysis": text}),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct AiPromptInput {
+    prompt: String,
+}
+
+async fn ai_optimize_prompt(
+    State(st): State<auth::AuthState>,
+    axum::Extension(user): axum::Extension<auth::CurrentUser>,
+    axum::Json(input): axum::Json<AiPromptInput>,
+) -> std::result::Result<axum::Json<serde_json::Value>, AppError> {
+    let cfg = {
+        let conn = st.db.lock().unwrap();
+        crate::push::store::get(&conn, user.id)?
+    }
+    .and_then(|c| c.ai)
+    .unwrap_or_default();
+    let prompt =
+        tokio::task::spawn_blocking(move || crate::ai::optimize_prompt(&cfg, &input.prompt))
+            .await
+            .map_err(|e| anyhow!("任务执行失败: {e}"))??;
+    Ok(axum::Json(serde_json::json!({"prompt": prompt})))
 }
 
 async fn push_preview(

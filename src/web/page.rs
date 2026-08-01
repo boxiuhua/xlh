@@ -22,7 +22,7 @@ h1{font-size:1.5rem;color:#1a252f;margin-bottom:14px}
 .row{display:flex;flex-wrap:wrap;gap:12px 18px;align-items:flex-end}
 .field{display:flex;flex-direction:column;gap:4px}
 .field label{font-size:.8rem;color:#5a6a7a}
-.field input,.field select{padding:7px 9px;border:1px solid #cfd6e0;border-radius:6px;font-size:.9rem}
+.field input,.field select,.field textarea{padding:7px 9px;border:1px solid #cfd6e0;border-radius:6px;font-size:.9rem}
 .field input[type=number]{width:120px}
 button.run{padding:9px 22px;background:#c0392b;color:#fff;border:none;border-radius:6px;font-size:.95rem;cursor:pointer;margin-top:12px}
 button.run:disabled{opacity:.5;cursor:wait}
@@ -107,6 +107,7 @@ xlhMe();
   <div class="groups">
     <button class="group active" data-group="fund">基金</button>
     <button class="group" data-group="stock">股票</button>
+    <button class="group" data-group="ai">AI 分析</button>
   </div>
   <div class="card" id="sync-card">
     <div class="row" style="align-items:flex-end">
@@ -476,6 +477,40 @@ xlhMe();
     </div>
   </div>
 
+  <div class="panel" id="panel-ai">
+    <div class="card">
+      <div style="font-weight:600;color:#1a252f;margin-bottom:10px">模型配置（默认 DeepSeek，兼容 OpenAI 格式）</div>
+      <div class="row">
+        <div class="field"><label>启用 AI 分析</label><select id="ai-enabled"><option value="false">否</option><option value="true">是</option></select></div>
+        <div class="field" style="flex:1;min-width:300px"><label>接口地址（HTTPS）</label><input id="ai-base-url" placeholder="https://api.deepseek.com"/></div>
+        <div class="field"><label>模型</label><input id="ai-model" placeholder="deepseek-v4-flash"/></div>
+        <div class="field" style="flex:1;min-width:250px"><label>API Key</label><input id="ai-key" type="password" placeholder="仅保存在当前用户配置中"/></div>
+      </div>
+      <div class="row" style="margin-top:10px"><div class="field" style="flex:1"><label>系统提示词（可选）</label><input id="ai-prompt" placeholder="留空使用内置的谨慎分析提示词"/></div><button class="small" id="ai-load">读取配置</button><button class="small" id="ai-save">保存配置</button></div>
+      <div id="ai-config-msg" class="hint" style="margin-top:8px">未启用或未配置密钥时不会发出 AI 请求。</div>
+    </div>
+    <div class="card">
+      <div style="font-weight:600;color:#1a252f;margin-bottom:8px">提示词优化</div>
+      <div class="field"><label>输入你希望模型关注的内容、输出格式或限制条件</label><textarea id="ai-prompt-draft" rows="7">请按以下五步分析 A 股股票：
+1. 初步筛选：通过价值与质量因子寻找具备研究潜力的股票，说明财务健康度、盈利趋势与估值依据。
+2. 确认基本盘：深度分析选中股票或指定代码的经营质量、现金流走向与核心竞争力。
+3. 资金动向：分析近一个月资金流向、量比和换手率，判断其是否处于相对健康区间。
+4. 未来发展：评估所处行业的成长空间、公司发展方向及相关政策支持。
+5. 规避风险：综合列出可能导致股价波动的因素、反证与需要继续验证的数据。</textarea></div>
+      <div style="margin-top:10px"><button class="small" id="ai-optimize-prompt">用 DeepSeek 优化</button><button class="small" id="ai-use-prompt" disabled>应用到系统提示词</button></div>
+      <pre id="ai-prompt-result" style="display:none;margin-top:10px;white-space:pre-wrap;background:#fafbfc;border:1px solid #eaecef;border-radius:8px;padding:12px"></pre>
+    </div>
+    <div class="card">
+      <div class="row">
+        <div class="field"><label>品种</label><select id="ai-asset"><option value="stock">股票</option><option value="fund">基金</option></select></div>
+        <div class="field"><label>代码</label><input id="ai-code" placeholder="股票 600519 / 基金 110022"/></div>
+        <button class="run" id="ai-run">生成分析</button>
+      </div>
+      <div class="hint" style="margin-top:8px">分析会先由本地生成股票诊断或基金市场状态，再将该数据提交给你配置的模型；内容仅供研究，不构成投资建议。</div>
+      <div id="ai-result" style="margin-top:14px;white-space:pre-wrap;line-height:1.65"></div>
+    </div>
+  </div>
+
   <iframe id="result" title="回测报告"></iframe>
 </div>
 
@@ -575,14 +610,14 @@ document.querySelectorAll('.tab').forEach(function(t){
   t.addEventListener('click', function(){ activateTab(t.getAttribute('data-tab')); });
 });
 // 大类切换：显隐对应子 Tab 栏 + 同步卡片，并激活该大类的首个子 Tab
-var GROUP_DEFAULT = { fund: 'single', stock: 's-diagnose' };
+var GROUP_DEFAULT = { fund: 'single', stock: 's-diagnose', ai: 'ai' };
 function activateGroup(g){
   document.querySelectorAll('.group').forEach(function(x){ x.classList.toggle('active', x.getAttribute('data-group') === g); });
-  var isStock = g === 'stock';
-  document.getElementById('tabs-fund').style.display = isStock ? 'none' : '';
+  var isStock = g === 'stock', isAi = g === 'ai';
+  document.getElementById('tabs-fund').style.display = isStock || isAi ? 'none' : '';
   document.getElementById('tabs-stock').style.display = isStock ? '' : 'none';
-  document.getElementById('sync-card').style.display = isStock ? 'none' : '';
-  document.getElementById('s-sync-card').style.display = isStock ? '' : 'none';
+  document.getElementById('sync-card').style.display = isStock || isAi ? 'none' : '';
+  document.getElementById('s-sync-card').style.display = isStock || isAi ? '' : 'none';
   activateTab(GROUP_DEFAULT[g]);
 }
 document.querySelectorAll('.group').forEach(function(gb){
@@ -1519,6 +1554,21 @@ document.getElementById('rt-watch-save').addEventListener('click', function(){
   }).catch(function(e){ status.textContent='保存失败：'+String(e.message||e); }).finally(function(){btn.disabled=false;});
 });
 loadRealtimeWatch();
+
+// ===== AI 股票 / 基金分析 =====
+function aiConfigValue(){ return {enabled:document.getElementById('ai-enabled').value==='true',base_url:document.getElementById('ai-base-url').value.trim(),model:document.getElementById('ai-model').value.trim(),api_key:document.getElementById('ai-key').value.trim(),system_prompt:document.getElementById('ai-prompt').value.trim()}; }
+function aiErrorText(v){ var d=document.createElement('div');d.innerHTML=String(v||'');return (d.textContent||d.innerText||String(v||'')).replace(/^回测失败\s*/,'').trim(); }
+function loadAiConfig(){
+  fetch('/api/ai/config').then(function(r){if(!r.ok) throw new Error('读取配置失败');return r.json();}).then(function(c){
+    document.getElementById('ai-enabled').value=c.enabled?'true':'false'; document.getElementById('ai-base-url').value=c.base_url||'https://api.deepseek.com'; document.getElementById('ai-model').value=c.model||'deepseek-v4-flash'; document.getElementById('ai-key').value=c.api_key||''; document.getElementById('ai-prompt').value=c.system_prompt||'';
+  }).catch(function(e){document.getElementById('ai-config-msg').textContent=String(e.message||e);});
+}
+document.getElementById('ai-load').addEventListener('click',loadAiConfig);
+document.getElementById('ai-save').addEventListener('click',function(){var b=this,m=document.getElementById('ai-config-msg');b.disabled=true;m.textContent='保存中…';fetch('/api/ai/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(aiConfigValue())}).then(function(r){if(!r.ok)return r.text().then(function(x){throw new Error(aiErrorText(x))});return r.json();}).then(function(){m.textContent='模型配置已保存。';}).catch(function(e){m.textContent='保存失败：'+String(e.message||e);}).finally(function(){b.disabled=false;});});
+document.getElementById('ai-run').addEventListener('click',function(){var b=this,code=document.getElementById('ai-code').value.trim(),out=document.getElementById('ai-result');if(!code){out.textContent='请先输入代码。';return;}b.disabled=true;out.textContent='正在生成本地指标并请求模型…';fetch('/api/ai/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({asset_type:document.getElementById('ai-asset').value,code:code})}).then(function(r){if(!r.ok)return r.text().then(function(x){throw new Error(aiErrorText(x))});return r.json();}).then(function(d){out.textContent='模型：'+(d.model||'')+'\n\n'+(d.analysis||'');}).catch(function(e){out.textContent='分析失败：'+String(e.message||e);}).finally(function(){b.disabled=false;});});
+document.getElementById('ai-optimize-prompt').addEventListener('click',function(){var b=this,d=document.getElementById('ai-prompt-draft').value.trim(),out=document.getElementById('ai-prompt-result');if(!d){out.style.display='block';out.textContent='请先填写提示词需求。';return;}b.disabled=true;out.style.display='block';out.textContent='正在用 DeepSeek 优化提示词…';fetch('/api/ai/optimize-prompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:d})}).then(function(r){if(!r.ok)return r.text().then(function(x){throw new Error(aiErrorText(x))});return r.json();}).then(function(x){out.textContent=x.prompt||'';document.getElementById('ai-use-prompt').disabled=!x.prompt;}).catch(function(e){out.textContent='优化失败：'+String(e.message||e);}).finally(function(){b.disabled=false;});});
+document.getElementById('ai-use-prompt').addEventListener('click',function(){var v=document.getElementById('ai-prompt-result').textContent;if(v){document.getElementById('ai-prompt').value=v;document.getElementById('ai-config-msg').textContent='已写入系统提示词，点击“保存配置”后生效。';}});
+loadAiConfig();
 
 document.getElementById('run-s-realtime').addEventListener('click', function(){
   var btn = this, day = document.getElementById('rt-day').value.trim();

@@ -29,6 +29,9 @@ pub struct PushConfig {
     /// 盘中异动的自选 A 股监控名单；有名单时实时推送只发名单内的明确买卖信号。
     #[serde(default)]
     pub realtime_watch_stocks: Vec<String>,
+    /// 每用户 AI 模型配置。复用同一份受登录保护的配置存储，老数据自动为空。
+    #[serde(default)]
+    pub ai: Option<crate::ai::AiConfig>,
     /// 质量筛选（可选）。`#[serde(default)]` 保证向后兼容 ——
     /// push_configs 存的是 JSON，老配置读出来这里就是 None，无需 DB 迁移。
     #[serde(default)]
@@ -111,6 +114,7 @@ pub fn default_config() -> PushConfig {
         stocks: Vec::new(),
         diagnose_stocks: Vec::new(),
         realtime_watch_stocks: Vec::new(),
+        ai: None,
         screen: None,
     }
 }
