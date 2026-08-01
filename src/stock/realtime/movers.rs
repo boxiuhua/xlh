@@ -50,6 +50,24 @@ pub enum Divergence {
     Unknown,
 }
 
+/// 盘中异动的可操作标签。只有价格与资金流形成明确背离时才给出买卖，
+/// 其余异动仍留在榜单中作为线索，但不会伪装成交易指令。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TradeAction {
+    Buy,
+    Sell,
+    Hold,
+}
+
+pub fn trade_action(divergence: Divergence) -> TradeAction {
+    match divergence {
+        Divergence::MainAccumulating => TradeAction::Buy,
+        Divergence::RetailChasing => TradeAction::Sell,
+        Divergence::None | Divergence::Unknown => TradeAction::Hold,
+    }
+}
+
 /// 该异动更像短线还是长线。启发式，未经检验。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Horizon {
@@ -339,6 +357,14 @@ mod tests {
             divergence(-0.03, Some(0.08), 0.05),
             Divergence::MainAccumulating
         );
+    }
+
+    #[test]
+    fn only_confirmed_divergences_become_trade_actions() {
+        assert_eq!(trade_action(Divergence::MainAccumulating), TradeAction::Buy);
+        assert_eq!(trade_action(Divergence::RetailChasing), TradeAction::Sell);
+        assert_eq!(trade_action(Divergence::None), TradeAction::Hold);
+        assert_eq!(trade_action(Divergence::Unknown), TradeAction::Hold);
     }
 
     #[test]

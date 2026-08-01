@@ -1079,6 +1079,7 @@ function attachStockCombobox(input){
 }
 
 function sSignalColor(sig){ if(sig&&sig.indexOf('买入')>=0) return '#c0392b'; if(sig&&sig.indexOf('卖出')>=0) return '#27ae60'; return '#7f8c8d'; }
+function actionText(a){ return a==='buy' ? '买入信号' : (a==='sell' ? '卖出信号' : '观望'); }
 function trendColor(tr){ return tr==='上涨' ? '#c0392b' : (tr==='下跌' ? '#27ae60' : '#7f8c8d'); }
 function pf(x){ return (x==null || !isFinite(x)) ? '∞' : Number(x).toFixed(2); }
 
@@ -1089,12 +1090,32 @@ function renderStockDiag(d){
   box.innerHTML =
     '<div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap"><span style="font-size:1.3rem;font-weight:700;color:'+tc+'">'+esc(d.trend)+'</span>'
     + '<span style="font-size:1.2rem;font-weight:700;color:'+sc+'">'+esc(d.signal)+'</span>'
+    + '<span style="color:'+sc+'">'+esc(actionText(d.action))+'</span>'
     + '<span style="color:#7f8c8d">'+esc(d.code)+' · '+esc(d.date)+'</span></div>'
     + '<div style="margin-top:8px;color:#34495e">价 '+d.price.toFixed(3)+'（后复权 '+d.adj_price.toFixed(3)+'）· '+esc(d.ma_relation)+' · MA短 '+d.ma_short.toFixed(2)+' / 长 '+d.ma_long.toFixed(2)+'</div>'
     + '<div style="margin-top:6px;color:#34495e">布林 z '+d.boll_z.toFixed(2)+'（下 '+d.boll_lower.toFixed(2)+' / 中 '+d.boll_mid.toFixed(2)+' / 上 '+d.boll_upper.toFixed(2)+'）· RSI '+d.rsi.toFixed(1)+' · MACD柱 '+d.macd_hist.toFixed(3)+'</div>'
     + '<div style="margin-top:8px;color:#5a6a7a">'+esc(d.rationale)+'</div>'
+    + forecastHtml(d.forecast)
     + sigEvidenceHtml(d.evidence)
     + '<div style="margin-top:8px;padding:8px 10px;background:#f3f7ff;border-radius:6px;color:#34495e">'+esc(d.caveat)+'</div>';
+}
+
+function forecastHtml(f){
+  if(!f) return '';
+  var pct = function(v){ return (Number(v)*100).toFixed(0)+'%'; };
+  var signed = function(v){ return (v>=0?'+':'')+(Number(v)*100).toFixed(1)+'%'; };
+  var hit = function(e){
+    if(!e || e.hit_rate==null) return '样本不足';
+    var edge = e.edge==null ? '' : '，超基准 '+(e.edge>=0?'+':'')+pct(e.edge);
+    return pct(e.hit_rate)+'（'+e.samples+'次'+edge+'）';
+  };
+  return '<div style="margin-top:10px;padding:10px;background:#f3f7ff;border-left:4px solid #2980b9;color:#34495e">'
+    + '<div style="font-weight:600">方向概率模型 · 当前'+esc(f.regime)+'行情</div>'
+    + (f.market_filter ? '<div style="margin-top:4px;color:#5a6a7a">市场过滤：'+esc(f.market_filter)+' · 个股相对强弱 '+signed(f.relative_return_20d||0)+'</div>' : '')
+    + '<div style="margin-top:5px">未来 5 日上涨概率 <strong>'+pct(f.up_probability_5d)+'</strong>（样本外命中 '+hit(f.evidence_5d)+'）'
+    + ' · 未来 20 日上涨概率 <strong>'+pct(f.up_probability_20d)+'</strong>（样本外命中 '+hit(f.evidence_20d)+'）</div>'
+    + '<div style="margin-top:5px;font-size:.88rem">'+esc(f.rationale)+'</div>'
+    + '<div style="margin-top:5px;font-size:.85rem;color:#7f8c8d">'+esc(f.caveat)+'</div></div>';
 }
 
 // 这套技术信号（布林+RSI+MACD 打分）到底有没有用。
@@ -1427,7 +1448,7 @@ function renderRealtime(r){
         + '<th style="'+TH+'">时间</th><th style="'+TH+'">代码</th><th style="'+TH+'">名称</th>'
         + '<th style="'+TH+';text-align:right">触发涨跌</th><th style="'+TH+';text-align:right">触发价</th>'
         + '<th style="'+TH+';text-align:right">量能</th><th style="'+TH+';text-align:right">主力占比</th>'
-        + '<th style="'+TH+'">背离</th><th style="'+TH+'">视角</th>'
+        + '<th style="'+TH+'">买卖信号</th><th style="'+TH+'">背离</th><th style="'+TH+'">视角</th>'
         + '<th style="'+TH+';text-align:right">至收盘</th><th style="'+TH+'">已推送</th>'
         + '</tr></thead><tbody>';
   r.movers.forEach(function(m){
@@ -1446,6 +1467,7 @@ function renderRealtime(r){
       + '<td style="'+TDR+'">'+Number(m.trigger_price).toFixed(2)+'</td>'
       + '<td style="'+TDR+'">'+Number(m.vol_surge_x).toFixed(1)+'×</td>'
       + '<td style="'+TDR+'">'+flow+'</td>'
+      + '<td style="'+TD+';color:'+sSignalColor(actionText(m.action))+'">'+esc(actionText(m.action))+'</td>'
       + '<td style="'+TD+'">'+rtDiv(m.divergence)+'</td>'
       + '<td style="'+TD+'">'+(m.horizon_tag==='long'?'长线':'短线')+'</td>'
       + '<td style="'+TDR+'">'+ret+'</td>'

@@ -75,13 +75,44 @@ fn diagnose_blocking(q: DiagnoseQuery) -> Result<StockDiagnosis> {
     let start = end - chrono::Duration::days(800);
     let bars = cache::load_or_fetch(&q.code, stock_cache(), start, end)
         .map_err(|e| anyhow!("加载行情失败: {e}"))?;
+    let (market, market_name) = match market_benchmark(&q.code) {
+        Some((code, name)) => {
+            let raw = cache::load_or_fetch(code, stock_cache(), start, end).ok();
+            (raw.and_then(|m| align_market(&bars, &m)), Some(name))
+        }
+        None => (None, None),
+    };
     // 对外展示必须带证据：给了「买入」就得说清这个信号到底有没有用
-    diagnose::diagnose_with_evidence(
+    diagnose::diagnose_with_evidence_and_market(
         q.code.clone(),
         q.code.clone(),
         &bars,
+        market.as_deref(),
+        market_name,
         &DiagnoseParams::default(),
     )
+}
+
+/// 显式市场前缀让指数与同名个股（如 000001）不会混淆。
+fn market_benchmark(code: &str) -> Option<(&'static str, &'static str)> {
+    match code.trim().chars().next()? {
+        '6' | '5' | '9' => Some(("sh000001", "上证指数")),
+        '0' | '3' => Some(("sz399001", "深证成指")),
+        _ => None,
+    }
+}
+
+fn align_market(
+    stock: &[data::StockBar],
+    market: &[data::StockBar],
+) -> Option<Vec<data::StockBar>> {
+    use std::collections::BTreeMap;
+    let by_date: BTreeMap<_, _> = market.iter().map(|b| (b.date, *b)).collect();
+    let aligned: Vec<_> = stock
+        .iter()
+        .filter_map(|s| by_date.get(&s.date).copied())
+        .collect();
+    (aligned.len() == stock.len()).then_some(aligned)
 }
 
 #[derive(Debug, Deserialize)]

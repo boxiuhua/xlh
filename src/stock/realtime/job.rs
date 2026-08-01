@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use std::collections::HashSet;
 
 use super::config::RealtimeCfg;
-use super::movers::{self, Baseline, Divergence, Horizon, Mover};
+use super::movers::{self, Baseline, Divergence, Horizon, Mover, TradeAction};
 use super::store::{self, SignalRow};
 use super::{calendar, flow, snapshot};
 
@@ -80,6 +80,7 @@ pub fn select_pushable(
     let strong: Vec<Mover> = movers
         .iter()
         .filter(|m| !already.contains(&m.code))
+        .filter(|m| movers::trade_action(m.divergence) != TradeAction::Hold)
         .filter(|m| {
             movers::is_strong(
                 m.jump_pct,
@@ -94,14 +95,6 @@ pub fn select_pushable(
     movers::rank_top(strong, cfg.max_push_per_tick)
 }
 
-fn dir_arrow(pct: f64) -> &'static str {
-    if pct >= 0.0 {
-        "涨"
-    } else {
-        "跌"
-    }
-}
-
 fn flow_text(m: &Mover) -> String {
     match m.main_net_pct {
         Some(p) => format!(
@@ -113,18 +106,11 @@ fn flow_text(m: &Mover) -> String {
     }
 }
 
-fn divergence_text(d: Divergence) -> &'static str {
-    match d {
-        Divergence::RetailChasing => "⚠ 涨但主力净流出（疑似散户抬轿）",
-        Divergence::MainAccumulating => "⚠ 跌但主力净流入（疑似主力吸筹）",
-        Divergence::None | Divergence::Unknown => "",
-    }
-}
-
-fn horizon_text(h: Horizon) -> &'static str {
-    match h {
-        Horizon::Short => "短线",
-        Horizon::Long => "长线",
+fn action_text(action: TradeAction) -> &'static str {
+    match action {
+        TradeAction::Buy => "买入信号",
+        TradeAction::Sell => "卖出信号",
+        TradeAction::Hold => "观望",
     }
 }
 
@@ -137,29 +123,69 @@ pub const DISCLAIMER: &str = "⚠ 本榜为盘中异动线索，非投资建议�
 /// 渲染盘中异动推送。**纯函数**，便于测试。
 pub fn render_movers(movers: &[Mover], flow_ok: bool) -> String {
     let mut s = String::new();
+    let has_trade = movers
+        .iter()
+        .any(|m| movers::trade_action(m.divergence) != TradeAction::Hold);
     if !flow_ok {
-        s.push_str("> 资金流暂不可用（数据源限流），本批仅凭价量判定\n\n");
+        s.push_str("> 资金流暂不可用，本批不发送买卖信号。\n\n");
     }
-    for m in movers {
-        s.push_str(&format!(
-            "**{} {}** {} {:+.2}% | 量能 {:.1}× | {} | {}\n",
-            m.code,
-            m.name,
-            dir_arrow(m.jump_pct),
-            m.jump_pct * 100.0,
-            m.vol_surge_x,
-            flow_text(m),
-            horizon_text(m.horizon)
-        ));
-        let d = divergence_text(m.divergence);
-        if !d.is_empty() {
-            s.push_str(&format!("　{}\n", d));
+    for (action, title) in [
+        (TradeAction::Buy, "🟢 买入信号"),
+        (TradeAction::Sell, "🔴 卖出信号"),
+    ] {
+        let rows: Vec<&Mover> = movers
+            .iter()
+            .filter(|m| movers::trade_action(m.divergence) == action)
+            .collect();
+        if rows.is_empty() {
+            continue;
         }
-        if m.baseline == Baseline::Fallback {
-            s.push_str("　（量能基准历史样本不足，已降级为当日均值）\n");
+        s.push_str(&format!("**{title}（{}）**\n", rows.len()));
+        for m in rows {
+            let reason = match m.divergence {
+                Divergence::MainAccumulating => "主力吸筹",
+                Divergence::RetailChasing => "散户抬轿",
+                Divergence::None | Divergence::Unknown => "待确认",
+            };
+            let baseline = if m.baseline == Baseline::Fallback {
+                " · 基准降级"
+            } else {
+                ""
+            };
+            s.push_str(&format!(
+                "- **{} {}** {:+.2}% · 量 {:.1}× · {} · {}{}\n",
+                m.code,
+                m.name,
+                m.jump_pct * 100.0,
+                m.vol_surge_x,
+                flow_text(m),
+                reason,
+                baseline
+            ));
         }
+        s.push('\n');
     }
-    s.push_str(&format!("\n{}", DISCLAIMER));
+    if !has_trade && !movers.is_empty() {
+        s.push_str("**异动待确认**\n");
+        for m in movers {
+            let baseline = if m.baseline == Baseline::Fallback {
+                " · 基准降级"
+            } else {
+                ""
+            };
+            s.push_str(&format!(
+                "- **{} {}** {:+.2}% · 量 {:.1}×{}\n",
+                m.code,
+                m.name,
+                m.jump_pct * 100.0,
+                m.vol_surge_x,
+                baseline
+            ));
+        }
+    } else if !has_trade {
+        s.push_str("本批无明确买入或卖出信号。\n");
+    }
+    s.push_str("⚠ 仅供盘中观察，非投资建议；买卖信号未经前瞻检验，主力资金为推算代理指标。\n");
     s
 }
 
@@ -186,10 +212,11 @@ pub fn render_summary(rows: &[SignalRow], day: NaiveDate) -> String {
             None => "资金流N/A".to_string(),
         };
         s.push_str(&format!(
-            "- {} **{} {}** 触发 {:+.2}% @{:.2} | 量能 {:.1}× | {} | {} | 至收盘 {}\n",
+            "- {} **{} {}** {} | 触发 {:+.2}% @{:.2} | 量能 {:.1}× | {} | {} | 至收盘 {}\n",
             r.ts.format("%H:%M"),
             r.code,
             r.name,
+            action_text(r.action),
             r.jump_pct * 100.0,
             r.trigger_price,
             r.vol_surge_x,
@@ -555,7 +582,8 @@ mod tests {
 
     #[test]
     fn strong_signals_are_pushed() {
-        let strong = mv("A", 0.04, 5.0, Some(0.06));
+        let mut strong = mv("A", -0.04, 5.0, Some(0.06));
+        strong.divergence = Divergence::MainAccumulating;
         let out = select_pushable(&[strong], &HashSet::new(), &cfg());
         assert_eq!(out.len(), 1);
     }
@@ -564,7 +592,8 @@ mod tests {
     fn already_pushed_today_is_filtered() {
         // 同一只股票当日只推一次。already 来自 signals 表而非内存 ——
         // 守护重启后限流状态不丢
-        let strong = mv("A", 0.04, 5.0, Some(0.06));
+        let mut strong = mv("A", -0.04, 5.0, Some(0.06));
+        strong.divergence = Divergence::MainAccumulating;
         let already: HashSet<String> = ["A".to_string()].into_iter().collect();
         assert!(select_pushable(&[strong], &already, &cfg()).is_empty());
     }
@@ -573,7 +602,11 @@ mod tests {
     fn push_is_capped_per_tick_and_ranked_by_flow() {
         // 6 只强信号 → 只推资金流占比最高的 5 只
         let ms: Vec<Mover> = (0..6)
-            .map(|i| mv(&format!("C{i}"), 0.04, 5.0, Some(i as f64 * 0.01)))
+            .map(|i| {
+                let mut m = mv(&format!("C{i}"), -0.04, 5.0, Some(i as f64 * 0.01));
+                m.divergence = Divergence::MainAccumulating;
+                m
+            })
             .collect();
         let out = select_pushable(&ms, &HashSet::new(), &cfg());
         assert_eq!(out.len(), 5, "每时点上限 5 只");
@@ -588,8 +621,10 @@ mod tests {
         // 的那只重新推出去 —— 正是 TickOutcome.pushed 存 Mover 而非数量的原因。
         //
         // 构造：TOP 资金流占比最高（排 movers 第一），但今天已推过。
-        let top = mv("TOP", 0.04, 5.0, Some(0.09));
-        let second = mv("SECOND", 0.04, 5.0, Some(0.01));
+        let mut top = mv("TOP", -0.04, 5.0, Some(0.09));
+        top.divergence = Divergence::MainAccumulating;
+        let mut second = mv("SECOND", -0.04, 5.0, Some(0.01));
+        second.divergence = Divergence::MainAccumulating;
         let all = movers::rank_top(vec![top, second], usize::MAX);
         assert_eq!(all[0].code, "TOP", "TOP 资金流占比最高，排第一");
 
@@ -658,6 +693,7 @@ mod tests {
             vol_surge_x: 5.0,
             main_net_pct: None,
             divergence: "none".into(),
+            action: TradeAction::Hold,
             horizon_tag: "short".into(),
             close_ret: None,
         }];
@@ -680,6 +716,7 @@ mod tests {
             vol_surge_x: 5.0,
             main_net_pct: Some(0.06),
             divergence: "none".into(),
+            action: TradeAction::Hold,
             horizon_tag: "short".into(),
             close_ret: Some(ret),
         };

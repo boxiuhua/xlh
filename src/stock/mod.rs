@@ -4,6 +4,7 @@ pub mod data;
 pub mod diagnose;
 pub mod evidence;
 pub mod fee;
+pub mod forecast;
 pub mod indicators;
 pub mod realtime;
 pub mod recommend;

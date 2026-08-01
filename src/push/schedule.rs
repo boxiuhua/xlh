@@ -176,7 +176,14 @@ fn realtime_tick(
         return Ok(());
     }
     let md = job::render_movers(&out.pushed, out.flow_ok);
-    broadcast(push_conn, "盘中异动", &md, now.date_naive(), warn, grace);
+    broadcast(
+        push_conn,
+        "盘中买卖信号",
+        &md,
+        now.date_naive(),
+        warn,
+        grace,
+    );
     Ok(())
 }
 

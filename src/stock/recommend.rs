@@ -187,6 +187,7 @@ fn diagnose_or_fallback(code: &str, name: &str, bars: &[StockBar]) -> StockDiagn
         name: name.to_string(),
         trend: "数据不足".into(),
         signal: "观望".into(),
+        action: diagnose::TradeAction::Hold,
         ma_relation: "未知".into(),
         rationale: "数据不足，暂不给出技术诊断".into(),
         ..Default::default()

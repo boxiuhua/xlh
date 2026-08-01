@@ -3,6 +3,22 @@ use crate::stock::indicators;
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 
+/// 面向调用方的标准动作。`signal` 保留中文强弱文案，`action` 则方便 Web、
+/// 推送和其他接口稳定地消费买入/卖出/观望三种状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TradeAction {
+    Buy,
+    Sell,
+    Hold,
+}
+
+impl Default for TradeAction {
+    fn default() -> Self {
+        Self::Hold
+    }
+}
+
 pub struct DiagnoseParams {
     pub ma_short: usize,
     pub ma_long: usize,
@@ -55,9 +71,12 @@ pub struct StockDiagnosis {
     pub rsi: f64,
     pub trend: String,
     pub signal: String,
+    pub action: TradeAction,
     pub score: i32,
     pub rationale: String,
     pub caveat: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forecast: Option<crate::stock::forecast::DirectionForecast>,
     /// 这套信号在该股自身历史上到底有没有用（前瞻检验，无未来函数）。
     ///
     /// `diagnose()` 恒为 `None` —— 它必须保持纯粹，因为 `evidence::evaluate_signals`
@@ -165,6 +184,13 @@ pub fn diagnose(
     } else {
         "强力卖出"
     };
+    let action = if score > 0 {
+        TradeAction::Buy
+    } else if score < 0 {
+        TradeAction::Sell
+    } else {
+        TradeAction::Hold
+    };
 
     let rationale = format!(
         "趋势{trend}（近{}日{:+.1}%，{ma_relation}）；布林 z={:.2}；RSI={:.1}；MACD 柱={:+.4}",
@@ -200,9 +226,11 @@ pub fn diagnose(
         rsi,
         trend: trend.to_string(),
         signal: signal.to_string(),
+        action,
         score,
         rationale,
         caveat,
+        forecast: None,
         evidence: None, // 见字段文档：此处算证据会与 evaluate_signals 无限递归
     })
 }
@@ -223,6 +251,22 @@ pub fn diagnose_with_evidence(
     p: &DiagnoseParams,
 ) -> Result<StockDiagnosis> {
     let mut d = diagnose(code, name, bars, p)?;
+    d.forecast = crate::stock::forecast::forecast(bars);
+    d.evidence = crate::stock::evidence::evaluate_signals(bars, p, crate::stock::evidence::HORIZON);
+    Ok(d)
+}
+
+/// 与可选市场基准一起诊断。基准缺失或交易日无法对齐时安全退化为基础模型。
+pub fn diagnose_with_evidence_and_market(
+    code: String,
+    name: String,
+    bars: &[StockBar],
+    market: Option<&[StockBar]>,
+    market_name: Option<&str>,
+    p: &DiagnoseParams,
+) -> Result<StockDiagnosis> {
+    let mut d = diagnose(code, name, bars, p)?;
+    d.forecast = crate::stock::forecast::forecast_with_market(bars, market, market_name);
     d.evidence = crate::stock::evidence::evaluate_signals(bars, p, crate::stock::evidence::HORIZON);
     Ok(d)
 }
@@ -324,6 +368,41 @@ mod tests {
         .unwrap();
         assert!(dgn.score < 0, "冲高末点应偏卖: score={}", dgn.score);
         assert!(dgn.signal.contains("卖出"), "信号应含卖出: {}", dgn.signal);
+    }
+
+    #[test]
+    fn standardized_action_matches_buy_and_sell_signal() {
+        let mut down: Vec<f64> = (0..79)
+            .map(|i| 100.0 + if i % 2 == 0 { -0.5 } else { 0.5 })
+            .collect();
+        down.push(80.0);
+        assert_eq!(
+            diagnose(
+                "x".into(),
+                "x".into(),
+                &series(&down),
+                &DiagnoseParams::default()
+            )
+            .unwrap()
+            .action,
+            TradeAction::Buy
+        );
+
+        let mut up: Vec<f64> = (0..79)
+            .map(|i| 100.0 + if i % 2 == 0 { -0.5 } else { 0.5 })
+            .collect();
+        up.push(140.0);
+        assert_eq!(
+            diagnose(
+                "x".into(),
+                "x".into(),
+                &series(&up),
+                &DiagnoseParams::default()
+            )
+            .unwrap()
+            .action,
+            TradeAction::Sell
+        );
     }
 
     #[test]

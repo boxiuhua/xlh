@@ -36,7 +36,7 @@ use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 
-use super::movers::{Divergence, Horizon, Mover};
+use super::movers::{Divergence, Horizon, Mover, TradeAction};
 use super::snapshot::Tick;
 
 const SCHEMA: &str = r#"
@@ -303,6 +303,7 @@ pub struct SignalRow {
     pub vol_surge_x: f64,
     pub main_net_pct: Option<f64>,
     pub divergence: String,
+    pub action: TradeAction,
     pub horizon_tag: String,
     pub close_ret: Option<f64>,
 }
@@ -329,6 +330,11 @@ pub fn signals_on(conn: &Connection, day: NaiveDate) -> Result<Vec<SignalRow>> {
             vol_surge_x: r.get(6)?,
             main_net_pct: r.get(7)?,
             divergence: r.get(8)?,
+            action: match r.get::<_, String>(8)?.as_str() {
+                "main_accumulating" => TradeAction::Buy,
+                "retail_chasing" => TradeAction::Sell,
+                _ => TradeAction::Hold,
+            },
             horizon_tag: r.get(9)?,
             close_ret: r.get(10)?,
         })
