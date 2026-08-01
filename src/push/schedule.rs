@@ -175,16 +175,51 @@ fn realtime_tick(
     if out.pushed.is_empty() {
         return Ok(());
     }
-    let md = job::render_movers(&out.pushed, out.flow_ok);
-    broadcast(
+    broadcast_realtime(
         push_conn,
-        "盘中买卖信号",
-        &md,
+        &out.pushed,
+        out.flow_ok,
         now.date_naive(),
         warn,
         grace,
     );
     Ok(())
+}
+
+/// 实时信号按用户自选名单过滤；空名单保持历史行为（接收全部强信号）。
+fn broadcast_realtime(
+    conn: &Connection,
+    movers: &[crate::stock::realtime::movers::Mover],
+    flow_ok: bool,
+    today: chrono::NaiveDate,
+    warn: i64,
+    grace: i64,
+) {
+    use crate::stock::realtime::job;
+    for (uid, cfg) in super::store::list_all(conn).unwrap_or_default() {
+        if !user_allowed(conn, uid, today, warn, grace) || cfg.channel.webhook.trim().is_empty() {
+            continue;
+        }
+        let selected: Vec<_> = if cfg.realtime_watch_stocks.is_empty() {
+            movers.to_vec()
+        } else {
+            movers
+                .iter()
+                .filter(|m| cfg.realtime_watch_stocks.iter().any(|c| c == &m.code))
+                .cloned()
+                .collect()
+        };
+        if selected.is_empty() {
+            continue;
+        }
+        if let Err(e) = super::channels::send(
+            &cfg.channel,
+            "自选盘中买卖信号",
+            &job::render_movers(&selected, flow_ok),
+        ) {
+            eprintln!("用户 {uid} 实时推送失败：{e}");
+        }
+    }
 }
 
 /// 向所有授权放行、且配了推送渠道的用户广播。单用户失败仅记日志。

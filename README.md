@@ -61,6 +61,11 @@ docker compose --profile push up -d xlh-push    # 定时推送守护（按需）
 docker compose logs -f xlh-web
 ```
 
+### 更新命令
+ cd /opt/xlh
+  docker load -i 新镜像包.tar.gz
+  docker compose -f docker-compose.prod.yml --profile push up -d --force-recreate
+
 **发到线上服务器（免镜像仓库，save + scp + load）**
 
 Git Bash 里一键（脚本自带：部署前备份、旧布局迁移、崩溃循环检测、部署前后用户数比对）：

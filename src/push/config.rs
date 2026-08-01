@@ -26,6 +26,9 @@ pub struct PushConfig {
     /// 额外只诊断、不持有的股票代码。
     #[serde(default)]
     pub diagnose_stocks: Vec<String>,
+    /// 盘中异动的自选 A 股监控名单；有名单时实时推送只发名单内的明确买卖信号。
+    #[serde(default)]
+    pub realtime_watch_stocks: Vec<String>,
     /// 质量筛选（可选）。`#[serde(default)]` 保证向后兼容 ——
     /// push_configs 存的是 JSON，老配置读出来这里就是 None，无需 DB 迁移。
     #[serde(default)]
@@ -107,6 +110,7 @@ pub fn default_config() -> PushConfig {
         diagnose: Vec::new(),
         stocks: Vec::new(),
         diagnose_stocks: Vec::new(),
+        realtime_watch_stocks: Vec::new(),
         screen: None,
     }
 }
@@ -127,12 +131,18 @@ pub fn validate(cfg: &PushConfig) -> Result<()> {
             CHANNELS
         ));
     }
-    if cfg.channel.webhook.trim().is_empty() {
+    let watch_only = !cfg.realtime_watch_stocks.is_empty()
+        && cfg.holdings.is_empty()
+        && cfg.diagnose.is_empty()
+        && cfg.stocks.is_empty()
+        && cfg.diagnose_stocks.is_empty()
+        && cfg.screen.is_none();
+    if cfg.channel.webhook.trim().is_empty() && !watch_only {
         return Err(anyhow!("channel.webhook 不能为空"));
     }
     // URL 类渠道的 webhook 必须是完整 http(s) 地址，否则发送时才炸出含糊的 builder error。
     // 飞书裸 hook token(UUID) 会被 canonical_webhook 补全为完整 URL，故此处按补全后的形态校验。
-    if URL_CHANNELS.contains(&cfg.channel.kind.as_str()) {
+    if !cfg.channel.webhook.trim().is_empty() && URL_CHANNELS.contains(&cfg.channel.kind.as_str()) {
         let w = super::channels::canonical_webhook(&cfg.channel.kind, &cfg.channel.webhook);
         if !(w.starts_with("http://") || w.starts_with("https://")) {
             return Err(anyhow!(
@@ -148,9 +158,20 @@ pub fn validate(cfg: &PushConfig) -> Result<()> {
         && cfg.diagnose.is_empty()
         && cfg.stocks.is_empty()
         && cfg.diagnose_stocks.is_empty()
+        && cfg.realtime_watch_stocks.is_empty()
     {
         return Err(anyhow!(
-            "holdings/stocks/diagnose/diagnose_stocks 至少配置一项"
+            "holdings/stocks/diagnose/diagnose_stocks/realtime_watch_stocks 至少配置一项"
+        ));
+    }
+    if let Some(code) = cfg.realtime_watch_stocks.iter().find(|c| {
+        let c = c.trim();
+        c.len() != 6
+            || !c.chars().all(|x| x.is_ascii_digit())
+            || !matches!(c.as_bytes()[0], b'0' | b'3' | b'5' | b'6' | b'9')
+    }) {
+        return Err(anyhow!(
+            "realtime_watch_stocks 仅支持 6 位 A 股代码，当前为 '{code}'"
         ));
     }
     Ok(())

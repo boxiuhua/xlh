@@ -346,6 +346,9 @@ xlhMe();
         <div class="field" style="flex:1;min-width:240px"><label>额外诊断·基金(逗号分隔)</label><input id="pu-diag-fund" placeholder="如 110022,161725"/></div>
         <div class="field" style="flex:1;min-width:240px"><label>额外诊断·股票(逗号分隔)</label><input id="pu-diag-stock" placeholder="如 600519,000001"/></div>
       </div>
+      <div class="row" style="margin-top:10px">
+        <div class="field" style="flex:1;min-width:360px"><label>盘中异动·自选股票监控（逗号分隔）</label><input id="pu-rt-watch" placeholder="如 600519,300750；仅 A 股，触发明确买卖信号才推送"/></div>
+      </div>
 
       <div style="margin-top:14px;font-weight:600;color:#1a252f">质量筛选（可选）</div>
       <div class="row">
@@ -418,6 +421,11 @@ xlhMe();
   <!-- 盘中异动（守护抓取，此处只读库）-->
   <div class="panel" id="panel-s-realtime">
     <div class="card">
+      <div class="row" style="margin-bottom:10px">
+        <div class="field" style="flex:1;min-width:320px"><label>自选股票监控（逗号分隔，仅 A 股）</label><input id="rt-watch-codes" placeholder="如 600519,300750"/></div>
+        <button class="small" id="rt-watch-save">保存监控</button>
+      </div>
+      <div id="rt-watch-status" class="hint" style="margin-bottom:10px">未设置自选监控；全市场异动仍会展示。</div>
       <div class="row">
         <div class="field"><label>日期</label><input type="date" id="rt-day"/></div>
         <button class="run" id="run-s-realtime">查看</button>
@@ -1434,8 +1442,13 @@ function rtDiv(d){
 
 function renderRealtime(r){
   var el = document.getElementById('rt-result');
+  var watched = rtWatchCodes();
+  var watchedRows = (r.movers||[]).filter(function(m){ return watched.indexOf(String(m.code))>=0; });
+  var watchSummary = watched.length
+    ? '<div class="hint" style="margin-bottom:8px">自选监控：<strong>'+esc(watched.join('、'))+'</strong>；本次明确买卖信号 <strong>'+watchedRows.length+'</strong> 条。</div>'
+    : '';
   if(!r.movers || !r.movers.length){
-    el.innerHTML = '<div class="hint">' + esc(r.day) + ' 无异动信号。'
+    el.innerHTML = watchSummary + '<div class="hint">' + esc(r.day) + ' 无异动信号。'
       + '（守护未运行、当日非交易日、或确实没有触发的股票都会是这个结果）</div>';
     return;
   }
@@ -1486,8 +1499,26 @@ function renderRealtime(r){
       + '（样本 '+known.length+' 条，<strong>尚不足以证明有效性</strong>；需数百至上千条才谈得上统计检验）</div>';
   }
   h += '<div class="hint" style="margin-top:6px">'+esc(r.disclaimer||'')+'</div>';
-  el.innerHTML = h;
+  el.innerHTML = watchSummary + h;
 }
+
+function rtWatchCodes(){ return document.getElementById('rt-watch-codes').value.split(',').map(function(x){return x.trim();}).filter(function(x){return x;}); }
+function loadRealtimeWatch(){
+  fetch('/api/push/config').then(function(r){ if(!r.ok) throw new Error('读取监控配置失败'); return r.json(); }).then(function(c){
+    var codes=(c.realtime_watch_stocks||[]); document.getElementById('rt-watch-codes').value=codes.join(',');
+    document.getElementById('rt-watch-status').textContent=codes.length ? ('正在监控：'+codes.join('、')+'；出现强买卖异动时将按推送设置发送。') : '未设置自选监控；全市场异动仍会展示。';
+  }).catch(function(){ document.getElementById('rt-watch-status').textContent='登录后可保存自选监控。'; });
+}
+document.getElementById('rt-watch-save').addEventListener('click', function(){
+  var btn=this, codes=rtWatchCodes(), status=document.getElementById('rt-watch-status'); btn.disabled=true; status.textContent='保存中…';
+  fetch('/api/push/config').then(function(r){ if(!r.ok) throw new Error('读取配置失败'); return r.json(); }).then(function(c){
+    c.realtime_watch_stocks=codes;
+    return fetch('/api/push/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});
+  }).then(function(r){ if(!r.ok) return r.text().then(function(x){throw new Error(x);}); return r.json(); }).then(function(){
+    status.textContent=codes.length ? ('已保存，正在监控：'+codes.join('、')) : '已清空自选监控；全市场异动仍会展示。';
+  }).catch(function(e){ status.textContent='保存失败：'+String(e.message||e); }).finally(function(){btn.disabled=false;});
+});
+loadRealtimeWatch();
 
 document.getElementById('run-s-realtime').addEventListener('click', function(){
   var btn = this, day = document.getElementById('rt-day').value.trim();
@@ -1551,6 +1582,7 @@ function collectPushConfig(){
     diagnose: puCsv('pu-diag-fund'),
     stocks: stocks,
     diagnose_stocks: puCsv('pu-diag-stock')
+    ,realtime_watch_stocks: puCsv('pu-rt-watch')
   };
 }
 function loadPushConfig(){
@@ -1572,6 +1604,7 @@ function loadPushConfig(){
     if(!(c.stocks||[]).length) puStockRow();
     document.getElementById('pu-diag-fund').value = (c.diagnose||[]).join(',');
     document.getElementById('pu-diag-stock').value = (c.diagnose_stocks||[]).join(',');
+    document.getElementById('pu-rt-watch').value = (c.realtime_watch_stocks||[]).join(',');
     var sc = c.screen || {};
     document.getElementById('pu-screen-codes').value = (sc.codes||[]).join(',');
     document.getElementById('pu-screen-topn').value = sc.top_n!=null ? sc.top_n : 10;
