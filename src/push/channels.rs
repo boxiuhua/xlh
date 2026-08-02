@@ -84,7 +84,14 @@ pub fn build_request(cfg: &ChannelCfg, title: &str, md: &str, ts_ms: i64) -> Htt
         }
         // 飞书：文本消息；加签走 body，timestamp 用秒，sign=HMAC(key="{ts}\n{secret}", data="")。
         "feishu" => {
-            let mut obj = serde_json::json!({"msg_type":"text","content":{"text": md}});
+            // 飞书关键词校验只检查正文；将用户配置的关键词置于开头，避免标题/Markdown
+            // 转换差异导致 19024 Key Words Not Found。
+            let text = if cfg.keyword.trim().is_empty() {
+                md.to_string()
+            } else {
+                format!("{}\n{}", cfg.keyword.trim(), md)
+            };
+            let mut obj = serde_json::json!({"msg_type":"text","content":{"text": text}});
             if !cfg.secret.is_empty() {
                 let ts_s = ts_ms / 1000;
                 let sign = hmac_b64(format!("{ts_s}\n{}", cfg.secret).as_bytes(), b"");
@@ -196,6 +203,7 @@ mod tests {
             kind: kind.into(),
             webhook: "https://hook/xyz".into(),
             secret: secret.into(),
+            keyword: String::new(),
             cache_dir: PathBuf::from(".cache"),
         }
     }
@@ -250,6 +258,14 @@ mod tests {
         assert!(r.body.contains("\"msg_type\":\"text\""));
         assert!(r.body.contains("\"sign\":"));
         assert!(r.body.contains("\"timestamp\":\"1700000000\""), "飞书用秒");
+    }
+
+    #[test]
+    fn feishu_prepends_configured_keyword() {
+        let mut c = cfg("feishu", "");
+        c.keyword = "股票".into();
+        let r = build_request(&c, "t", "正文", 0);
+        assert!(r.body.contains("股票\\n正文"));
     }
 
     #[test]

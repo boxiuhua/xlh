@@ -77,6 +77,9 @@ pub struct ChannelCfg {
     /// 钉钉/飞书加签密钥（可选）；serverchan 时 webhook 填 sendkey。
     #[serde(default)]
     pub secret: String,
+    /// 飞书机器人“关键词校验”所要求命中的文字；留空表示未开启该校验。
+    #[serde(default)]
+    pub keyword: String,
     #[serde(default = "default_cache_dir")]
     pub cache_dir: PathBuf,
 }
@@ -106,6 +109,7 @@ pub fn default_config() -> PushConfig {
             kind: "feishu".into(),
             webhook: String::new(),
             secret: String::new(),
+            keyword: String::new(),
             cache_dir: default_cache_dir(),
         },
         portfolio: PortfolioCfg::default(),
@@ -134,6 +138,9 @@ pub fn validate(cfg: &PushConfig) -> Result<()> {
             cfg.channel.kind,
             CHANNELS
         ));
+    }
+    if cfg.channel.keyword.chars().count() > 128 {
+        return Err(anyhow!("飞书关键词不能超过 128 个字符"));
     }
     let watch_only = !cfg.realtime_watch_stocks.is_empty()
         && cfg.holdings.is_empty()

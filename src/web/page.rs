@@ -326,6 +326,7 @@ xlhMe();
         </div>
         <div class="field" style="flex:1;min-width:280px"><label>webhook / sendkey</label><input id="pu-webhook" placeholder="群机器人地址；Server酱填 sendkey"/></div>
         <div class="field"><label>加签密钥(可选)</label><input id="pu-secret" placeholder="钉钉/飞书 secret"/></div>
+        <div class="field"><label>飞书关键词(可选)</label><input id="pu-keyword" placeholder="飞书机器人安全设置中的关键词"/></div>
         <div class="field"><label>cron(6段含秒)</label><input id="pu-cron" value="0 30 8 * * *"/></div>
         <div class="field"><label>仅有新数据时推</label><select id="pu-onlynew"><option value="true">是</option><option value="false">否</option></select></div>
       </div>
@@ -1625,7 +1626,7 @@ function collectPushConfig(){
     : null;
   return {
     schedule:{ cron:document.getElementById('pu-cron').value.trim(), only_on_new_data: document.getElementById('pu-onlynew').value==='true' },
-    channel:{ kind:document.getElementById('pu-kind').value, webhook:document.getElementById('pu-webhook').value.trim(), secret:document.getElementById('pu-secret').value.trim(), cache_dir:'.cache' },
+    channel:{ kind:document.getElementById('pu-kind').value, webhook:document.getElementById('pu-webhook').value.trim(), secret:document.getElementById('pu-secret').value.trim(), keyword:document.getElementById('pu-keyword').value.trim(), cache_dir:'.cache' },
     portfolio: portfolio,
     screen: screen,
     holdings: holdings,
@@ -1640,6 +1641,7 @@ function loadPushConfig(){
     document.getElementById('pu-kind').value = (c.channel&&c.channel.kind)||'feishu';
     document.getElementById('pu-webhook').value = (c.channel&&c.channel.webhook)||'';
     document.getElementById('pu-secret').value = (c.channel&&c.channel.secret)||'';
+    document.getElementById('pu-keyword').value = (c.channel&&c.channel.keyword)||'';
     document.getElementById('pu-cron').value = (c.schedule&&c.schedule.cron)||'0 30 8 * * *';
     document.getElementById('pu-onlynew').value = (c.schedule&&c.schedule.only_on_new_data===false)?'false':'true';
     var p=c.portfolio||{};
