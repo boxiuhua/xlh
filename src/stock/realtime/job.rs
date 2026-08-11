@@ -10,6 +10,7 @@ use rusqlite::Connection;
 use std::collections::HashSet;
 
 use super::config::RealtimeCfg;
+use super::limit_board::{self, BoardDirection, LimitBoard};
 use super::movers::{self, Baseline, Divergence, Horizon, Mover, TradeAction};
 use super::store::{self, SignalRow};
 use super::{calendar, flow, snapshot};
@@ -37,6 +38,8 @@ pub struct TickOutcome {
     pub pushed: Vec<Mover>,
     /// 资金流是否可用（东财封禁时为 false）
     pub flow_ok: bool,
+    /// 当前快照中已触及涨停或跌停价的股票。
+    pub limit_boards: Vec<LimitBoard>,
 }
 
 /// 跳过的原因。区分「不该抓」与「抓了但不是交易日」——
@@ -189,6 +192,26 @@ pub fn render_movers(movers: &[Mover], flow_ok: bool) -> String {
     s
 }
 
+/// 渲染当前涨跌停板。检测只描述盘口状态，不生成买卖建议。
+pub fn render_limit_boards(boards: &[LimitBoard]) -> String {
+    let mut s = String::new();
+    for (direction, title) in [
+        (BoardDirection::Up, "🔴 涨停板"),
+        (BoardDirection::Down, "🟢 跌停板"),
+    ] {
+        let rows: Vec<_> = boards.iter().filter(|b| b.direction == direction).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        s.push_str(&format!("**{title}（{}）**\n", rows.len()));
+        for b in rows {
+            s.push_str(&format!("- **{} {}** {:.2}\n", b.code, b.name, b.price));
+        }
+        s.push('\n');
+    }
+    s
+}
+
 /// 渲染收盘汇总。**纯函数**。
 ///
 /// `close_ret` 是本项目最有价值的一列：它免费积累出信号质量的评估数据 ——
@@ -295,6 +318,13 @@ pub fn run_tick(
     }
 
     let n = store::insert_ticks(conn, &ticks)?;
+    let mut limit_boards = limit_board::detect(&ticks);
+    for board in &mut limit_boards {
+        if let Some(name) = names.get(&board.code) {
+            board.name = name.clone();
+        }
+    }
+    store::insert_limit_boards(conn, &limit_boards)?;
     let candidates = detect(conn, cfg, &ticks, now)?;
 
     // 资金流：只查候选。失败不致命 —— 佐证拿不到不影响价量主判定成立。
@@ -340,6 +370,7 @@ pub fn run_tick(
         movers: out,
         pushed: pushable,
         flow_ok,
+        limit_boards,
     })
 }
 

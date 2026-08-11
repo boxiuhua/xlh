@@ -27,6 +27,8 @@ fn tick(code: &str, ts: NaiveDateTime, price: f64, cum_volume: f64) -> Tick {
         amount: cum_volume * price * 100.0,
         turnover: 0.5,
         vol_ratio: 1.0,
+        limit_up: None,
+        limit_down: None,
     }
 }
 

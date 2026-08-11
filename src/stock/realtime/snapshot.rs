@@ -38,6 +38,10 @@ pub struct Tick {
     pub turnover: f64,
     /// 量比（下标 49）
     pub vol_ratio: f64,
+    /// 当日涨停价（下标 47）。无涨跌幅限制或数据源未提供时为 `None`。
+    pub limit_up: Option<f64>,
+    /// 当日跌停价（下标 48）。无涨跌幅限制或数据源未提供时为 `None`。
+    pub limit_down: Option<f64>,
 }
 
 /// 腾讯单请求代码数上限。实测 800 只正常返回（168KB）。
@@ -56,6 +60,8 @@ const I_TS: usize = 30;
 const I_CHANGE_PCT: usize = 32;
 const I_AMOUNT_WAN: usize = 37;
 const I_TURNOVER: usize = 38;
+const I_LIMIT_UP: usize = 47;
+const I_LIMIT_DOWN: usize = 48;
 const I_VOL_RATIO: usize = 49;
 /// 需要读到的最大下标 —— 短于此的行直接丢弃。
 const MIN_FIELDS: usize = I_VOL_RATIO + 1;
@@ -119,6 +125,8 @@ pub fn parse(body: &str) -> Vec<Tick> {
             amount: num(I_AMOUNT_WAN).unwrap_or(0.0) * 10_000.0,
             turnover: num(I_TURNOVER).unwrap_or(0.0),
             vol_ratio: num(I_VOL_RATIO).unwrap_or(0.0),
+            limit_up: num(I_LIMIT_UP).filter(|v| *v > 0.0),
+            limit_down: num(I_LIMIT_DOWN).filter(|v| *v > 0.0),
         });
     }
     out
@@ -211,6 +219,8 @@ mod tests {
         assert!((t.change_pct - 0.63).abs() < 1e-9, "涨跌幅在下标 32");
         assert!((t.turnover - 0.38).abs() < 1e-9, "换手率在下标 38");
         assert!((t.vol_ratio - 0.98).abs() < 1e-9, "量比在下标 49");
+        assert_eq!(t.limit_up, Some(1376.17), "涨停价在下标 47");
+        assert_eq!(t.limit_down, Some(1125.95), "跌停价在下标 48");
         assert_eq!(
             t.ts.format("%Y-%m-%d %H:%M:%S").to_string(),
             "2026-07-16 16:14:40",

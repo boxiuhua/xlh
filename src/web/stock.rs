@@ -455,6 +455,7 @@ pub struct MoversReport {
     pub day: String,
     pub count: usize,
     pub movers: Vec<crate::stock::realtime::store::SignalRow>,
+    pub limit_boards: Vec<crate::stock::realtime::limit_board::LimitBoard>,
     pub disclaimer: &'static str,
 }
 
@@ -480,10 +481,12 @@ fn realtime_movers_blocking(q: MoversQuery) -> Result<MoversReport> {
     let cfg = crate::stock::realtime::config::get();
     let conn = store::open(&cfg.db_path)?;
     let movers = store::signals_on(&conn, day)?;
+    let limit_boards = store::limit_boards_on(&conn, day)?;
     Ok(MoversReport {
         day: day.to_string(),
         count: movers.len(),
         movers,
+        limit_boards,
         disclaimer: job::DISCLAIMER,
     })
 }

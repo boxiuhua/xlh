@@ -179,8 +179,9 @@ fn realtime_cmd(config: &std::path::Path, action: RealtimeCmd) -> Result<()> {
 
             let out = job::run_tick(&mut conn, cfg, &symbols, &names, now)?;
             println!(
-                "快照 {} 条，异动 {} 只，应推送 {} 只{}",
+                "快照 {} 条，涨跌停 {} 只，异动 {} 只，应推送 {} 只{}",
                 out.ticks,
+                out.limit_boards.len(),
                 out.movers.len(),
                 out.pushed.len(),
                 if out.flow_ok {
@@ -189,6 +190,9 @@ fn realtime_cmd(config: &std::path::Path, action: RealtimeCmd) -> Result<()> {
                     "（资金流不可用）"
                 }
             );
+            if !out.limit_boards.is_empty() {
+                println!("\n{}", job::render_limit_boards(&out.limit_boards));
+            }
             if !out.movers.is_empty() {
                 println!("\n{}", job::render_movers(&out.movers, out.flow_ok));
             }

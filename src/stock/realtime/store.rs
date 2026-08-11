@@ -36,6 +36,7 @@ use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 
+use super::limit_board::{BoardDirection, LimitBoard};
 use super::movers::{Divergence, Horizon, Mover, TradeAction};
 use super::snapshot::Tick;
 
@@ -72,6 +73,16 @@ CREATE TABLE IF NOT EXISTS signals (
   UNIQUE (code, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts);
+CREATE TABLE IF NOT EXISTS limit_boards (
+  code        TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  ts          INTEGER NOT NULL,
+  price       REAL NOT NULL,
+  limit_price REAL NOT NULL,
+  direction   TEXT NOT NULL,
+  PRIMARY KEY (code, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_limit_boards_ts ON limit_boards(ts);
 CREATE TABLE IF NOT EXISTS non_trading_days (
   day TEXT PRIMARY KEY
 );
@@ -279,6 +290,62 @@ pub fn insert_signal(conn: &Connection, m: &Mover, pushed: bool) -> Result<()> {
     Ok(())
 }
 
+/// 保存本次快照检出的涨跌停板，同一股票同一行情时间戳幂等。
+pub fn insert_limit_boards(conn: &mut Connection, boards: &[LimitBoard]) -> Result<usize> {
+    let tx = conn.transaction()?;
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO limit_boards
+         (code, name, ts, price, limit_price, direction) VALUES (?1,?2,?3,?4,?5,?6)",
+    )?;
+    let mut count = 0;
+    for b in boards {
+        count += stmt.execute(rusqlite::params![
+            b.code,
+            b.name,
+            b.ts.and_utc().timestamp(),
+            b.price,
+            b.limit_price,
+            match b.direction {
+                BoardDirection::Up => "up",
+                BoardDirection::Down => "down",
+            }
+        ])?;
+    }
+    drop(stmt);
+    tx.commit()?;
+    Ok(count)
+}
+
+/// 当日曾触及涨跌停的股票；同一股票仅返回最近一次记录。
+pub fn limit_boards_on(conn: &Connection, day: NaiveDate) -> Result<Vec<LimitBoard>> {
+    let start = day.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+    let end = start + 86400;
+    let mut stmt = conn.prepare(
+        "SELECT b.code,b.name,b.ts,b.price,b.limit_price,b.direction
+         FROM limit_boards b
+         JOIN (SELECT code,MAX(ts) ts FROM limit_boards WHERE ts>=?1 AND ts<?2 GROUP BY code) x
+           ON b.code=x.code AND b.ts=x.ts
+         ORDER BY b.direction DESC,b.ts DESC",
+    )?;
+    let rows = stmt.query_map([start, end], |r| {
+        Ok(LimitBoard {
+            code: r.get(0)?,
+            name: r.get(1)?,
+            ts: chrono::DateTime::from_timestamp(r.get::<_, i64>(2)?, 0)
+                .map(|d| d.naive_utc())
+                .unwrap_or_default(),
+            price: r.get(3)?,
+            limit_price: r.get(4)?,
+            direction: if r.get::<_, String>(5)? == "up" {
+                BoardDirection::Up
+            } else {
+                BoardDirection::Down
+            },
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 /// 今天已推送过的股票代码集合。用于「同一只股票当日只推一次」的限流。
 pub fn pushed_today(
     conn: &Connection,
@@ -425,6 +492,8 @@ mod tests {
             amount: volume * price,
             turnover: 0.5,
             vol_ratio: 1.0,
+            limit_up: None,
+            limit_down: None,
         }
     }
 

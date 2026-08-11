@@ -1478,13 +1478,24 @@ function rtDiv(d){
 
 function renderRealtime(r){
   var el = document.getElementById('rt-result');
+  var boards = r.limit_boards || [];
+  var ups = boards.filter(function(b){return b.direction==='up';});
+  var downs = boards.filter(function(b){return b.direction==='down';});
+  function boardBox(rows,title,color){
+    if(!rows.length) return '';
+    return '<div style="margin:0 0 10px;padding:10px 12px;border:1px solid '+color+';border-radius:8px">'
+      + '<strong style="color:'+color+'">'+title+'（'+rows.length+'）</strong><div style="margin-top:6px">'
+      + rows.map(function(b){return '<span style="display:inline-block;margin:3px 12px 3px 0"><strong>'+esc(b.code)+' '+esc(b.name)+'</strong> '+Number(b.price).toFixed(2)+'</span>';}).join('')
+      + '</div></div>';
+  }
+  var boardHtml = boardBox(ups,'🔴 当日触及涨停','#c0392b') + boardBox(downs,'🟢 当日触及跌停','#27ae60');
   var watched = rtWatchCodes();
   var watchedRows = (r.movers||[]).filter(function(m){ return watched.indexOf(String(m.code))>=0; });
   var watchSummary = watched.length
     ? '<div class="hint" style="margin-bottom:8px">自选监控：<strong>'+esc(watched.join('、'))+'</strong>；本次明确买卖信号 <strong>'+watchedRows.length+'</strong> 条。</div>'
     : '';
   if(!r.movers || !r.movers.length){
-    el.innerHTML = watchSummary + '<div class="hint">' + esc(r.day) + ' 无异动信号。'
+    el.innerHTML = boardHtml + watchSummary + '<div class="hint">' + esc(r.day) + ' 无异动信号。'
       + '（守护未运行、当日非交易日、或确实没有触发的股票都会是这个结果）</div>';
     return;
   }
@@ -1535,7 +1546,7 @@ function renderRealtime(r){
       + '（样本 '+known.length+' 条，<strong>尚不足以证明有效性</strong>；需数百至上千条才谈得上统计检验）</div>';
   }
   h += '<div class="hint" style="margin-top:6px">'+esc(r.disclaimer||'')+'</div>';
-  el.innerHTML = watchSummary + h;
+  el.innerHTML = boardHtml + watchSummary + h;
 }
 
 function rtWatchCodes(){ return document.getElementById('rt-watch-codes').value.split(',').map(function(x){return x.trim();}).filter(function(x){return x;}); }

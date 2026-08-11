@@ -26,6 +26,7 @@ pub mod calendar;
 pub mod config;
 pub mod flow;
 pub mod job;
+pub mod limit_board;
 pub mod movers;
 pub mod snapshot;
 pub mod store;

@@ -160,9 +160,10 @@ fn realtime_tick(
         return Ok(());
     };
     println!(
-        "[{}] 快照 {} 条，异动 {} 只，推送 {} 只{}",
+        "[{}] 快照 {} 条，涨跌停 {} 只，异动 {} 只，推送 {} 只{}",
         naive.format("%H:%M"),
         out.ticks,
+        out.limit_boards.len(),
         out.movers.len(),
         out.pushed.len(),
         if out.flow_ok {
