@@ -140,10 +140,11 @@ pub fn has_open_ticket(
     )?)
 }
 
+/// 今日已生成的实盘买入工单数(每日工单上限只约束买入)。
 pub fn count_real_tickets_on(conn: &Connection, user_id: i64, day: NaiveDate) -> Result<u32> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM trade_tickets
-         WHERE user_id = ?1 AND account = 'real' AND substr(created_at, 1, 10) = ?2",
+         WHERE user_id = ?1 AND account = 'real' AND side = 'buy' AND substr(created_at, 1, 10) = ?2",
         params![user_id, day.format(DATE_FMT).to_string()],
         |r| r.get(0),
     )?;
@@ -619,6 +620,29 @@ mod tests {
         assert_eq!(
             count_real_tickets_on(&c, 1, at(15, 0, 0).date()).unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn daily_count_excludes_sell_tickets() {
+        let c = db();
+        ticket(
+            &c,
+            Direction::Buy,
+            100,
+            TicketStatus::Pending,
+            at(15, 10, 0),
+        );
+        ticket(
+            &c,
+            Direction::Sell,
+            100,
+            TicketStatus::Pending,
+            at(15, 10, 1),
+        );
+        assert_eq!(
+            count_real_tickets_on(&c, 1, at(15, 0, 0).date()).unwrap(),
+            1
         );
     }
 
