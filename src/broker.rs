@@ -37,6 +37,15 @@ impl FeeModel {
 pub trait Fee {
     fn buy_fee(&self, cash: f64) -> f64;
     fn sell_fee(&self, shares: f64, price: f64, holding_days: i64) -> f64;
+
+    /// 一笔卖单的总费用。`legs` 为 FIFO 拆出的 (份额, 持有天数)。
+    /// 默认逐 lot 累加(基金赎回费按持有期分档,本就逐 lot 计);
+    /// 有「每笔最低佣金」的费率须覆盖,整单只收一次最低佣金。
+    fn sell_fee_order(&self, legs: &[(f64, i64)], price: f64) -> f64 {
+        legs.iter().fold(0.0, |acc, &(shares, days)| {
+            acc + self.sell_fee(shares, price, days)
+        })
+    }
 }
 
 impl Fee for FeeModel {
@@ -149,17 +158,18 @@ impl Broker {
                 };
                 let mut remaining = want.min(self.total_shares());
                 let mut sold = 0.0;
-                let mut fee = 0.0;
+                let mut legs: Vec<(f64, i64)> = Vec::new();
                 let mut i = 0;
                 while remaining > 1e-9 && i < self.lots.len() {
                     let take = remaining.min(self.lots[i].shares);
                     let days = (order.date - self.lots[i].date).num_days();
-                    fee += self.fee.sell_fee(take, price, days);
+                    legs.push((take, days));
                     self.lots[i].shares -= take;
                     sold += take;
                     remaining -= take;
                     i += 1;
                 }
+                let fee = self.fee.sell_fee_order(&legs, price);
                 self.lots.retain(|l| l.shares > 1e-9);
                 FillEvent {
                     date: order.date,
@@ -361,5 +371,41 @@ mod tests {
     fn buy_fee_is_exposed() {
         let b = Broker::new(crate::stock::fee::StockFee::a_share());
         assert!((b.buy_fee(1000.0) - 5.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fund_fee_model_order_fee_still_sums_lots_by_tier() {
+        // 默认实现逐 lot:3 天档 1.5% + 100 天档 0.5%
+        let fee = fee_model().sell_fee_order(&[(100.0, 3), (100.0, 100)], 1.0);
+        assert!((fee - 2.0).abs() < 1e-9, "实际 {fee}");
+    }
+
+    #[test]
+    fn stock_sell_across_lots_pays_min_commission_once() {
+        let mut b = Broker::new(crate::stock::fee::StockFee::a_share());
+        for day in [2, 3, 4] {
+            b.execute(
+                &OrderEvent {
+                    date: d(2024, 1, day),
+                    direction: Direction::Buy,
+                    qty: OrderQty::Shares(100.0),
+                },
+                10.0,
+            );
+        }
+        let fill = b.execute(
+            &OrderEvent {
+                date: d(2024, 1, 10),
+                direction: Direction::Sell,
+                qty: OrderQty::AllShares,
+            },
+            10.0,
+        );
+        assert!((fill.shares - 300.0).abs() < 1e-9);
+        assert!(
+            (fill.fee - 6.53).abs() < 1e-9,
+            "整单一次最低佣金,实际 {}",
+            fill.fee
+        );
     }
 }
