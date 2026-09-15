@@ -124,6 +124,7 @@ fn main() -> Result<()> {
             let conn = xlh::web::auth::store::open(&auth_cfg.db_path)?;
             xlh::history::migrate(&conn)?;
             xlh::push::store::migrate(&conn)?;
+            xlh::trade::store::migrate(&conn)?;
             xlh::push::store::migrate_legacy_push(&conn, std::path::Path::new("push.toml")).ok();
             if once {
                 xlh::push::run_all_once(&conn, auth_cfg.warn_days, auth_cfg.grace_days)

@@ -19,4 +19,5 @@ pub mod result;
 pub mod runner;
 pub mod stock;
 pub mod strategy;
+pub mod trade;
 pub mod web;

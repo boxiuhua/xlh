@@ -535,6 +535,7 @@ pub async fn serve(config_path: std::path::PathBuf, port: u16) -> Result<()> {
     let conn = auth::store::open(&cfg.db_path).context("打开授权数据库失败")?;
     crate::history::migrate(&conn).context("建历史表失败")?;
     crate::push::store::migrate(&conn).context("建推送配置表失败")?;
+    crate::trade::store::migrate(&conn).context("建交易表失败")?;
     crate::push::store::migrate_legacy_push(&conn, std::path::Path::new("push.toml")).ok();
     let state = auth::AuthState::new(conn, cfg);
 
@@ -1377,6 +1378,7 @@ mod tests {
         let conn = crate::web::auth::store::open_in_memory().unwrap();
         crate::history::migrate(&conn).unwrap();
         crate::push::store::migrate(&conn).unwrap();
+        crate::trade::store::migrate(&conn).unwrap();
         crate::web::auth::AuthState::new(conn, Default::default())
     }
     /// 造一个已授权用户 + 会话，返回 token。
