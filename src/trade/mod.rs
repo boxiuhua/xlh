@@ -4,6 +4,8 @@
 pub mod exits;
 pub mod gate;
 pub mod model;
+pub mod monitor;
+pub mod movers;
 pub mod quotes;
 pub mod router;
 pub mod service;
