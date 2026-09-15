@@ -36,25 +36,26 @@ pub fn submit_signal(
     ctx: &SubmitContext,
 ) -> Result<SubmitOutcome> {
     let now = ctx.now;
-    let Some(signal_id) = ticket::insert_signal(conn, sig, now)? else {
+    let tx = conn.transaction()?;
+    let Some(signal_id) = ticket::insert_signal(&tx, sig, now)? else {
         return Ok(SubmitOutcome::Duplicate);
     };
 
-    let rules = store::get_risk_rules(conn, sig.user_id)?;
-    let real_account = store::get_account(conn, sig.user_id, Account::Real)?;
-    let mut paper_account = store::get_account(conn, sig.user_id, Account::Paper)?;
+    let rules = store::get_risk_rules(&tx, sig.user_id)?;
+    let real_account = store::get_account(&tx, sig.user_id, Account::Real)?;
+    let mut paper_account = store::get_account(&tx, sig.user_id, Account::Paper)?;
     if paper_account.is_none() {
         if let Some(real) = &real_account {
-            store::set_capital(conn, sig.user_id, Account::Paper, real.total_capital, now)?;
-            paper_account = store::get_account(conn, sig.user_id, Account::Paper)?;
+            store::set_capital(&tx, sig.user_id, Account::Paper, real.total_capital, now)?;
+            paper_account = store::get_account(&tx, sig.user_id, Account::Paper)?;
         }
     }
-    let real_position = store::get_position(conn, sig.user_id, Account::Real, &sig.code)?;
-    let paper_position = store::get_position(conn, sig.user_id, Account::Paper, &sig.code)?;
-    let has_open_ticket = ticket::has_open_ticket(conn, sig.user_id, &sig.code, sig.side)?;
-    let last_signal_at = ticket::last_signal_at(conn, sig.user_id, &sig.code, sig.side, signal_id)?;
-    let tickets_today = ticket::count_real_tickets_on(conn, sig.user_id, now.date())?;
-    let realized_pnl_today = ticket::realized_pnl_on(conn, sig.user_id, Account::Real, now.date())?;
+    let real_position = store::get_position(&tx, sig.user_id, Account::Real, &sig.code)?;
+    let paper_position = store::get_position(&tx, sig.user_id, Account::Paper, &sig.code)?;
+    let has_open_ticket = ticket::has_open_ticket(&tx, sig.user_id, &sig.code, sig.side)?;
+    let last_signal_at = ticket::last_signal_at(&tx, sig.user_id, &sig.code, sig.side, signal_id)?;
+    let tickets_today = ticket::count_real_tickets_on(&tx, sig.user_id, now.date())?;
+    let realized_pnl_today = ticket::realized_pnl_on(&tx, sig.user_id, Account::Real, now.date())?;
 
     let decision = gate::evaluate(&GateInput {
         signal: sig,
@@ -74,7 +75,8 @@ pub fn submit_signal(
 
     let plans = match decision {
         GateDecision::Reject(reason) => {
-            ticket::mark_signal(conn, signal_id, "rejected", Some(reason.as_str()))?;
+            ticket::mark_signal(&tx, signal_id, "rejected", Some(reason.as_str()))?;
+            tx.commit()?;
             return Ok(SubmitOutcome::Rejected { signal_id, reason });
         }
         GateDecision::Pass(plans) => plans,
@@ -89,7 +91,7 @@ pub fn submit_signal(
             Account::Paper => TicketStatus::Confirmed,
         };
         let id = ticket::create_ticket(
-            conn,
+            &tx,
             &NewTicket {
                 user_id: sig.user_id,
                 signal_id,
@@ -109,11 +111,14 @@ pub fn submit_signal(
             Account::Paper => paper_ticket = Some(id),
         }
     }
-    ticket::mark_signal(conn, signal_id, "ticketed", None)?;
+    ticket::mark_signal(&tx, signal_id, "ticketed", None)?;
+    tx.commit()?;
 
     if let (Some(id), Some(q)) = (paper_ticket, ctx.quote) {
         if let Some(t) = ticket::get_ticket(conn, id)? {
-            router::fill_paper_ticket(conn, &t, q, rules.slippage, now)?;
+            if let Err(e) = router::fill_paper_ticket(conn, &t, q, rules.slippage, now) {
+                eprintln!("模拟盘工单 {id} 即时成交失败,留待批量撮合重试: {e:#}");
+            }
         }
     }
 

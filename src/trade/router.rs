@@ -20,6 +20,7 @@ pub enum RouteOutcome {
     NotFillable,
 }
 
+/// 模拟盘工单同样受有效期约束:过期未成交即标记 expired。
 pub fn fill_paper_ticket(
     conn: &mut Connection,
     t: &Ticket,
@@ -37,6 +38,13 @@ pub fn fill_paper_ticket(
         current.status,
         TicketStatus::Confirmed | TicketStatus::Partial
     ) {
+        return Ok(RouteOutcome::NotFillable);
+    }
+    if now >= current.expires_at {
+        conn.execute(
+            "UPDATE trade_tickets SET status = 'expired' WHERE id = ?1 AND status IN ('confirmed', 'partial')",
+            [current.id],
+        )?;
         return Ok(RouteOutcome::NotFillable);
     }
     if !(quote.price.is_finite() && quote.price > 0.0) {
@@ -213,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn sell_waits_for_t_plus_one_then_fills_and_batch_counts() {
+    fn sell_waits_t_plus_one_expires_stale_and_fills_fresh_ticket() {
         let mut c = db();
         let b = paper_ticket(&c, Direction::Buy, 1000, at(15, 10, 0));
         fill_paper_ticket(
@@ -224,24 +232,57 @@ mod tests {
             at(15, 10, 0),
         )
         .unwrap();
-        let s = paper_ticket(&c, Direction::Sell, 1000, at(15, 11, 0));
+        let s1 = paper_ticket(&c, Direction::Sell, 1000, at(15, 11, 0));
         let mut quotes = HashMap::new();
         quotes.insert(
             "600000".to_string(),
             quote(10.5, None, Some(9.0), at(15, 11, 0)),
         );
         assert_eq!(
-            fill_pending_paper(&mut c, &quotes, at(15, 11, 0)).unwrap(),
+            fill_pending_paper(&mut c, &quotes, at(15, 11, 10)).unwrap(),
             0,
             "T+1 等待"
         );
         assert_eq!(
             fill_pending_paper(&mut c, &quotes, at(16, 9, 31)).unwrap(),
+            0,
+            "过期工单不成交"
+        );
+        assert_eq!(
+            ticket::get_ticket(&c, s1.id).unwrap().unwrap().status,
+            TicketStatus::Expired
+        );
+
+        let s2 = paper_ticket(&c, Direction::Sell, 1000, at(16, 9, 20));
+        assert_eq!(
+            fill_pending_paper(&mut c, &quotes, at(16, 9, 31)).unwrap(),
             1
         );
         assert_eq!(
-            ticket::get_ticket(&c, s.id).unwrap().unwrap().status,
+            ticket::get_ticket(&c, s2.id).unwrap().unwrap().status,
             TicketStatus::Filled
+        );
+        assert!(store::get_position(&c, 1, Account::Paper, "600000")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn paper_buy_expires_instead_of_filling_late() {
+        let mut c = db();
+        let t = paper_ticket(&c, Direction::Buy, 1000, at(15, 10, 0));
+        let out = fill_paper_ticket(
+            &mut c,
+            &t,
+            &quote(10.0, Some(11.0), None, at(15, 10, 30)),
+            0.001,
+            at(15, 10, 30),
+        )
+        .unwrap();
+        assert_eq!(out, RouteOutcome::NotFillable);
+        assert_eq!(
+            ticket::get_ticket(&c, t.id).unwrap().unwrap().status,
+            TicketStatus::Expired
         );
         assert!(store::get_position(&c, 1, Account::Paper, "600000")
             .unwrap()
