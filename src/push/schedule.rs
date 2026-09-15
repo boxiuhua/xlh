@@ -36,7 +36,7 @@ pub fn due_users(
 }
 
 /// 该用户是否允许被投递：启用、未注销、且授权放行。
-fn user_allowed(
+pub(crate) fn user_allowed(
     conn: &Connection,
     uid: i64,
     today: chrono::NaiveDate,
