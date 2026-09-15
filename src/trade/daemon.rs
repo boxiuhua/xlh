@@ -159,14 +159,17 @@ fn run_loop(
     warn_days: i64,
     grace_days: i64,
 ) {
-    let mut conn =
+    // 打开失败(如库被其它进程独占、磁盘瞬时不可用)不能让监听线程直接退出——
+    // 退出就意味着止盈止损此后彻底停摆且无人知晓;每 60 秒重试直至成功。
+    let mut conn = loop {
         match crate::web::auth::store::open(&db_path).and_then(|c| store::migrate(&c).map(|_| c)) {
-            Ok(c) => c,
+            Ok(c) => break c,
             Err(e) => {
-                eprintln!("[trade] 打开数据库失败,交易监听未启动: {e:#}");
-                return;
+                eprintln!("[trade] 打开数据库失败,60 秒后重试: {e:#}");
+                std::thread::sleep(std::time::Duration::from_secs(60));
             }
-        };
+        }
+    };
     println!(
         "交易监听已启动(每 {} 秒,库 {})",
         cfg.monitor_interval_secs,
