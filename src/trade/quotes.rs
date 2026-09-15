@@ -13,6 +13,9 @@ pub fn tencent_symbol(code: &str) -> Option<String> {
     if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
+    if code.starts_with("92") {
+        return None;
+    }
     match code.as_bytes()[0] {
         b'6' | b'5' | b'9' => snapshot::symbol(1, code),
         b'0' | b'1' | b'2' | b'3' => snapshot::symbol(0, code),
@@ -56,6 +59,8 @@ mod tests {
         assert_eq!(tencent_symbol("300750").as_deref(), Some("sz300750"));
         assert_eq!(tencent_symbol("159915").as_deref(), Some("sz159915"));
         assert_eq!(tencent_symbol("830799"), None, "北交所暂不支持");
+        assert_eq!(tencent_symbol("920819"), None, "北交所 92 开头");
+        assert_eq!(tencent_symbol("900901").as_deref(), Some("sh900901"));
         assert_eq!(tencent_symbol("60051"), None);
         assert_eq!(tencent_symbol("AAPL00"), None);
     }

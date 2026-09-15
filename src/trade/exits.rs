@@ -51,7 +51,9 @@ pub fn trigger(p: &Position, price: f64) -> Option<ExitRule> {
 
 /// 启用移动止盈时,价格创出新高则返回新的最高价。
 pub fn next_trailing_high(p: &Position, price: f64) -> Option<f64> {
-    p.trailing_pct?;
+    if !p.trailing_pct.is_some_and(|pct| pct > 0.0) {
+        return None;
+    }
     match p.trailing_high {
         Some(high) if price <= high => None,
         _ => Some(price),
@@ -169,11 +171,22 @@ mod tests {
         empty.qty = 0;
         assert_eq!(trigger(&empty, 1.0), None);
         assert_eq!(trigger(&p, 0.0), None);
+        let mut zero_pct = p.clone();
+        zero_pct.trailing_pct = Some(0.0);
+        zero_pct.trailing_high = Some(12.0);
+        assert_eq!(trigger(&zero_pct, 11.0), None, "移动止盈比例非正视为关闭");
     }
 
     #[test]
     fn trailing_high_tracks_new_highs_only_when_enabled() {
         let mut p = pos(Account::Real);
+        let mut z = p.clone();
+        z.trailing_pct = Some(0.0);
+        assert_eq!(
+            next_trailing_high(&z, 13.0),
+            None,
+            "移动止盈比例非正视为关闭"
+        );
         assert_eq!(next_trailing_high(&p, 13.0), None, "未启用移动止盈");
         p.trailing_pct = Some(0.05);
         assert_eq!(next_trailing_high(&p, 10.5), Some(10.5), "首次记录");
