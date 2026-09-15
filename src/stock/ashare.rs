@@ -1,6 +1,10 @@
 //! A 股交易规则(纯函数)与 A 股成交模型。
 //! 规则只在此处定义一次:回测成交模型与交易闸门共用。
 
+use crate::broker::Broker;
+use crate::event::{Direction, MarketEvent, OrderEvent, OrderQty};
+use crate::execution::{CloseExecution, ExecBar, ExecutionModel, Prepared, RejectReason};
+
 fn is_star(code: &str) -> bool {
     code.starts_with("688") || code.starts_with("689")
 }
@@ -95,12 +99,459 @@ pub fn step_down(n: u64, lot: BuyLot) -> u64 {
     }
 }
 
+/// A 股成交口径:T 日开盘价 ± 滑点(不越过涨跌停价)、整手、开盘涨停不买/跌停不卖、T+1。
+///
+/// 涨跌停与整手按**不复权**价计算;交给 Broker 的价格与份额换算回复权尺度,
+/// 保证「份额 × 价格」等于真实成交金额。
+pub struct AShareExecution {
+    ratio: f64,
+    decimals: i32,
+    lot: BuyLot,
+    slippage: f64,
+}
+
+impl AShareExecution {
+    pub const DEFAULT_SLIPPAGE: f64 = 0.001;
+
+    pub fn new(code: &str, name: Option<&str>, slippage: f64) -> Self {
+        Self {
+            ratio: limit_ratio(code, name),
+            decimals: price_decimals(code),
+            lot: buy_lot(code),
+            slippage,
+        }
+    }
+}
+
+impl ExecutionModel for AShareExecution {
+    fn name(&self) -> &'static str {
+        "a_share"
+    }
+
+    fn prepare(
+        &self,
+        order: &OrderEvent,
+        _today: &MarketEvent,
+        bar: Option<&ExecBar>,
+        broker: &Broker,
+    ) -> Result<Prepared, RejectReason> {
+        let bar = bar.ok_or(RejectReason::NoPrice)?;
+        if bar.open <= 0.0 || bar.close <= 0.0 || bar.adj_close <= 0.0 {
+            return Err(RejectReason::NoPrice);
+        }
+        let prev = bar.prev_close.ok_or(RejectReason::NoPrevClose)?;
+        let (up, down) = limit_prices(prev, self.ratio, self.decimals);
+        let eps = 0.5 * 10f64.powi(-self.decimals);
+        // 复权因子:复权尺度 = 不复权 × factor
+        let factor = bar.adj_close / bar.close;
+
+        match order.direction {
+            Direction::Buy => {
+                if bar.open >= up - eps {
+                    return Err(RejectReason::LimitUp);
+                }
+                let OrderQty::Cash(budget) = order.qty else {
+                    return Err(RejectReason::UnsupportedQty);
+                };
+                let raw_price = (bar.open * (1.0 + self.slippage)).min(up);
+                let mut n = round_buy_shares(budget / raw_price, self.lot);
+                while n > 0 {
+                    let value = n as f64 * raw_price;
+                    if value + broker.buy_fee(value) <= budget + 1e-9 {
+                        break;
+                    }
+                    n = step_down(n, self.lot);
+                }
+                if n == 0 {
+                    return Err(RejectReason::BelowOneLot);
+                }
+                Ok(Prepared {
+                    order: OrderEvent {
+                        date: order.date,
+                        direction: Direction::Buy,
+                        qty: OrderQty::Shares(n as f64 / factor),
+                    },
+                    price: raw_price * factor,
+                })
+            }
+            Direction::Sell => {
+                if bar.open <= down + eps {
+                    return Err(RejectReason::LimitDown);
+                }
+                let sellable = broker.sellable_shares(order.date);
+                if sellable <= 1e-9 {
+                    return Err(RejectReason::NothingSellable);
+                }
+                let want = match order.qty {
+                    OrderQty::AllShares => sellable,
+                    OrderQty::Shares(s) => s.min(sellable),
+                    OrderQty::Cash(_) => return Err(RejectReason::UnsupportedQty),
+                };
+                let shares = if want >= sellable - 1e-9 {
+                    // 清掉全部可卖份额:允许零股
+                    sellable
+                } else {
+                    let raw_n =
+                        ((want * factor + 1e-6).floor() as u64) / self.lot.step * self.lot.step;
+                    if raw_n == 0 {
+                        return Err(RejectReason::BelowOneLot);
+                    }
+                    raw_n as f64 / factor
+                };
+                let raw_price = (bar.open * (1.0 - self.slippage)).max(down);
+                Ok(Prepared {
+                    order: OrderEvent {
+                        date: order.date,
+                        direction: Direction::Sell,
+                        qty: OrderQty::Shares(shares),
+                    },
+                    price: raw_price * factor,
+                })
+            }
+        }
+    }
+}
+
+/// 按市场选择成交口径:港股(116)、美股(105..=107)沿用收盘成交,其余按 A 股规则。
+pub fn execution_for_market(market: u16, code: &str) -> Box<dyn ExecutionModel> {
+    match market {
+        116 | 105..=107 => Box::new(CloseExecution),
+        _ => Box::new(AShareExecution::new(
+            code,
+            None,
+            AShareExecution::DEFAULT_SLIPPAGE,
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    use crate::broker::Broker;
+    use crate::event::{Direction, MarketEvent, OrderEvent, OrderQty};
+    use crate::execution::{ExecBar, ExecutionModel, RejectReason};
+    use crate::stock::fee::StockFee;
+    use chrono::NaiveDate;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+    fn today() -> MarketEvent {
+        MarketEvent {
+            date: d(2024, 1, 3),
+            nav: 0.0,
+            adj_nav: 0.0,
+        }
+    }
+    fn xbar(open: f64, close: f64, adj_close: f64, prev: Option<f64>) -> ExecBar {
+        ExecBar {
+            open,
+            close,
+            adj_close,
+            prev_close: prev,
+        }
+    }
+    fn buy(cash: f64) -> OrderEvent {
+        OrderEvent {
+            date: d(2024, 1, 3),
+            direction: Direction::Buy,
+            qty: OrderQty::Cash(cash),
+        }
+    }
+    fn sell(qty: OrderQty, date: NaiveDate) -> OrderEvent {
+        OrderEvent {
+            date,
+            direction: Direction::Sell,
+            qty,
+        }
+    }
+    /// 1/2 买入 `shares` 股 @10 的持仓。
+    fn holding(shares: f64) -> Broker {
+        let mut b = Broker::new(StockFee::a_share());
+        b.execute(
+            &OrderEvent {
+                date: d(2024, 1, 2),
+                direction: Direction::Buy,
+                qty: OrderQty::Shares(shares),
+            },
+            10.0,
+        );
+        b
+    }
+    fn shares_of(o: &OrderEvent) -> f64 {
+        match o.qty {
+            OrderQty::Shares(s) => s,
+            other => panic!("应为 Shares,实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn buy_fills_at_open_plus_slippage_in_lots() {
+        let ex = AShareExecution::new("600000", None, 0.001);
+        let b = Broker::new(StockFee::a_share());
+        let p = ex
+            .prepare(
+                &buy(10000.0),
+                &today(),
+                Some(&xbar(10.0, 10.5, 10.5, Some(10.0))),
+                &b,
+            )
+            .unwrap();
+        // 10.01 → 999 股 → 900;9009 + 5.09 ≤ 10000
+        assert!(close(p.price, 10.01), "price={}", p.price);
+        assert!(close(shares_of(&p.order), 900.0));
+        assert_eq!(ex.name(), "a_share");
+    }
+
+    #[test]
+    fn buy_steps_down_when_fee_exceeds_budget() {
+        let ex = AShareExecution::new("600000", None, 0.0);
+        let b = Broker::new(StockFee::a_share());
+        let r = ex.prepare(
+            &buy(1005.0),
+            &today(),
+            Some(&xbar(10.0, 10.0, 10.0, Some(10.0))),
+            &b,
+        );
+        // 100 股 = 1000 + 5.01 费 > 1005
+        assert_eq!(r.unwrap_err(), RejectReason::BelowOneLot);
+    }
+
+    #[test]
+    fn buy_rejected_at_limit_up_by_board() {
+        let b = Broker::new(StockFee::a_share());
+        let bar = xbar(11.0, 11.0, 11.0, Some(10.0));
+        let main = AShareExecution::new("600000", None, 0.001);
+        assert_eq!(
+            main.prepare(&buy(10000.0), &today(), Some(&bar), &b)
+                .unwrap_err(),
+            RejectReason::LimitUp
+        );
+        let star = AShareExecution::new("688001", None, 0.001);
+        assert!(
+            star.prepare(&buy(10000.0), &today(), Some(&bar), &b)
+                .is_ok(),
+            "科创板 20%"
+        );
+        let st = AShareExecution::new("600000", Some("*ST某某"), 0.001);
+        assert_eq!(
+            st.prepare(
+                &buy(10000.0),
+                &today(),
+                Some(&xbar(10.5, 10.5, 10.5, Some(10.0))),
+                &b
+            )
+            .unwrap_err(),
+            RejectReason::LimitUp
+        );
+    }
+
+    #[test]
+    fn slippage_is_capped_at_limit_up() {
+        let ex = AShareExecution::new("600000", None, 0.05);
+        let b = Broker::new(StockFee::a_share());
+        let p = ex
+            .prepare(
+                &buy(100000.0),
+                &today(),
+                Some(&xbar(10.9, 10.9, 10.9, Some(10.0))),
+                &b,
+            )
+            .unwrap();
+        assert!(close(p.price, 11.0), "price={}", p.price);
+    }
+
+    #[test]
+    fn buy_converts_lots_into_adjusted_units() {
+        // 复权因子 2:不复权 10 元 ↔ 复权 20 元
+        let ex = AShareExecution::new("600000", None, 0.0);
+        let b = Broker::new(StockFee::a_share());
+        let p = ex
+            .prepare(
+                &buy(10000.0),
+                &today(),
+                Some(&xbar(10.0, 10.0, 20.0, Some(10.0))),
+                &b,
+            )
+            .unwrap();
+        // 1000 股需 10005.1 > 预算 → 900 股;复权尺度 450 份 @20,市值同为 9000
+        assert!(close(p.price, 20.0));
+        assert!(close(shares_of(&p.order), 450.0));
+    }
+
+    #[test]
+    fn star_board_buys_in_single_shares_above_200() {
+        let ex = AShareExecution::new("688001", None, 0.0);
+        let b = Broker::new(StockFee::a_share());
+        let p = ex
+            .prepare(
+                &buy(3000.0),
+                &today(),
+                Some(&xbar(10.0, 10.0, 10.0, Some(10.0))),
+                &b,
+            )
+            .unwrap();
+        // 300 股 3000+5.03 超预算 → 299 股 2990+5.0299
+        assert!(close(shares_of(&p.order), 299.0));
+    }
+
+    #[test]
+    fn sell_respects_t_plus_one() {
+        let ex = AShareExecution::new("600000", None, 0.001);
+        let mut b = Broker::new(StockFee::a_share());
+        b.execute(&buy_shares_on(d(2024, 1, 3), 1000.0), 10.0);
+        let bar = xbar(10.0, 10.0, 10.0, Some(10.0));
+        assert_eq!(
+            ex.prepare(
+                &sell(OrderQty::AllShares, d(2024, 1, 3)),
+                &today(),
+                Some(&bar),
+                &b
+            )
+            .unwrap_err(),
+            RejectReason::NothingSellable
+        );
+        let p = ex
+            .prepare(
+                &sell(OrderQty::AllShares, d(2024, 1, 4)),
+                &today(),
+                Some(&bar),
+                &b,
+            )
+            .unwrap();
+        assert!(close(shares_of(&p.order), 1000.0));
+        assert!(close(p.price, 9.99));
+    }
+
+    fn buy_shares_on(date: NaiveDate, shares: f64) -> OrderEvent {
+        OrderEvent {
+            date,
+            direction: Direction::Buy,
+            qty: OrderQty::Shares(shares),
+        }
+    }
+
+    #[test]
+    fn sell_rejected_at_limit_down() {
+        let ex = AShareExecution::new("600000", None, 0.001);
+        let b = holding(1000.0);
+        let r = ex.prepare(
+            &sell(OrderQty::AllShares, d(2024, 1, 3)),
+            &today(),
+            Some(&xbar(9.0, 9.0, 9.0, Some(10.0))),
+            &b,
+        );
+        assert_eq!(r.unwrap_err(), RejectReason::LimitDown);
+    }
+
+    #[test]
+    fn partial_sell_floors_to_step_but_full_exit_allows_odd_lot() {
+        let ex = AShareExecution::new("600000", None, 0.0);
+        let bar = xbar(10.0, 10.0, 10.0, Some(10.0));
+        let b = holding(1050.0);
+        let p = ex
+            .prepare(
+                &sell(OrderQty::Shares(250.0), d(2024, 1, 3)),
+                &today(),
+                Some(&bar),
+                &b,
+            )
+            .unwrap();
+        assert!(close(shares_of(&p.order), 200.0));
+        assert_eq!(
+            ex.prepare(
+                &sell(OrderQty::Shares(50.0), d(2024, 1, 3)),
+                &today(),
+                Some(&bar),
+                &b
+            )
+            .unwrap_err(),
+            RejectReason::BelowOneLot
+        );
+        let all = ex
+            .prepare(
+                &sell(OrderQty::AllShares, d(2024, 1, 3)),
+                &today(),
+                Some(&bar),
+                &b,
+            )
+            .unwrap();
+        assert!(close(shares_of(&all.order), 1050.0), "清仓允许零股");
+    }
+
+    #[test]
+    fn missing_prev_close_or_bar_is_rejected() {
+        let ex = AShareExecution::new("600000", None, 0.001);
+        let b = Broker::new(StockFee::a_share());
+        assert_eq!(
+            ex.prepare(
+                &buy(10000.0),
+                &today(),
+                Some(&xbar(10.0, 10.0, 10.0, None)),
+                &b
+            )
+            .unwrap_err(),
+            RejectReason::NoPrevClose
+        );
+        assert_eq!(
+            ex.prepare(&buy(10000.0), &today(), None, &b).unwrap_err(),
+            RejectReason::NoPrice
+        );
+    }
+
+    #[test]
+    fn execution_for_market_picks_model() {
+        assert_eq!(execution_for_market(1, "600000").name(), "a_share");
+        assert_eq!(execution_for_market(0, "000001").name(), "a_share");
+        assert_eq!(execution_for_market(116, "00700").name(), "close");
+        assert_eq!(execution_for_market(105, "AAPL").name(), "close");
+    }
+
+    /// 端到端:经引擎运行,记录拒单原因并按开盘价成交。
+    #[test]
+    fn engine_records_rejections_and_fills_at_open() {
+        use crate::engine::Engine;
+        use crate::portfolio::Portfolio;
+        use crate::stock::data::{StockBar, StockData};
+        use crate::strategy::dca::Dca;
+        use crate::strategy::Period;
+        let sb = |date: NaiveDate, open: f64, close: f64| StockBar {
+            date,
+            open,
+            high: open.max(close),
+            low: open.min(close),
+            close,
+            volume: 1.0,
+            adj_close: close,
+        };
+        let bars = vec![
+            sb(d(2024, 1, 1), 10.0, 10.0), // 定投日,首根无前收 → 拒
+            sb(d(2024, 2, 1), 11.0, 11.0), // 定投日,开盘涨停 → 拒
+            sb(d(2024, 3, 1), 11.0, 11.0), // 定投日,正常成交
+        ];
+        let mut e = Engine::new(
+            StockData::new(bars),
+            Dca::new(Period::Monthly, 1, 10000.0),
+            Broker::new(StockFee::a_share()),
+            Portfolio::new(0.0),
+        )
+        .with_execution(Box::new(AShareExecution::new("600000", None, 0.001)));
+        e.run();
+        let reasons: Vec<_> = e.rejected().iter().map(|r| r.reason).collect();
+        assert_eq!(
+            reasons,
+            vec![RejectReason::NoPrevClose, RejectReason::LimitUp]
+        );
+        assert_eq!(e.trades().len(), 1);
+        let t = &e.trades()[0];
+        assert_eq!(t.date, d(2024, 3, 1));
+        assert!(close(t.shares, 900.0), "shares={}", t.shares);
+        assert!(close(t.price, 11.011), "price={}", t.price);
     }
 
     #[test]
