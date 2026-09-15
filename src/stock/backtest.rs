@@ -1,5 +1,6 @@
 use crate::broker::Broker;
 use crate::engine::Engine;
+use crate::execution::{ExecutionModel, RejectedOrder};
 use crate::metrics::{self, Summary};
 use crate::portfolio::Portfolio;
 use crate::result::{DailyRecord, TradeRecord};
@@ -16,9 +17,13 @@ pub struct StockRunOutcome {
     pub trade_stats: TradeStats,
     pub daily: Vec<DailyRecord>,
     pub trades: Vec<TradeRecord>,
+    /// 成交口径:"a_share" | "close"
+    pub execution: String,
+    /// 因成交规则未能成交的订单
+    pub rejected: Vec<RejectedOrder>,
 }
 
-/// 装配引擎跑单股回测：StockData + 复用策略 + StockFee + Portfolio。
+/// 装配引擎跑单股回测:StockData + 复用策略 + StockFee + Portfolio + 成交模型。
 pub fn run_one(
     name: String,
     code: String,
@@ -26,29 +31,31 @@ pub fn run_one(
     strategy: Box<dyn Strategy>,
     fee: StockFee,
     initial_cash: f64,
+    exec: Box<dyn ExecutionModel>,
 ) -> StockRunOutcome {
     let data = StockData::new(bars);
     let broker = Broker::new(fee);
     let portfolio = Portfolio::new(initial_cash);
-    let mut engine = Engine::new(data, strategy, broker, portfolio);
+    let mut engine = Engine::new(data, strategy, broker, portfolio).with_execution(exec);
     engine.run();
     let summary = metrics::summarize(engine.portfolio(), engine.trades().len());
     let stats = trade_stats::trade_stats(engine.trades());
-    let daily = engine.daily().to_vec();
-    let trades = engine.trades().to_vec();
     StockRunOutcome {
         name,
         code,
         summary,
         trade_stats: stats,
-        daily,
-        trades,
+        daily: engine.daily().to_vec(),
+        trades: engine.trades().to_vec(),
+        execution: engine.execution_name().to_string(),
+        rejected: engine.rejected().to_vec(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::CloseExecution;
     use crate::strategy::dca::Dca;
     use crate::strategy::Period;
     use chrono::NaiveDate;
@@ -84,6 +91,7 @@ mod tests {
             strategy,
             StockFee::us(),
             0.0,
+            Box::new(CloseExecution),
         );
         assert_eq!(out.daily.len(), 3);
         assert!(
@@ -110,6 +118,7 @@ mod tests {
             Box::new(Dca::new(Period::Monthly, 1, 1000.0)),
             StockFee::us(),
             0.0,
+            Box::new(CloseExecution),
         );
         let j = serde_json::to_string(&out).unwrap();
         for k in [
@@ -118,6 +127,8 @@ mod tests {
             "\"daily\"",
             "\"trades\"",
             "\"round_trips\"",
+            "\"execution\"",
+            "\"rejected\"",
         ] {
             assert!(j.contains(k), "JSON 应含 {k}");
         }
@@ -138,6 +149,7 @@ mod tests {
             Box::new(Dca::new(Period::Monthly, 1, 1000.0)),
             StockFee::us(),
             0.0,
+            Box::new(CloseExecution),
         );
         let paid = run_one(
             "p".into(),
@@ -146,10 +158,36 @@ mod tests {
             Box::new(Dca::new(Period::Monthly, 1, 1000.0)),
             StockFee::a_share(),
             0.0,
+            Box::new(CloseExecution),
         );
         assert!(
             paid.summary.final_equity < free.summary.final_equity,
             "A股费应降低期末权益"
         );
+    }
+
+    #[test]
+    fn a_share_execution_is_applied_and_reported() {
+        use crate::stock::ashare::AShareExecution;
+        // bar() 的 open == close
+        let bars = vec![
+            bar(d(2024, 1, 1), 10.0),
+            bar(d(2024, 2, 1), 11.0), // 相对前收 10 开盘涨停
+            bar(d(2024, 3, 1), 11.0),
+        ];
+        let out = run_one(
+            "t".into(),
+            "600519".into(),
+            bars,
+            Box::new(Dca::new(Period::Monthly, 1, 10000.0)),
+            StockFee::a_share(),
+            0.0,
+            Box::new(AShareExecution::new("600519", None, 0.001)),
+        );
+        assert_eq!(out.execution, "a_share");
+        assert_eq!(out.rejected.len(), 2);
+        assert_eq!(out.trades.len(), 1);
+        let j = serde_json::to_string(&out).unwrap();
+        assert!(j.contains("\"limit_up\""), "拒单原因应序列化: {j}");
     }
 }

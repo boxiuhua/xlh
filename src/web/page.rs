@@ -1213,11 +1213,22 @@ function renderStockRun(o){
   var box = document.getElementById('sb-result');
   if(!o || !o.summary){ box.innerHTML = '<span style="color:#c0392b">回测失败</span>'; return; }
   var s = o.summary, ts = o.trade_stats || {};
+  var rj = o.rejected || [];
+  var rjNames = {limit_up:'涨停买不进', limit_down:'跌停卖不出', no_prev_close:'首日无前收', below_one_lot:'资金不足一手', nothing_sellable:'T+1 不可卖', no_price:'无报价', unsupported_qty:'数量类型不支持'};
+  var rjCnt = {};
+  rj.forEach(function(r){ rjCnt[r.reason] = (rjCnt[r.reason]||0) + 1; });
+  var rjHtml = rj.length
+    ? '<div style="margin-top:6px;color:#b8860b">未成交订单 '+rj.length+' 笔：'+Object.keys(rjCnt).map(function(k){ return (rjNames[k]||k)+' '+rjCnt[k]; }).join(' · ')+'</div>'
+    : '';
+  var execHtml = o.execution === 'a_share'
+    ? '<div style="margin-top:6px;color:#7f8c8d;font-size:.9em">成交口径：A 股 · 当日开盘价 +0.1% 滑点 · 整手 · 开盘涨跌停不成交 · T+1</div>'
+    : '';
   box.innerHTML = '<div class="card" style="margin-top:0">'
     + '<div style="font-size:1.1rem;font-weight:600">'+esc(o.code)+' · '+esc(o.name)+'</div>'
     + '<div style="margin-top:8px;color:#34495e">总收益 '+pct(s.total_return)+' · 年化 '+pct(s.annualized)+' · 夏普 '+s.sharpe.toFixed(2)+' · 最大回撤 '+pct(s.max_drawdown)+'</div>'
     + '<div style="margin-top:6px;color:#34495e">投入 '+s.total_contributed.toFixed(0)+' · 期末 '+s.final_equity.toFixed(0)+' · 成交 '+s.trade_count+' 笔</div>'
     + '<div style="margin-top:6px;color:#5a6a7a">交易统计：卖出 '+(ts.round_trips||0)+' 次 · 胜率 '+pct(ts.win_rate||0)+' · 盈亏比 '+pf(ts.profit_factor)+' · 实现盈亏 '+(ts.realized_pnl||0).toFixed(0)+'</div>'
+    + rjHtml + execHtml
     + '</div>';
 }
 function sCard(r, rank){

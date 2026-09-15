@@ -164,6 +164,8 @@ fn candidate(kind: &str) -> Box<dyn Strategy> {
 
 fn run_metrics(kind: &str, bars: &[StockBar], fee: StockFee) -> Summary {
     let strat = candidate(kind);
+    // 候选策略固定每次 1000 元,A 股整手规则下高价股一手都买不起,
+    // 暂保持收盘成交口径;迁移到 A 股口径见量化交易设计 §10(策略准入)。
     backtest::run_one(
         kind.to_string(),
         String::new(),
@@ -171,6 +173,7 @@ fn run_metrics(kind: &str, bars: &[StockBar], fee: StockFee) -> Summary {
         strat,
         fee,
         0.0,
+        Box::new(crate::execution::CloseExecution),
     )
     .summary
 }

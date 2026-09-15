@@ -192,6 +192,7 @@ fn run_blocking(q: StockRunQuery) -> Result<StockRunOutcome> {
         overbought: q.overbought,
     };
     let strategy = build_strategy_from_fields(&sf)?;
+    let exec = crate::stock::ashare::execution_for_market(secid.market, &q.code);
     Ok(backtest::run_one(
         q.strategy.clone(),
         q.code.clone(),
@@ -199,6 +200,7 @@ fn run_blocking(q: StockRunQuery) -> Result<StockRunOutcome> {
         strategy,
         fee,
         q.initial_cash,
+        exec,
     ))
 }
 
