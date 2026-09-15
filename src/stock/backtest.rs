@@ -4,7 +4,7 @@ use crate::execution::{ExecutionModel, RejectedOrder};
 use crate::metrics::{self, Summary};
 use crate::portfolio::Portfolio;
 use crate::result::{DailyRecord, TradeRecord};
-use crate::stock::data::{StockBar, StockData};
+use crate::stock::data::StockData;
 use crate::stock::fee::StockFee;
 use crate::stock::trade_stats::{self, TradeStats};
 use crate::strategy::Strategy;
@@ -27,13 +27,12 @@ pub struct StockRunOutcome {
 pub fn run_one(
     name: String,
     code: String,
-    bars: Vec<StockBar>,
+    data: StockData,
     strategy: Box<dyn Strategy>,
     fee: StockFee,
     initial_cash: f64,
     exec: Box<dyn ExecutionModel>,
 ) -> StockRunOutcome {
-    let data = StockData::new(bars);
     let broker = Broker::new(fee);
     let portfolio = Portfolio::new(initial_cash);
     let mut engine = Engine::new(data, strategy, broker, portfolio).with_execution(exec);
@@ -56,6 +55,7 @@ pub fn run_one(
 mod tests {
     use super::*;
     use crate::execution::CloseExecution;
+    use crate::stock::data::StockBar;
     use crate::strategy::dca::Dca;
     use crate::strategy::Period;
     use chrono::NaiveDate;
@@ -87,7 +87,7 @@ mod tests {
         let out = run_one(
             "t".into(),
             "600519".into(),
-            bars,
+            StockData::new(bars),
             strategy,
             StockFee::us(),
             0.0,
@@ -114,7 +114,7 @@ mod tests {
         let out = run_one(
             "t".into(),
             "600519".into(),
-            bars,
+            StockData::new(bars),
             Box::new(Dca::new(Period::Monthly, 1, 1000.0)),
             StockFee::us(),
             0.0,
@@ -145,7 +145,7 @@ mod tests {
         let free = run_one(
             "f".into(),
             "600519".into(),
-            bars.clone(),
+            StockData::new(bars.clone()),
             Box::new(Dca::new(Period::Monthly, 1, 1000.0)),
             StockFee::us(),
             0.0,
@@ -154,7 +154,7 @@ mod tests {
         let paid = run_one(
             "p".into(),
             "600519".into(),
-            bars,
+            StockData::new(bars),
             Box::new(Dca::new(Period::Monthly, 1, 1000.0)),
             StockFee::a_share(),
             0.0,
@@ -178,7 +178,7 @@ mod tests {
         let out = run_one(
             "t".into(),
             "600519".into(),
-            bars,
+            StockData::new(bars),
             Box::new(Dca::new(Period::Monthly, 1, 10000.0)),
             StockFee::a_share(),
             0.0,
@@ -189,5 +189,33 @@ mod tests {
         assert_eq!(out.trades.len(), 1);
         let j = serde_json::to_string(&out).unwrap();
         assert!(j.contains("\"limit_up\""), "拒单原因应序列化: {j}");
+    }
+
+    /// F1: 提供区间前一交易日 bar 后，首根 bar(定投日)应正常成交，而非因 NoPrevClose 被拒。
+    #[test]
+    fn first_bar_fills_when_prev_bar_supplied() {
+        use crate::stock::ashare::AShareExecution;
+        let prev = bar(d(2023, 12, 29), 10.0);
+        let bars = vec![
+            bar(d(2024, 1, 1), 10.0),
+            bar(d(2024, 2, 1), 10.0),
+            bar(d(2024, 3, 1), 10.0),
+        ];
+        let out = run_one(
+            "t".into(),
+            "600519".into(),
+            StockData::with_prev_bar(bars, Some(prev)),
+            Box::new(Dca::new(Period::Monthly, 1, 10000.0)),
+            StockFee::a_share(),
+            0.0,
+            Box::new(AShareExecution::new("600519", None, 0.001)),
+        );
+        assert_eq!(
+            out.rejected.len(),
+            0,
+            "提供前收后首根 bar 不应被拒: {:?}",
+            out.rejected
+        );
+        assert_eq!(out.trades.len(), 3);
     }
 }

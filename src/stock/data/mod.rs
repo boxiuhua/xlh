@@ -36,11 +36,19 @@ pub struct StockData {
     bars: Vec<MarketEvent>,
     /// 原始 bar,仅供成交模型(开盘价、前收)使用,不进入策略上下文。
     raw: Vec<StockBar>,
+    /// 区间起始前一交易日的 bar,仅用于给 bar 0 提供 prev_close/prev_adj_close;
+    /// 不进入 `bars`/`raw` 的可迭代序列,不影响 `next_bar()`/`history()`。
+    prev: Option<StockBar>,
     cursor: usize,
 }
 
 impl StockData {
     pub fn new(raw: Vec<StockBar>) -> Self {
+        Self::with_prev_bar(raw, None)
+    }
+
+    /// `prev` 是 `bars[0]` 前一交易日的 bar,仅用于其 `exec_bar().prev_close`/`prev_adj_close`。
+    pub fn with_prev_bar(raw: Vec<StockBar>, prev: Option<StockBar>) -> Self {
         let bars = raw
             .iter()
             .map(|b| MarketEvent {
@@ -52,6 +60,7 @@ impl StockData {
         Self {
             bars,
             raw,
+            prev,
             cursor: 0,
         }
     }
@@ -79,11 +88,16 @@ impl DataHandler for StockData {
     fn exec_bar(&self) -> Option<ExecBar> {
         let i = self.cursor.checked_sub(1)?;
         let b = self.raw.get(i)?;
+        let (prev_close, prev_adj_close) = match i.checked_sub(1) {
+            Some(j) => (Some(self.raw[j].close), Some(self.raw[j].adj_close)),
+            None => (self.prev.map(|p| p.close), self.prev.map(|p| p.adj_close)),
+        };
         Some(ExecBar {
             open: b.open,
             close: b.close,
             adj_close: b.adj_close,
-            prev_close: i.checked_sub(1).map(|j| self.raw[j].close),
+            prev_close,
+            prev_adj_close,
         })
     }
 }
@@ -142,6 +156,33 @@ mod tests {
         h.next_bar();
         assert_eq!(h.history(10).len(), 2);
         assert_eq!(h.history(1).len(), 1, "lookback 截断");
+    }
+
+    #[test]
+    fn with_prev_bar_only_feeds_exec_bar_not_iteration() {
+        let prev = bar(d(2023, 12, 29), 9.0, 18.0);
+        let b1 = bar(d(2024, 1, 2), 10.0, 20.0);
+        let b2 = bar(d(2024, 1, 3), 11.0, 22.0);
+        let mut h = StockData::with_prev_bar(vec![b1, b2], Some(prev));
+
+        h.next_bar();
+        let e1 = h.exec_bar().unwrap();
+        assert_eq!(e1.prev_close, Some(9.0), "bar 0 应用 prev 的不复权 close");
+        assert_eq!(
+            e1.prev_adj_close,
+            Some(18.0),
+            "bar 0 应用 prev 的复权 close"
+        );
+        assert!(
+            h.history(10).is_empty(),
+            "首根 bar 无「昨天」，prev 不计入 history（与不传 prev 时行为一致）"
+        );
+
+        h.next_bar();
+        assert!(h.next_bar().is_none(), "prev 不增加可迭代 bar 数，共 2 根");
+        let h2 = h.history(10);
+        assert_eq!(h2.len(), 1, "history 截止 T-1，只含 bars[0]，不含 prev");
+        assert_eq!(h2[0].date, d(2024, 1, 2), "prev 的日期不应出现在 history");
     }
 
     #[test]

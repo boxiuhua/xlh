@@ -169,7 +169,7 @@ fn run_metrics(kind: &str, bars: &[StockBar], fee: StockFee) -> Summary {
     backtest::run_one(
         kind.to_string(),
         String::new(),
-        bars.to_vec(),
+        crate::stock::data::StockData::new(bars.to_vec()),
         strat,
         fee,
         0.0,

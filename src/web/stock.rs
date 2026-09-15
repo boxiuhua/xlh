@@ -175,8 +175,26 @@ fn run_blocking(q: StockRunQuery) -> Result<StockRunOutcome> {
     }
     let secid = data::resolve_secid(&q.code).map_err(|e| anyhow!("代码解析失败: {e}"))?;
     let fee = StockFee::for_market(secid.market);
-    let bars = cache::load_or_fetch(&q.code, stock_cache(), q.start, q.end)
-        .map_err(|e| anyhow!("加载行情失败: {e}"))?;
+    // 多取区间前 30 天，拆出「区间前最后一根」作为 prev bar，专供成交模型算首根 bar 的涨跌停基准，
+    // 不进入策略可见的 bars（见 StockData::with_prev_bar）。
+    let widened = cache::load_or_fetch(
+        &q.code,
+        stock_cache(),
+        q.start - chrono::Duration::days(30),
+        q.end,
+    )
+    .map_err(|e| anyhow!("加载行情失败: {e}"))?;
+    let prev = widened.iter().rev().find(|b| b.date < q.start).copied();
+    let bars: Vec<data::StockBar> = widened.into_iter().filter(|b| b.date >= q.start).collect();
+    if bars.is_empty() {
+        return Err(anyhow!(
+            "股票 {code} 在 {start}~{end} 无数据",
+            code = q.code,
+            start = q.start,
+            end = q.end
+        ));
+    }
+    let data = crate::stock::data::StockData::with_prev_bar(bars, prev);
     let sf = StrategyFields {
         strategy: q.strategy.clone(),
         period: q.period.clone(),
@@ -196,7 +214,7 @@ fn run_blocking(q: StockRunQuery) -> Result<StockRunOutcome> {
     Ok(backtest::run_one(
         q.strategy.clone(),
         q.code.clone(),
-        bars,
+        data,
         strategy,
         fee,
         q.initial_cash,

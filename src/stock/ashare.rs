@@ -13,8 +13,10 @@ fn is_chinext(code: &str) -> bool {
     code.starts_with("300") || code.starts_with("301")
 }
 
+/// 北交所判定不依赖调用方的检查顺序:即使脱离 `limit_ratio`/`buy_lot` 单独调用,
+/// 也不得因 `starts_with('8')` 误判科创板代码(自成一体地排除 is_star)。
 fn is_bse(code: &str) -> bool {
-    code.starts_with('8') || code.starts_with("43") || code.starts_with("92")
+    !is_star(code) && (code.starts_with('8') || code.starts_with("43") || code.starts_with("92"))
 }
 
 fn is_etf(code: &str) -> bool {
@@ -51,6 +53,22 @@ pub fn price_decimals(code: &str) -> i32 {
 fn round_to(x: f64, decimals: i32) -> f64 {
     let m = 10f64.powi(decimals);
     (x * m).round() / m
+}
+
+/// 除权除息参考价:数据按后复权存储(`adj_close = close * f_t`),
+/// 若今日发生除权除息(送股/转增/分红),不复权前收不能直接作为涨跌停基准，
+/// 须换算成「今日除权后」的参考价 = `prev_adj_close * close / adj_close`。
+/// 无复权前收(数据首根且未提供 prev bar)时回退到不复权前收。
+fn prev_ref_price(bar: &ExecBar) -> Result<f64, RejectReason> {
+    let prev_ref = if let Some(pa) = bar.prev_adj_close.filter(|pa| *pa > 0.0) {
+        pa * bar.close / bar.adj_close
+    } else {
+        bar.prev_close.ok_or(RejectReason::NoPrevClose)?
+    };
+    if !prev_ref.is_finite() || prev_ref <= 0.0 {
+        return Err(RejectReason::NoPrevClose);
+    }
+    Ok(prev_ref)
 }
 
 /// (涨停价, 跌停价),按最小价位四舍五入。
@@ -139,8 +157,8 @@ impl ExecutionModel for AShareExecution {
         if bar.open <= 0.0 || bar.close <= 0.0 || bar.adj_close <= 0.0 {
             return Err(RejectReason::NoPrice);
         }
-        let prev = bar.prev_close.ok_or(RejectReason::NoPrevClose)?;
-        let (up, down) = limit_prices(prev, self.ratio, self.decimals);
+        let prev_ref = prev_ref_price(bar)?;
+        let (up, down) = limit_prices(prev_ref, self.ratio, self.decimals);
         let eps = 0.5 * 10f64.powi(-self.decimals);
         // 复权因子:复权尺度 = 不复权 × factor
         let factor = bar.adj_close / bar.close;
@@ -254,6 +272,7 @@ mod tests {
             close,
             adj_close,
             prev_close: prev,
+            prev_adj_close: None,
         }
     }
     fn buy(cash: f64) -> OrderEvent {
@@ -484,6 +503,47 @@ mod tests {
         assert!(close(shares_of(&all.order), 1050.0), "清仓允许零股");
     }
 
+    /// F3: 复权因子 ≠ 1 时的部分卖出。持仓 500 复权份额(=1000 不复权股,前日以复权价 20 买入)。
+    /// 卖出 Shares(125.0)(=250 不复权股)→ 按 100 股步长向下取整为 200 不复权股 = 复权 100 份，
+    /// 价格 = 10 * (1-slippage) * factor = 20.0(slippage=0)。
+    #[test]
+    fn partial_sell_with_adjustment_factor_not_one() {
+        let ex = AShareExecution::new("600000", None, 0.0);
+        let bar = xbar(10.0, 10.0, 20.0, Some(10.0)); // 今日 close=10, adj_close=20 → factor=2
+        let mut b = Broker::new(StockFee::a_share());
+        b.execute(
+            &OrderEvent {
+                date: d(2024, 1, 2),
+                direction: Direction::Buy,
+                qty: OrderQty::Shares(500.0), // 复权份额 500 = 不复权 1000 股
+            },
+            20.0, // 复权价
+        );
+        let p = ex
+            .prepare(
+                &sell(OrderQty::Shares(125.0), d(2024, 1, 3)), // 复权 125 份 = 不复权 250 股
+                &today(),
+                Some(&bar),
+                &b,
+            )
+            .unwrap();
+        // 250 股按 100 步长向下取整 → 200 股(不复权) = 100 份(复权)
+        assert!(close(shares_of(&p.order), 100.0), "order={:?}", p.order);
+        assert!(close(p.price, 20.0), "price={}", p.price);
+
+        // 复权 20 份 = 不复权 40 股，不足一手(100 股步长)
+        assert_eq!(
+            ex.prepare(
+                &sell(OrderQty::Shares(20.0), d(2024, 1, 3)),
+                &today(),
+                Some(&bar),
+                &b
+            )
+            .unwrap_err(),
+            RejectReason::BelowOneLot
+        );
+    }
+
     #[test]
     fn missing_prev_close_or_bar_is_rejected() {
         let ex = AShareExecution::new("600000", None, 0.001);
@@ -501,6 +561,65 @@ mod tests {
         assert_eq!(
             ex.prepare(&buy(10000.0), &today(), None, &b).unwrap_err(),
             RejectReason::NoPrice
+        );
+    }
+
+    /// F2: 除权除息日(10 送 10)——涨跌停基准须用除权参考价，而非未复权前收。
+    /// 前收(不复权) 20，复权前收 20；今日不复权 open/close 10，复权 close 20(除权因子翻倍)。
+    /// 除权参考价 = 20 * 10 / 20 = 10 → 卖出 open=10 不该跌停；买入 open=11.0 应涨停(10*1.10=11.00)。
+    #[test]
+    fn bonus_share_ex_rights_uses_adjusted_reference_price() {
+        let ex = AShareExecution::new("600000", None, 0.0);
+        let bar_today = ExecBar {
+            open: 10.0,
+            close: 10.0,
+            adj_close: 20.0,
+            prev_close: Some(20.0),
+            prev_adj_close: Some(20.0),
+        };
+        // 卖出：参考价 10，跌停价 9.00，open=10 未跌停，应成交
+        let b = holding(1000.0);
+        let sell_p = ex
+            .prepare(
+                &sell(OrderQty::AllShares, d(2024, 1, 3)),
+                &today(),
+                Some(&bar_today),
+                &b,
+            )
+            .expect("除权日参考价应为 10，卖出不应判跌停");
+        assert!(close(sell_p.price, 20.0), "price={}", sell_p.price);
+
+        // 买入：涨停价 11.00，open=11.0 触及涨停应拒绝
+        let buy_bar = ExecBar {
+            open: 11.0,
+            close: 11.0,
+            adj_close: 22.0,
+            prev_close: Some(20.0),
+            prev_adj_close: Some(20.0),
+        };
+        let empty = Broker::new(StockFee::a_share());
+        assert_eq!(
+            ex.prepare(&buy(10000.0), &today(), Some(&buy_bar), &empty)
+                .unwrap_err(),
+            RejectReason::LimitUp
+        );
+    }
+
+    #[test]
+    fn zero_prev_close_without_prev_adj_close_is_no_prev_close() {
+        let ex = AShareExecution::new("600000", None, 0.001);
+        let b = Broker::new(StockFee::a_share());
+        let bar_today = ExecBar {
+            open: 10.0,
+            close: 10.0,
+            adj_close: 10.0,
+            prev_close: Some(0.0),
+            prev_adj_close: None,
+        };
+        assert_eq!(
+            ex.prepare(&buy(10000.0), &today(), Some(&bar_today), &b)
+                .unwrap_err(),
+            RejectReason::NoPrevClose
         );
     }
 
@@ -567,6 +686,18 @@ mod tests {
         assert!(close(limit_ratio("688981", None), 0.20));
         assert!(close(limit_ratio("830799", None), 0.30));
         assert!(close(limit_ratio("430047", None), 0.30));
+        assert!(
+            close(limit_ratio("689009", None), 0.20),
+            "689 开头属科创板,不应被 is_bse 的 '8' 前缀误判为北交所"
+        );
+    }
+
+    #[test]
+    fn is_bse_excludes_star_board_codes() {
+        assert!(!is_bse("688001"), "688 开头是科创板,不是北交所");
+        assert!(!is_bse("689009"), "689 开头是科创板,不是北交所");
+        assert!(is_bse("830799"));
+        assert!(is_bse("430047"));
     }
 
     #[test]
@@ -601,6 +732,7 @@ mod tests {
             }
         );
         assert_eq!(buy_lot("688001"), BuyLot { min: 200, step: 1 });
+        assert_eq!(buy_lot("689009"), BuyLot { min: 200, step: 1 });
         assert_eq!(buy_lot("830799"), BuyLot { min: 100, step: 1 });
     }
 

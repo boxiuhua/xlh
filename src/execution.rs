@@ -19,6 +19,8 @@ pub struct ExecBar {
     pub adj_close: f64,
     /// 前一交易日不复权收盘价;数据首根 bar 为 None
     pub prev_close: Option<f64>,
+    /// 前一交易日复权收盘价;数据首根 bar 且未提供 prev bar 时为 None
+    pub prev_adj_close: Option<f64>,
 }
 
 /// 可交给 `Broker::execute` 的订单与成交价(复权尺度)。
