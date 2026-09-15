@@ -1,3 +1,4 @@
+pub mod ashare;
 pub mod attribution;
 pub mod backtest;
 pub mod data;
