@@ -1452,3 +1452,24 @@ git commit -m "feat(stock): 单股回测采用 A 股成交口径并展示未成�
 - 计划 2:交易核心(`src/trade/`:模型与存储、工单状态机、闸门、Broker、trade-monitor、四类信号源)—— 复用本计划 `stock::ashare` 规则函数与 `AShareExecution`(PaperBroker)
 - 计划 3:策略准入(walk-forward、准入状态机、watchdog、成绩单;股票推荐迁移到 A 股口径)
 - 计划 4:Web `/trade` 页面、签名链接、推送与日报
+
+## 执行后遗留项(来自最终审查,须被后续计划吸收)
+
+**计划 2 开头必须先做(PaperBroker 之前):**
+- 卖出最低佣金按 FIFO 每个 lot 各收一次(`src/broker.rs` 卖出循环调用 `sell_fee`),应改为每笔订单只收一次最低佣金;基金 `FeeModel` 无最低佣金,结果须保持不变
+- `ExecutionModel::prepare` 依赖具体 `Broker` 且价格基准固定为开盘价:抽出 `AccountView { buy_fee, sellable_shares }` trait、支持价格基准(开盘 / 快照价)、`ExecutionModel: Send`
+
+**计划 2 闸门/模拟盘涉及:**
+- 滑点后价格未按最小价位取整(如 11.011)
+- 科创板部分卖出可能剩余或卖出不足 200 股
+- `is_etf` 缺 `50` 前缀;T+0 ETF(债券/黄金/跨境)被当作 T+1
+- `execution_for_market` 的 `_` 分支把未知市场当 A 股,宜显式 `0 | 1`
+- 主板 ST 5% 涨跌幅规则需核实是否已调整为 10%
+- 未覆盖测试:`UnsupportedQty`、卖出滑点被跌停价封顶、`Broker` 买入 `Shares` 的非正数保护分支
+- `stock/data/kline.rs` hfq 缺失日期回退不复权价,导致复权因子在序列内跳变(腾讯源已取交集,东财源未做)
+
+**计划 3:** 股票推荐迁移到 A 股口径;如需记录结构比较,为 `DailyRecord`/`TradeRecord` 派生 `PartialEq`
+
+**计划 4:** `RejectedOrder` 增加数量/金额,页面展示未投入资金
+
+**已知小瑕疵(不阻塞):** `web/stock.rs::run_blocking` 在扩展区间整体无数据时,错误信息中的起始日期为扩展后的日期
