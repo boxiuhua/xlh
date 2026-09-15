@@ -104,8 +104,33 @@ CREATE TABLE IF NOT EXISTS trade_heartbeat (
 );
 "#;
 
+/// 表已存在但缺列时补建:`CREATE TABLE IF NOT EXISTS` 对已存在的旧表是空操作,
+/// 新增列(如 `trade_signals.scope`)不会自动出现,后续显式列清单的 INSERT 会报错。
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let has_column = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|n| n == column);
+    if !has_column {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA).context("建交易表失败")?;
+    ensure_column(
+        conn,
+        "trade_signals",
+        "scope",
+        "TEXT NOT NULL DEFAULT 'both'",
+    )
+    .context("补建 trade_signals.scope 失败")?;
     Ok(())
 }
 
@@ -598,6 +623,51 @@ mod tests {
         assert!(get_position(&c, 1, Account::Real, "600000")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn migrate_adds_scope_to_legacy_trade_signals() {
+        let c = Connection::open_in_memory().unwrap();
+        // 旧版 trade_signals(无 scope 列),模拟历史库升级前的状态。
+        c.execute_batch(
+            "CREATE TABLE trade_signals (
+              id            INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id       INTEGER NOT NULL,
+              source        TEXT NOT NULL,
+              strategy_id   INTEGER,
+              code          TEXT NOT NULL,
+              name          TEXT,
+              side          TEXT NOT NULL,
+              ref_price     REAL NOT NULL,
+              reason        TEXT NOT NULL,
+              ai_note       TEXT,
+              dedup_key     TEXT NOT NULL,
+              suggest_cash  REAL,
+              suggest_qty   INTEGER,
+              status        TEXT NOT NULL DEFAULT 'new',
+              reject_reason TEXT,
+              created_at    TEXT NOT NULL,
+              UNIQUE (user_id, dedup_key)
+            );",
+        )
+        .unwrap();
+
+        migrate(&c).unwrap();
+
+        let cols: Vec<String> = {
+            let mut stmt = c.prepare("PRAGMA table_info(trade_signals)").unwrap();
+            stmt.query_map([], |r| r.get(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(
+            cols.iter().any(|n| n == "scope"),
+            "迁移后应补上 scope 列: {:?}",
+            cols
+        );
+
+        migrate(&c).unwrap();
     }
 
     #[test]
