@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod event;
+pub mod execution;
 // 后续任务逐个取消注释：
 pub mod analyze;
 pub mod broker;

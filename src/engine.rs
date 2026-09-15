@@ -1,6 +1,7 @@
 use crate::broker::Broker;
 use crate::data::DataHandler;
 use crate::event::Event;
+use crate::execution::{CloseExecution, ExecutionModel, RejectedOrder};
 use crate::portfolio::Portfolio;
 use crate::result::{DailyRecord, TradeRecord};
 use crate::strategy::{Strategy, StrategyContext};
@@ -14,6 +15,8 @@ pub struct Engine<D: DataHandler, S: Strategy> {
     lookback: usize,
     daily: Vec<DailyRecord>,
     trades: Vec<TradeRecord>,
+    exec: Box<dyn ExecutionModel>,
+    rejected: Vec<RejectedOrder>,
 }
 
 impl<D: DataHandler, S: Strategy> Engine<D, S> {
@@ -26,7 +29,15 @@ impl<D: DataHandler, S: Strategy> Engine<D, S> {
             lookback: usize::MAX,
             daily: Vec::new(),
             trades: Vec::new(),
+            exec: Box::new(CloseExecution),
+            rejected: Vec::new(),
         }
+    }
+
+    /// 替换成交模型;默认 `CloseExecution`(历史行为)。
+    pub fn with_execution(mut self, exec: Box<dyn ExecutionModel>) -> Self {
+        self.exec = exec;
+        self
     }
 
     pub fn run(&mut self) -> &Portfolio {
@@ -64,8 +75,18 @@ impl<D: DataHandler, S: Strategy> Engine<D, S> {
                         }
                     }
                     Event::Order(o) => {
-                        let fill = self.broker.execute(&o, today.adj_nav);
-                        queue.push_back(Event::Fill(fill));
+                        let bar = self.data.exec_bar();
+                        match self.exec.prepare(&o, &today, bar.as_ref(), &self.broker) {
+                            Ok(p) => {
+                                let fill = self.broker.execute(&p.order, p.price);
+                                queue.push_back(Event::Fill(fill));
+                            }
+                            Err(reason) => self.rejected.push(RejectedOrder {
+                                date: o.date,
+                                direction: o.direction,
+                                reason,
+                            }),
+                        }
                     }
                     Event::Fill(f) => {
                         if f.shares > 1e-9 {
@@ -108,6 +129,15 @@ impl<D: DataHandler, S: Strategy> Engine<D, S> {
 
     pub fn trades(&self) -> &[TradeRecord] {
         &self.trades
+    }
+
+    /// 因成交规则被拒绝的订单(涨跌停、不足一手、T+1 等)。
+    pub fn rejected(&self) -> &[RejectedOrder] {
+        &self.rejected
+    }
+
+    pub fn execution_name(&self) -> &'static str {
+        self.exec.name()
     }
 
     /// Immutable access to the portfolio after run().
@@ -329,5 +359,48 @@ mod tests {
             last_equity
         );
         assert_eq!(engine.trades()[0].direction, Direction::Buy);
+    }
+
+    /// 注入 CloseExecution 必须与默认构造逐位一致 —— 基金回测结果不变的护栏。
+    #[test]
+    fn explicit_close_execution_is_identical_to_default() {
+        use crate::execution::CloseExecution;
+        let pts = || {
+            (0..60)
+                .map(|i| {
+                    let v = 1.0 + (i as f64 * 0.37).sin() * 0.2;
+                    NavPoint {
+                        date: d(2024, 1, 1) + chrono::Duration::days(i),
+                        nav: v,
+                        acc_nav: v,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let strat = || {
+            RuleLayer::new(
+                Box::new(Dca::new(Period::Weekly, 1, 1000.0)),
+                vec![Rule::TakeProfit { target_return: 0.1 }],
+            )
+        };
+        let mut a = Engine::new(
+            InMemoryData::new(pts()),
+            strat(),
+            Broker::new(no_fee()),
+            Portfolio::new(0.0),
+        );
+        a.run();
+        let mut b = Engine::new(
+            InMemoryData::new(pts()),
+            strat(),
+            Broker::new(no_fee()),
+            Portfolio::new(0.0),
+        )
+        .with_execution(Box::new(CloseExecution));
+        b.run();
+        assert_eq!(format!("{:?}", a.daily()), format!("{:?}", b.daily()));
+        assert_eq!(format!("{:?}", a.trades()), format!("{:?}", b.trades()));
+        assert!(a.rejected().is_empty() && b.rejected().is_empty());
+        assert_eq!(a.execution_name(), "close");
     }
 }

@@ -4,6 +4,7 @@ pub mod fundlist;
 pub mod sync;
 
 use crate::event::MarketEvent;
+use crate::execution::ExecBar;
 use chrono::NaiveDate;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -48,6 +49,12 @@ pub trait DataHandler {
     /// 对场外基金这是不可能的：T 日净值收盘后才公布，而申赎 15:00 截单。
     /// 详见 `strategy::StrategyContext` 的说明。
     fn history(&self, lookback: usize) -> &[MarketEvent];
+
+    /// 当日原始行情,**只给成交模型用,不进入策略上下文**。
+    /// 基金数据没有开盘价与涨跌停概念,默认 None。
+    fn exec_bar(&self) -> Option<ExecBar> {
+        None
+    }
 }
 
 /// 内存数据源（测试与已抓取数据回放共用）。
