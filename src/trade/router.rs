@@ -82,23 +82,46 @@ pub fn fill_paper_ticket(
     })
 }
 
-/// 用最新一批报价撮合所有待成交模拟盘工单,返回成交笔数。
+/// 一轮批量撮合的结果。单张工单出错不影响其余工单。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PaperBatch {
+    pub filled: usize,
+    /// (工单 id, 错误信息)
+    pub errors: Vec<(i64, String)>,
+}
+
+/// 用最新一批报价撮合所有待成交模拟盘工单。
 pub fn fill_pending_paper(
     conn: &mut Connection,
     quotes: &HashMap<String, Quote>,
     now: NaiveDateTime,
-) -> Result<usize> {
-    let mut filled = 0;
+) -> Result<PaperBatch> {
+    let mut batch = PaperBatch::default();
+    let mut slippage_by_user: HashMap<i64, f64> = HashMap::new();
     for t in ticket::list_open_paper(conn)? {
         let Some(q) = quotes.get(&t.code) else {
             continue;
         };
-        let slippage = store::get_risk_rules(conn, t.user_id)?.slippage;
-        if let RouteOutcome::Filled { .. } = fill_paper_ticket(conn, &t, q, slippage, now)? {
-            filled += 1;
+        let slippage = match slippage_by_user.get(&t.user_id) {
+            Some(s) => *s,
+            None => match store::get_risk_rules(conn, t.user_id) {
+                Ok(r) => {
+                    slippage_by_user.insert(t.user_id, r.slippage);
+                    r.slippage
+                }
+                Err(e) => {
+                    batch.errors.push((t.id, format!("{e:#}")));
+                    continue;
+                }
+            },
+        };
+        match fill_paper_ticket(conn, &t, q, slippage, now) {
+            Ok(RouteOutcome::Filled { .. }) => batch.filled += 1,
+            Ok(_) => {}
+            Err(e) => batch.errors.push((t.id, format!("{e:#}"))),
         }
     }
-    Ok(filled)
+    Ok(batch)
 }
 
 #[cfg(test)]
@@ -241,12 +264,16 @@ mod tests {
             quote(10.5, None, Some(9.0), at(15, 11, 0)),
         );
         assert_eq!(
-            fill_pending_paper(&mut c, &quotes, at(15, 11, 10)).unwrap(),
+            fill_pending_paper(&mut c, &quotes, at(15, 11, 10))
+                .unwrap()
+                .filled,
             0,
             "T+1 等待"
         );
         assert_eq!(
-            fill_pending_paper(&mut c, &quotes, at(16, 9, 31)).unwrap(),
+            fill_pending_paper(&mut c, &quotes, at(16, 9, 31))
+                .unwrap()
+                .filled,
             0,
             "过期工单不成交"
         );
@@ -257,7 +284,9 @@ mod tests {
 
         let s2 = paper_ticket(&c, Direction::Sell, 1000, at(16, 9, 20));
         assert_eq!(
-            fill_pending_paper(&mut c, &quotes, at(16, 9, 31)).unwrap(),
+            fill_pending_paper(&mut c, &quotes, at(16, 9, 31))
+                .unwrap()
+                .filled,
             1
         );
         assert_eq!(
@@ -289,5 +318,61 @@ mod tests {
         assert!(store::get_position(&c, 1, Account::Paper, "600000")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn batch_isolates_per_ticket_errors() {
+        let mut c = db();
+        let good = paper_ticket(&c, Direction::Buy, 100, at(15, 10, 0));
+        // 用户 2 没有模拟盘账户 → 回填时 add_cash 报错
+        let sid = insert_signal(
+            &c,
+            &NewSignal {
+                user_id: 2,
+                source: crate::trade::model::SignalSource::Manual,
+                strategy_id: None,
+                code: "600000".into(),
+                name: None,
+                side: Direction::Buy,
+                scope: crate::trade::model::AccountScope::Both,
+                ref_price: 10.0,
+                reason: "r".into(),
+                ai_note: None,
+                dedup_key: "u2".into(),
+                suggest_cash: None,
+                suggest_qty: None,
+            },
+            at(15, 10, 0),
+        )
+        .unwrap()
+        .unwrap();
+        let bad = create_ticket(
+            &c,
+            &NewTicket {
+                user_id: 2,
+                signal_id: sid,
+                account: Account::Paper,
+                code: "600000".into(),
+                side: Direction::Buy,
+                suggest_price: 10.0,
+                qty: 100,
+                expires_at: at(15, 10, 30),
+                deviation_th: 0.015,
+                status: TicketStatus::Confirmed,
+                urgency: 0,
+                created_at: at(15, 10, 0),
+            },
+        )
+        .unwrap();
+        let mut quotes = HashMap::new();
+        quotes.insert("600000".to_string(), quote(10.0, None, None, at(15, 10, 1)));
+        let batch = fill_pending_paper(&mut c, &quotes, at(15, 10, 1)).unwrap();
+        assert_eq!(batch.filled, 1);
+        assert_eq!(batch.errors.len(), 1);
+        assert_eq!(batch.errors[0].0, bad);
+        assert_eq!(
+            ticket::get_ticket(&c, good.id).unwrap().unwrap().status,
+            TicketStatus::Filled
+        );
     }
 }

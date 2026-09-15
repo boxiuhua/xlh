@@ -1,6 +1,8 @@
 //! 交易表结构与账户 / 风控 / 持仓读写。所有查询按 user_id 隔离。
 
-use crate::trade::model::{fmt_ts, Account, AccountState, Position, RiskRules, DATE_FMT};
+use crate::trade::model::{
+    fmt_ts, parse_ts, Account, AccountState, Position, Quote, RiskRules, DATE_FMT,
+};
 use anyhow::{anyhow, Context, Result};
 use chrono::{NaiveDate, NaiveDateTime};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -87,6 +89,18 @@ CREATE TABLE IF NOT EXISTS trade_positions (
   trailing_high    REAL,
   updated_at       TEXT NOT NULL,
   PRIMARY KEY (user_id, account, code)
+);
+CREATE TABLE IF NOT EXISTS trade_quotes (
+  code       TEXT PRIMARY KEY,
+  price      REAL NOT NULL,
+  limit_up   REAL,
+  limit_down REAL,
+  ts         TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS trade_heartbeat (
+  name    TEXT PRIMARY KEY,
+  beat_at TEXT NOT NULL
 );
 "#;
 
@@ -202,17 +216,17 @@ struct RawPosition {
     trailing_high: Option<f64>,
 }
 
-fn read_raw_position(r: &Row) -> rusqlite::Result<RawPosition> {
+fn read_raw_position_at(r: &Row, o: usize) -> rusqlite::Result<RawPosition> {
     Ok(RawPosition {
-        code: r.get(0)?,
-        qty: r.get(1)?,
-        avg_cost: r.get(2)?,
-        today_bought_qty: r.get(3)?,
-        last_buy_date: r.get(4)?,
-        stop_loss: r.get(5)?,
-        take_profit: r.get(6)?,
-        trailing_pct: r.get(7)?,
-        trailing_high: r.get(8)?,
+        code: r.get(o)?,
+        qty: r.get(o + 1)?,
+        avg_cost: r.get(o + 2)?,
+        today_bought_qty: r.get(o + 3)?,
+        last_buy_date: r.get(o + 4)?,
+        stop_loss: r.get(o + 5)?,
+        take_profit: r.get(o + 6)?,
+        trailing_pct: r.get(o + 7)?,
+        trailing_high: r.get(o + 8)?,
     })
 }
 
@@ -252,7 +266,7 @@ pub fn get_position(
                  WHERE user_id = ?1 AND account = ?2 AND code = ?3"
             ),
             params![user_id, account.as_str(), code],
-            read_raw_position,
+            |r| read_raw_position_at(r, 0),
         )
         .optional()?;
     raw.map(|r| r.into_position(user_id, account)).transpose()
@@ -264,7 +278,9 @@ pub fn list_positions(conn: &Connection, user_id: i64, account: Account) -> Resu
          WHERE user_id = ?1 AND account = ?2 ORDER BY code"
     ))?;
     let raws = stmt
-        .query_map(params![user_id, account.as_str()], read_raw_position)?
+        .query_map(params![user_id, account.as_str()], |r| {
+            read_raw_position_at(r, 0)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     raws.into_iter()
         .map(|r| r.into_position(user_id, account))
@@ -324,6 +340,150 @@ pub fn set_exit_levels(
         params![stop_loss, take_profit, trailing_pct, fmt_ts(now), user_id, account.as_str(), code],
     )?;
     Ok(n > 0)
+}
+
+/// 全体用户全部持仓(监听线程用)。
+pub fn list_all_positions(conn: &Connection) -> Result<Vec<Position>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT user_id, account, {POSITION_COLS} FROM trade_positions
+         ORDER BY user_id, account, code"
+    ))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                read_raw_position_at(r, 2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(uid, account, raw)| raw.into_position(uid, Account::parse(&account)?))
+        .collect()
+}
+
+pub fn set_trailing_high(
+    conn: &Connection,
+    user_id: i64,
+    account: Account,
+    code: &str,
+    high: f64,
+    now: NaiveDateTime,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE trade_positions SET trailing_high = ?1, updated_at = ?2
+         WHERE user_id = ?3 AND account = ?4 AND code = ?5",
+        params![high, fmt_ts(now), user_id, account.as_str(), code],
+    )?;
+    Ok(())
+}
+
+fn user_ids(conn: &Connection, sql: &str) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(sql)?;
+    let ids = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    Ok(ids)
+}
+
+pub fn users_with_positions(conn: &Connection) -> Result<Vec<i64>> {
+    user_ids(
+        conn,
+        "SELECT DISTINCT user_id FROM trade_positions ORDER BY user_id",
+    )
+}
+
+pub fn users_with_real_account(conn: &Connection) -> Result<Vec<i64>> {
+    user_ids(
+        conn,
+        "SELECT user_id FROM trade_accounts WHERE account = 'real' ORDER BY user_id",
+    )
+}
+
+pub fn upsert_quotes(conn: &Connection, quotes: &[Quote], now: NaiveDateTime) -> Result<usize> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO trade_quotes (code, price, limit_up, limit_down, ts, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(code) DO UPDATE SET price = excluded.price, limit_up = excluded.limit_up,
+           limit_down = excluded.limit_down, ts = excluded.ts, updated_at = excluded.updated_at",
+    )?;
+    for q in quotes {
+        stmt.execute(params![
+            q.code,
+            q.price,
+            q.limit_up,
+            q.limit_down,
+            fmt_ts(q.ts),
+            fmt_ts(now)
+        ])?;
+    }
+    Ok(quotes.len())
+}
+
+struct RawQuote {
+    code: String,
+    price: f64,
+    limit_up: Option<f64>,
+    limit_down: Option<f64>,
+    ts: String,
+}
+
+pub fn get_quote(conn: &Connection, code: &str) -> Result<Option<Quote>> {
+    let raw: Option<RawQuote> = conn
+        .query_row(
+            "SELECT code, price, limit_up, limit_down, ts FROM trade_quotes WHERE code = ?1",
+            [code],
+            |r| {
+                Ok(RawQuote {
+                    code: r.get(0)?,
+                    price: r.get(1)?,
+                    limit_up: r.get(2)?,
+                    limit_down: r.get(3)?,
+                    ts: r.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    raw.map(|r| {
+        Ok(Quote {
+            code: r.code,
+            price: r.price,
+            limit_up: r.limit_up,
+            limit_down: r.limit_down,
+            ts: parse_ts(&r.ts)?,
+        })
+    })
+    .transpose()
+}
+
+/// 行情时间距 now 不超过 max_age_secs 的缓存报价。
+pub fn fresh_quote(
+    conn: &Connection,
+    code: &str,
+    now: NaiveDateTime,
+    max_age_secs: i64,
+) -> Result<Option<Quote>> {
+    Ok(get_quote(conn, code)?.filter(|q| (now - q.ts).num_seconds() <= max_age_secs))
+}
+
+pub fn beat(conn: &Connection, name: &str, now: NaiveDateTime) -> Result<()> {
+    conn.execute(
+        "INSERT INTO trade_heartbeat (name, beat_at) VALUES (?1, ?2)
+         ON CONFLICT(name) DO UPDATE SET beat_at = excluded.beat_at",
+        params![name, fmt_ts(now)],
+    )?;
+    Ok(())
+}
+
+pub fn last_beat(conn: &Connection, name: &str) -> Result<Option<NaiveDateTime>> {
+    let s: Option<String> = conn
+        .query_row(
+            "SELECT beat_at FROM trade_heartbeat WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    s.as_deref().map(parse_ts).transpose()
 }
 
 #[cfg(test)]
@@ -443,7 +603,82 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 6);
+        assert_eq!(n, 8);
+    }
+
+    #[test]
+    fn quotes_upsert_and_freshness() {
+        let c = db();
+        let q = Quote {
+            code: "600000".into(),
+            price: 10.0,
+            limit_up: Some(11.0),
+            limit_down: None,
+            ts: at(16, 10, 0),
+        };
+        assert_eq!(
+            upsert_quotes(&c, std::slice::from_ref(&q), at(16, 10, 0)).unwrap(),
+            1
+        );
+        assert_eq!(get_quote(&c, "600000").unwrap(), Some(q.clone()));
+        let newer = Quote {
+            price: 10.2,
+            ts: at(16, 10, 1),
+            ..q.clone()
+        };
+        upsert_quotes(&c, std::slice::from_ref(&newer), at(16, 10, 1)).unwrap();
+        assert_eq!(get_quote(&c, "600000").unwrap(), Some(newer.clone()));
+        assert_eq!(
+            fresh_quote(&c, "600000", at(16, 10, 2), 60).unwrap(),
+            Some(newer)
+        );
+        assert!(
+            fresh_quote(&c, "600000", at(16, 10, 5), 60)
+                .unwrap()
+                .is_none(),
+            "超过 60 秒视为陈旧"
+        );
+        assert!(get_quote(&c, "000001").unwrap().is_none());
+    }
+
+    #[test]
+    fn heartbeat_round_trip() {
+        let c = db();
+        assert!(last_beat(&c, "trade-monitor").unwrap().is_none());
+        beat(&c, "trade-monitor", at(16, 10, 0)).unwrap();
+        beat(&c, "trade-monitor", at(16, 10, 1)).unwrap();
+        assert_eq!(last_beat(&c, "trade-monitor").unwrap(), Some(at(16, 10, 1)));
+    }
+
+    #[test]
+    fn all_positions_trailing_high_and_user_lists() {
+        let c = db();
+        for (uid, account, code) in [(2, Account::Paper, "600036"), (1, Account::Real, "600000")] {
+            let mut p = Position::empty(uid, account, code);
+            p.qty = 100;
+            p.avg_cost = 10.0;
+            p.trailing_pct = Some(0.05);
+            upsert_position(&c, &p, at(16, 9, 0)).unwrap();
+        }
+        let all = list_all_positions(&c).unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|p| (p.user_id, p.account, p.code.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, Account::Real, "600000"), (2, Account::Paper, "600036")]
+        );
+        set_trailing_high(&c, 1, Account::Real, "600000", 12.5, at(16, 10, 0)).unwrap();
+        assert_eq!(
+            get_position(&c, 1, Account::Real, "600000")
+                .unwrap()
+                .unwrap()
+                .trailing_high,
+            Some(12.5)
+        );
+        assert_eq!(users_with_positions(&c).unwrap(), vec![1, 2]);
+        set_capital(&c, 3, Account::Real, 1000.0, at(16, 9, 0)).unwrap();
+        set_capital(&c, 4, Account::Paper, 1000.0, at(16, 9, 0)).unwrap();
+        assert_eq!(users_with_real_account(&c).unwrap(), vec![3]);
     }
 
     #[test]
