@@ -126,6 +126,7 @@ mod tests {
                 code: "600000".into(),
                 name: None,
                 side,
+                scope: crate::trade::model::AccountScope::Both,
                 ref_price: 10.0,
                 reason: "r".into(),
                 ai_note: None,

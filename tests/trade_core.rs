@@ -2,7 +2,9 @@ use chrono::{NaiveDate, NaiveDateTime};
 use rusqlite::Connection;
 use xlh::event::Direction;
 use xlh::trade::gate::{Admission, GateReject};
-use xlh::trade::model::{Account, NewSignal, Quote, SignalSource, TicketStatus};
+use xlh::trade::model::{
+    Account, AccountScope, NewSignal, Position, Quote, SignalSource, TicketStatus,
+};
 use xlh::trade::service::{submit_signal, SubmitContext, SubmitOutcome};
 use xlh::trade::{store, ticket};
 
@@ -28,6 +30,7 @@ fn signal(source: SignalSource, side: Direction, key: &str) -> NewSignal {
         code: "600000".into(),
         name: Some("浦发银行".into()),
         side,
+        scope: AccountScope::Both,
         ref_price: 10.0,
         reason: "集成测试".into(),
         ai_note: None,
@@ -155,6 +158,59 @@ fn manual_buy_confirm_fill_then_exit_sell_next_day() {
     assert_eq!(
         ticket::get_ticket(&c, sell_rt).unwrap().unwrap().status,
         TicketStatus::Expired
+    );
+}
+
+#[test]
+fn stop_loss_rejected_at_limit_down_refires_same_day() {
+    let mut c = db();
+    let mut pos = Position::empty(1, Account::Real, "600000");
+    pos.qty = 1000;
+    pos.avg_cost = 10.0;
+    pos.last_buy_date = Some(NaiveDate::from_ymd_opt(2026, 9, 14).unwrap());
+    store::upsert_position(&c, &pos, at(14, 15, 0)).unwrap();
+
+    let mut sig = signal(
+        SignalSource::Exit,
+        Direction::Sell,
+        "exit-real-600000-stop-2026-09-16",
+    );
+    sig.scope = AccountScope::RealOnly;
+
+    let q1 = quote(9.0, Some(11.0), Some(9.0), at(16, 9, 35));
+    let ctx1 = SubmitContext {
+        quote: Some(&q1),
+        admission: Admission::NotRequired,
+        now: at(16, 9, 35),
+    };
+    let SubmitOutcome::Rejected {
+        signal_id: first,
+        reason: GateReject::LimitDown,
+    } = submit_signal(&mut c, &sig, &ctx1).unwrap()
+    else {
+        panic!("跌停应被拒绝");
+    };
+
+    let q2 = quote(9.2, Some(11.0), Some(9.0), at(16, 10, 5));
+    let ctx2 = SubmitContext {
+        quote: Some(&q2),
+        admission: Admission::NotRequired,
+        now: at(16, 10, 5),
+    };
+    let SubmitOutcome::Ticketed {
+        signal_id,
+        real_ticket: Some(_),
+        paper_ticket: None,
+    } = submit_signal(&mut c, &sig, &ctx2).unwrap()
+    else {
+        panic!("解除跌停后应重新激活同一信号并生成实盘工单");
+    };
+    assert_eq!(signal_id, first, "重新激活的应是同一行");
+
+    assert_eq!(
+        submit_signal(&mut c, &sig, &ctx2).unwrap(),
+        SubmitOutcome::Duplicate,
+        "已生成工单后重复提交应视为重复"
     );
 }
 

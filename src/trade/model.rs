@@ -57,6 +57,43 @@ impl Account {
     }
 }
 
+/// 信号作用的账户范围。止盈止损按账户分别发信号(实盘持仓 → RealOnly,模拟盘持仓 → PaperOnly)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountScope {
+    Both,
+    RealOnly,
+    PaperOnly,
+}
+
+impl AccountScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccountScope::Both => "both",
+            AccountScope::RealOnly => "real_only",
+            AccountScope::PaperOnly => "paper_only",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "both" => Ok(AccountScope::Both),
+            "real_only" => Ok(AccountScope::RealOnly),
+            "paper_only" => Ok(AccountScope::PaperOnly),
+            _ => Err(anyhow!("未知账户范围: {s}")),
+        }
+    }
+
+    pub fn includes(self, a: Account) -> bool {
+        matches!(
+            (self, a),
+            (AccountScope::Both, _)
+                | (AccountScope::RealOnly, Account::Real)
+                | (AccountScope::PaperOnly, Account::Paper)
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SignalSource {
@@ -147,6 +184,7 @@ pub struct NewSignal {
     pub code: String,
     pub name: Option<String>,
     pub side: Direction,
+    pub scope: AccountScope,
     pub ref_price: f64,
     pub reason: String,
     pub ai_note: Option<String>,
@@ -303,6 +341,13 @@ mod tests {
             TicketStatus::Cancelled,
         ] {
             assert_eq!(TicketStatus::parse(t.as_str()).unwrap(), t);
+        }
+        for sc in [
+            AccountScope::Both,
+            AccountScope::RealOnly,
+            AccountScope::PaperOnly,
+        ] {
+            assert_eq!(AccountScope::parse(sc.as_str()).unwrap(), sc);
         }
         assert_eq!(
             parse_side(side_str(Direction::Sell)).unwrap(),

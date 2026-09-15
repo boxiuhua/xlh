@@ -113,12 +113,16 @@ pub fn evaluate(inp: &GateInput) -> GateDecision {
             }
         }
     }
-    let accounts = match (s.source, inp.admission) {
+    let mut accounts = match (s.source, inp.admission) {
         (SignalSource::Exit | SignalSource::Manual, _) => vec![Account::Real, Account::Paper],
         (_, Admission::NotRequired | Admission::Admitted) => vec![Account::Real, Account::Paper],
         (_, Admission::Probation) => vec![Account::Paper],
         (_, Admission::Blocked) => return Reject(GateReject::NotAdmitted),
     };
+    accounts.retain(|a| s.scope.includes(*a));
+    if accounts.is_empty() {
+        return Reject(GateReject::NotAdmitted);
+    }
     let Some(q) = inp.quote.filter(|q| q.price.is_finite() && q.price > 0.0) else {
         return Reject(GateReject::NoQuote);
     };
@@ -291,6 +295,7 @@ mod tests {
                     code: "600000".into(),
                     name: None,
                     side: Direction::Buy,
+                    scope: AccountScope::Both,
                     ref_price: 10.0,
                     reason: "r".into(),
                     ai_note: None,
@@ -444,6 +449,29 @@ mod tests {
             plans(f.run()),
             vec![plan(Account::Real, 1000), plan(Account::Paper, 1000)]
         );
+    }
+
+    #[test]
+    fn paper_only_scope_exits_paper_position_without_real_position() {
+        let mut f = Fx::sell(1000, yesterday());
+        f.real_pos = None;
+        f.sig.scope = AccountScope::PaperOnly;
+        assert_eq!(plans(f.run()), vec![plan(Account::Paper, 1000)]);
+    }
+
+    #[test]
+    fn real_only_scope_does_not_touch_paper() {
+        let mut f = Fx::sell(1000, yesterday());
+        f.sig.scope = AccountScope::RealOnly;
+        assert_eq!(plans(f.run()), vec![plan(Account::Real, 1000)]);
+    }
+
+    #[test]
+    fn scope_excluded_by_admission_is_not_admitted() {
+        let mut f = Fx::buy(SignalSource::Strategy);
+        f.admission = Admission::Probation;
+        f.sig.scope = AccountScope::RealOnly;
+        assert_eq!(rejected(f.run()), GateReject::NotAdmitted);
     }
 
     #[test]

@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS trade_signals (
   code          TEXT NOT NULL,
   name          TEXT,
   side          TEXT NOT NULL,
+  scope         TEXT NOT NULL DEFAULT 'both',
   ref_price     REAL NOT NULL,
   reason        TEXT NOT NULL,
   ai_note       TEXT,

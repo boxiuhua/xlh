@@ -71,11 +71,20 @@ pub fn default_expiry(source: SignalSource, now: NaiveDateTime) -> NaiveDateTime
     }
 }
 
+/// 入库信号；同 dedup_key 已被拒绝的信号会被重新激活(可重试)，其余重复返回 None。
 pub fn insert_signal(conn: &Connection, s: &NewSignal, now: NaiveDateTime) -> Result<Option<i64>> {
-    let n = conn.execute(
-        "INSERT OR IGNORE INTO trade_signals (user_id, source, strategy_id, code, name, side,
-           ref_price, reason, ai_note, dedup_key, suggest_cash, suggest_qty, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'new', ?13)",
+    conn.query_row(
+        "INSERT INTO trade_signals (user_id, source, strategy_id, code, name, side, scope, ref_price, reason,
+           ai_note, dedup_key, suggest_cash, suggest_qty, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'new', ?14)
+         ON CONFLICT(user_id, dedup_key) DO UPDATE SET
+           source = excluded.source, strategy_id = excluded.strategy_id, code = excluded.code,
+           name = excluded.name, side = excluded.side, scope = excluded.scope,
+           ref_price = excluded.ref_price, reason = excluded.reason, ai_note = excluded.ai_note,
+           suggest_cash = excluded.suggest_cash, suggest_qty = excluded.suggest_qty,
+           status = 'new', reject_reason = NULL, created_at = excluded.created_at
+         WHERE trade_signals.status = 'rejected'
+         RETURNING id",
         params![
             s.user_id,
             s.source.as_str(),
@@ -83,6 +92,7 @@ pub fn insert_signal(conn: &Connection, s: &NewSignal, now: NaiveDateTime) -> Re
             s.code,
             s.name,
             side_str(s.side),
+            s.scope.as_str(),
             s.ref_price,
             s.reason,
             s.ai_note,
@@ -91,8 +101,10 @@ pub fn insert_signal(conn: &Connection, s: &NewSignal, now: NaiveDateTime) -> Re
             s.suggest_qty.map(|q| q as i64),
             fmt_ts(now),
         ],
-    )?;
-    Ok((n > 0).then(|| conn.last_insert_rowid()))
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 /// status:"ticketed" | "rejected"
@@ -454,6 +466,7 @@ pub fn record_fill(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trade::model::AccountScope;
     use crate::trade::store;
 
     fn at(d: u32, h: u32, m: u32) -> NaiveDateTime {
@@ -478,6 +491,7 @@ mod tests {
             code: "600000".into(),
             name: Some("浦发银行".into()),
             side,
+            scope: AccountScope::Both,
             ref_price: 10.0,
             reason: "测试".into(),
             ai_note: None,
@@ -566,6 +580,31 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "排除自身"
+        );
+    }
+
+    #[test]
+    fn rejected_signal_can_be_resubmitted_ticketed_cannot() {
+        let c = db();
+        let s = signal("re-key", Direction::Sell);
+        let id = insert_signal(&c, &s, at(15, 10, 0)).unwrap().unwrap();
+        mark_signal(&c, id, "rejected", Some("limit_down")).unwrap();
+
+        let again = insert_signal(&c, &s, at(15, 10, 5)).unwrap();
+        assert_eq!(again, Some(id), "被拒的信号可用同 key 重新激活同一行");
+        let (status, reject_reason): (String, Option<String>) = c
+            .query_row(
+                "SELECT status, reject_reason FROM trade_signals WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), reject_reason.as_deref()), ("new", None));
+
+        mark_signal(&c, id, "ticketed", None).unwrap();
+        assert!(
+            insert_signal(&c, &s, at(15, 10, 10)).unwrap().is_none(),
+            "已生成工单的信号仍返回 None"
         );
     }
 
