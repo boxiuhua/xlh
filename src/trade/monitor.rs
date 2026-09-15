@@ -1,6 +1,7 @@
 //! 交易监听单轮:过期 → 报价 → 缓存 → 止盈止损 → 过期重发 → 模拟盘撮合。
 //! 报价源经参数注入,整轮可离线测试;线程、休眠与退避在 `daemon`。
 
+use crate::event::Direction;
 use crate::stock::realtime::calendar::is_weekend;
 use crate::trade::exits::{exit_signal, next_trailing_high};
 use crate::trade::gate::Admission;
@@ -96,7 +97,10 @@ pub fn run_tick(
             report.errors.push(format!("{label}: {e:#}"));
         }
     }
-    report.paper = router::fill_pending_paper(conn, &quotes, now)?;
+    match router::fill_pending_paper(conn, &quotes, now) {
+        Ok(batch) => report.paper = batch,
+        Err(e) => report.errors.push(format!("模拟盘批量撮合失败: {e:#}")),
+    }
     Ok(report)
 }
 
@@ -126,15 +130,19 @@ fn process_position(
             ..
         } => report.new_real_tickets.push(id),
         SubmitOutcome::Duplicate if p.account == Account::Real => {
-            if let Some(id) = ticket::reissue_expired_exit(
-                conn,
-                p.user_id,
-                &sig.dedup_key,
-                p.sellable(now.date()),
-                q.price,
-                now,
-            )? {
-                report.new_real_tickets.push(id);
+            // 同用户同代码同方向若已有另一张挂起的实盘卖出工单(即便所属信号不同),
+            // 也不应重发——避免同一持仓同时存在多张待确认的卖出工单。
+            if !ticket::has_open_ticket(conn, p.user_id, &p.code, Direction::Sell)? {
+                if let Some(id) = ticket::reissue_expired_exit(
+                    conn,
+                    p.user_id,
+                    &sig.dedup_key,
+                    p.sellable(now.date()),
+                    q.price,
+                    now,
+                )? {
+                    report.new_real_tickets.push(id);
+                }
             }
         }
         _ => {}
@@ -239,6 +247,92 @@ mod tests {
         assert_eq!(p.trailing_high, Some(12.0));
         let r2 = run_tick(&mut c, &quote(11.3, at(16, 10, 1)), at(16, 10, 1)).unwrap();
         assert_eq!((r2.exit_signals, r2.new_real_tickets.len()), (1, 1));
+    }
+
+    #[test]
+    fn no_reissue_while_another_sell_ticket_is_open() {
+        let mut c = db_with_position(|p| {
+            p.stop_loss = Some(9.2);
+            p.trailing_pct = Some(0.05);
+        });
+
+        // t0: 12.0 → 记录移动止盈最高价,不触发
+        let r0 = run_tick(&mut c, &quote(12.0, at(16, 10, 0)), at(16, 10, 0)).unwrap();
+        assert_eq!(r0.exit_signals, 0);
+
+        // t1: 11.3 ≤ 12×0.95=11.4 → 触发移动止盈,创建实盘工单 A(挂起,10:31 到期)
+        let r1 = run_tick(&mut c, &quote(11.3, at(16, 10, 1)), at(16, 10, 1)).unwrap();
+        assert_eq!(r1.new_real_tickets.len(), 1, "移动止盈应创建实盘工单");
+        let ticket_a = r1.new_real_tickets[0];
+        assert_eq!(
+            ticket::get_ticket(&c, ticket_a)
+                .unwrap()
+                .unwrap()
+                .expires_at,
+            at(16, 10, 31)
+        );
+
+        // t2: 9.1 ≤ 9.2 → 止损优先于移动止盈触发,dedup_key 是全新的;
+        // 但 A 仍挂起(同用户同代码同方向)→ 闸门按 DuplicateOpenTicket 拒绝,不产生新工单
+        let r2 = run_tick(&mut c, &quote(9.1, at(16, 10, 2)), at(16, 10, 2)).unwrap();
+        assert!(
+            r2.new_real_tickets.is_empty(),
+            "A 挂起中,止损信号应被闸门拒绝而非出单"
+        );
+        assert!(r2.errors.is_empty(), "{:?}", r2.errors);
+
+        // 直接到期 A(不经 run_tick)
+        assert_eq!(ticket::expire_due(&c, at(16, 10, 31)).unwrap(), 1);
+        assert_eq!(
+            ticket::get_ticket(&c, ticket_a).unwrap().unwrap().status,
+            TicketStatus::Expired
+        );
+
+        // t3: 9.1 → 止损信号的 dedup_key 此前被拒绝,现重新激活;A 已过期且无其它挂起 → 正常出单 B
+        let r3 = run_tick(&mut c, &quote(9.1, at(16, 10, 32)), at(16, 10, 32)).unwrap();
+        assert_eq!(
+            r3.new_real_tickets.len(),
+            1,
+            "止损 key 重新激活后应正常出单"
+        );
+        let ticket_b = r3.new_real_tickets[0];
+        assert_ne!(ticket_b, ticket_a);
+
+        // t4: 11.3 → 移动止盈的 dedup_key(A 所属信号,已 ticketed)→ Duplicate;
+        // A 本身已过期,但止损工单 B 仍挂起(同用户同代码同方向)→ 不应重发
+        //
+        // 注:若沿用协调者原始描述在此仍用价格 9.1,由于 `trigger()` 对止损的优先级
+        // 高于移动止盈(见 exits.rs trigger()),9.1 会重新算出"止损"key(而非"移动止盈"
+        // key),两者都会因 B 挂起而不重发,但那样测的是同一 key 的自重复,而非"另一张
+        // 挂起工单挡住重发"。这里改用 11.3 使 `trigger()` 真正切回移动止盈规则,
+        // 从而实际验证"不同信号的挂起工单也能挡住重发"这一行为(详见任务报告 Concerns)。
+        let r4 = run_tick(&mut c, &quote(11.3, at(16, 10, 33)), at(16, 10, 33)).unwrap();
+        assert!(
+            r4.new_real_tickets.is_empty(),
+            "止损工单 B 仍挂起,移动止盈不应重发"
+        );
+        assert!(r4.errors.is_empty(), "{:?}", r4.errors);
+    }
+
+    #[test]
+    fn paper_match_failure_is_recorded_not_propagated() {
+        let mut c = db_with_position(|p| p.stop_loss = Some(9.2));
+        // 插入一张 side 字段损坏的模拟盘工单,使 fill_pending_paper 顶层解析失败
+        c.execute(
+            "INSERT INTO trade_tickets (user_id, signal_id, account, code, side, suggest_price,
+               qty, filled_qty, expires_at, deviation_th, status, urgency, created_at)
+             VALUES (1, 0, 'paper', '600000', 'sideways', 10.0, 100, 0,
+               '2026-09-16 23:59:59', 0.015, 'confirmed', 0, '2026-09-16 10:00:00')",
+            [],
+        )
+        .unwrap();
+
+        let r = run_tick(&mut c, &quote(9.1, at(16, 10, 0)), at(16, 10, 0)).unwrap();
+        assert_eq!(r.paper, PaperBatch::default(), "撮合失败时不产出成交批次");
+        assert_eq!(r.errors.len(), 1);
+        assert!(r.errors[0].contains("模拟盘批量撮合失败"), "{:?}", r.errors);
+        // 止损信号本身应正常出单,不受模拟盘撮合失败影响
+        assert_eq!(r.new_real_tickets.len(), 1);
     }
 
     #[test]

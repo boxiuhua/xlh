@@ -58,48 +58,61 @@ pub fn submit_mover_signals(
         return Ok(report);
     }
     for uid in store::users_with_real_account(conn)? {
-        let watch = match crate::push::store::get(conn, uid)? {
-            Some(cfg) => cfg.realtime_watch_stocks,
-            None => continue,
-        };
-        if watch.is_empty() {
-            continue;
-        }
-        for m in movers.iter().filter(|m| watch.iter().any(|c| c == &m.code)) {
-            let side = match trade_action(m.divergence) {
-                TradeAction::Buy => Direction::Buy,
-                TradeAction::Sell => {
-                    let held = store::get_position(conn, uid, Account::Real, &m.code)?.is_some()
-                        || store::get_position(conn, uid, Account::Paper, &m.code)?.is_some();
-                    if !held {
-                        continue;
-                    }
-                    Direction::Sell
-                }
-                TradeAction::Hold => continue,
-            };
-            let quote = store::fresh_quote(conn, &m.code, now, 60)?.unwrap_or(Quote {
-                code: m.code.clone(),
-                price: m.price,
-                limit_up: None,
-                limit_down: None,
-                ts: m.ts,
-            });
-            let sig = mover_signal(uid, m, side);
-            report.signals += 1;
-            let ctx = SubmitContext {
-                quote: Some(&quote),
-                admission: Admission::Probation,
-                now,
-            };
-            match submit_signal(conn, &sig, &ctx) {
-                Ok(SubmitOutcome::Ticketed { .. }) => report.ticketed += 1,
-                Ok(_) => {}
-                Err(e) => report.errors.push(format!("用户 {uid} {}: {e:#}", m.code)),
-            }
+        if let Err(e) = process_user(conn, uid, movers, now, &mut report) {
+            report.errors.push(format!("用户 {uid}: {e:#}"));
         }
     }
     Ok(report)
+}
+
+/// 单个用户的订阅匹配与提交;任一环节出错都整体中止该用户,由调用方记入
+/// `report.errors` 并继续处理下一个用户,不影响其余用户的信号。
+fn process_user(
+    conn: &mut Connection,
+    uid: i64,
+    movers: &[Mover],
+    now: NaiveDateTime,
+    report: &mut MoverReport,
+) -> Result<()> {
+    let watch = match crate::push::store::get(conn, uid)? {
+        Some(cfg) => cfg.realtime_watch_stocks,
+        None => return Ok(()),
+    };
+    if watch.is_empty() {
+        return Ok(());
+    }
+    for m in movers.iter().filter(|m| watch.iter().any(|c| c == &m.code)) {
+        let side = match trade_action(m.divergence) {
+            TradeAction::Buy => Direction::Buy,
+            TradeAction::Sell => {
+                // 观察期只进模拟盘,故只以模拟盘持仓判定是否可卖。
+                let held = store::get_position(conn, uid, Account::Paper, &m.code)?.is_some();
+                if !held {
+                    continue;
+                }
+                Direction::Sell
+            }
+            TradeAction::Hold => continue,
+        };
+        let quote = store::fresh_quote(conn, &m.code, now, 60)?.unwrap_or(Quote {
+            code: m.code.clone(),
+            price: m.price,
+            limit_up: None,
+            limit_down: None,
+            ts: m.ts,
+        });
+        let sig = mover_signal(uid, m, side);
+        report.signals += 1;
+        let ctx = SubmitContext {
+            quote: Some(&quote),
+            admission: Admission::Probation,
+            now,
+        };
+        if let SubmitOutcome::Ticketed { .. } = submit_signal(conn, &sig, &ctx)? {
+            report.ticketed += 1;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -199,6 +212,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!((r.signals, r.ticketed), (1, 1), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn per_user_failure_is_isolated_and_recorded() {
+        let mut c = db(&["600000"]);
+        // 用户 2 也订阅同一代码,但写入损坏的风控规则 JSON,使其 submit_signal 内部
+        // 读取风控规则时报错;应仅记入该用户的错误,不影响用户 1 也不使整体调用失败。
+        store::set_capital(&c, 2, Account::Real, 50_000.0, at(9, 0)).unwrap();
+        let mut cfg2 = crate::push::config::default_config();
+        cfg2.realtime_watch_stocks = vec!["600000".into()];
+        crate::push::store::upsert(&c, 2, &cfg2).unwrap();
+        c.execute(
+            "INSERT INTO trade_risk_rules (user_id, rules_json, updated_at) VALUES (2, 'not-json', 'x')",
+            [],
+        )
+        .unwrap();
+
+        let r = submit_mover_signals(
+            &mut c,
+            &[mover("600000", Divergence::MainAccumulating)],
+            at(10, 31),
+        )
+        .unwrap();
+        assert_eq!(r.ticketed, 1, "用户 1 应正常成交,不受用户 2 影响");
+        assert_eq!(r.errors.len(), 1);
+        assert!(r.errors[0].starts_with("用户 2:"), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn sell_mover_requires_paper_holding_even_if_real_position_exists() {
+        let mut c = db(&["600000"]);
+        let mut p = Position::empty(1, Account::Real, "600000");
+        p.qty = 1000;
+        p.avg_cost = 9.0;
+        p.last_buy_date = Some(NaiveDate::from_ymd_opt(2026, 9, 15).unwrap());
+        store::upsert_position(&c, &p, at(9, 0)).unwrap();
+        let r = submit_mover_signals(
+            &mut c,
+            &[mover("600000", Divergence::RetailChasing)],
+            at(10, 31),
+        )
+        .unwrap();
+        assert_eq!(r.signals, 0, "仅有实盘持仓、无模拟盘持仓时不应视为可卖");
     }
 
     #[test]

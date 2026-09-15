@@ -74,7 +74,8 @@ pub struct GateInput<'a> {
     pub real_reserved_cash: f64,
     /// 模拟盘未完结买入工单占用资金
     pub paper_reserved_cash: f64,
-    /// 同用户同代码同方向是否已有未完结实盘工单
+    /// 同用户同代码同方向是否已有未完结实盘工单(仅当目标账户含实盘时才会阻塞;
+    /// 若信号只作用于模拟盘,如观察期策略或 `PaperOnly` 范围的止盈止损,不受此约束)
     pub has_open_ticket: bool,
     /// 同代码同方向最近一次成功生成工单的信号时间(冷却用)
     pub last_signal_at: Option<NaiveDateTime>,
@@ -107,9 +108,6 @@ pub fn evaluate(inp: &GateInput) -> GateDecision {
     if !rules.enabled {
         return Reject(GateReject::TradingDisabled);
     }
-    if inp.has_open_ticket {
-        return Reject(GateReject::DuplicateOpenTicket);
-    }
     if s.source != SignalSource::Exit {
         if let Some(last) = inp.last_signal_at {
             if inp.now - last < chrono::Duration::minutes(rules.cooldown_min) {
@@ -126,6 +124,9 @@ pub fn evaluate(inp: &GateInput) -> GateDecision {
     accounts.retain(|a| s.scope.includes(*a));
     if accounts.is_empty() {
         return Reject(GateReject::NotAdmitted);
+    }
+    if inp.has_open_ticket && accounts.contains(&Account::Real) {
+        return Reject(GateReject::DuplicateOpenTicket);
     }
     let Some(q) = inp.quote.filter(|q| q.price.is_finite() && q.price > 0.0) else {
         return Reject(GateReject::NoQuote);
@@ -443,6 +444,22 @@ mod tests {
             GateReject::BelowOneLot,
             "20000/300.3 不足一手"
         );
+    }
+
+    #[test]
+    fn open_real_ticket_does_not_block_paper_only_exit() {
+        let mut f = Fx::sell(1000, yesterday());
+        f.open = true;
+        f.sig.scope = AccountScope::PaperOnly;
+        assert_eq!(plans(f.run()), vec![plan(Account::Paper, 1000)]);
+    }
+
+    #[test]
+    fn open_real_ticket_does_not_block_probation_buy() {
+        let mut f = Fx::buy(SignalSource::Strategy);
+        f.admission = Admission::Probation;
+        f.open = true;
+        assert_eq!(plans(f.run()), vec![plan(Account::Paper, 1900)]);
     }
 
     #[test]
