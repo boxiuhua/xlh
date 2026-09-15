@@ -36,7 +36,7 @@ pub fn submit_signal(
     ctx: &SubmitContext,
 ) -> Result<SubmitOutcome> {
     let now = ctx.now;
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let Some(signal_id) = ticket::insert_signal(&tx, sig, now)? else {
         return Ok(SubmitOutcome::Duplicate);
     };

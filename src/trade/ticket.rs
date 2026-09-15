@@ -366,7 +366,7 @@ pub fn record_fill(
     source: &str,
     now: NaiveDateTime,
 ) -> Result<FillOutcome> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let t = get_ticket(&tx, ticket_id)?
         .filter(|t| t.user_id == user_id)
         .ok_or_else(|| anyhow!("工单不存在"))?;
