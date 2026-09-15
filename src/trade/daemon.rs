@@ -5,8 +5,8 @@ use crate::stock::realtime::calendar::is_weekend;
 use crate::stock::realtime::movers::Mover;
 use crate::trade::config::TradeCfg;
 use crate::trade::notify::{
-    render_fill_reminder, render_monitor_down, render_new_ticket, signal_reason, Notifier,
-    PushNotifier,
+    self, render_fill_reminder, render_monitor_down, render_new_ticket, signal_reason, Notifier,
+    PushNotifier, QueuedPushNotifier,
 };
 use crate::trade::quotes::TencentQuotes;
 use crate::trade::{monitor, movers, store, ticket};
@@ -38,7 +38,7 @@ impl Backoff {
     }
 
     pub fn delay_secs(&self, base: u64) -> u64 {
-        base * (1u64 << self.failures.min(2))
+        base.saturating_mul(1u64 << self.failures.min(2))
     }
 
     pub fn should_alert(&self, now: NaiveDateTime, alert_after_secs: i64) -> bool {
@@ -62,6 +62,20 @@ pub fn due_daily(now: NaiveDateTime, hour: u32, minute: u32, last_run: Option<Na
         return false;
     };
     !is_weekend(now.date()) && now.time() >= at && last_run != Some(now.date())
+}
+
+/// 同 `due_daily`,但只在 `[start, end)` 窗口内触发——避免因某轮迟迟未跑而在
+/// 深夜甚至次日凌晨才补跑「当日」任务(如 15:05 回填提醒,过了 16:00 就不再有意义)。
+pub fn due_daily_window(
+    now: NaiveDateTime,
+    start: (u32, u32),
+    end: (u32, u32),
+    last_run: Option<NaiveDate>,
+) -> bool {
+    let Some(end_at) = NaiveTime::from_hms_opt(end.0, end.1, 0) else {
+        return false;
+    };
+    due_daily(now, start.0, start.1, last_run) && now.time() < end_at
 }
 
 /// 推送本轮新建的实盘工单,返回成功推送条数;单条失败只记日志。
@@ -100,11 +114,11 @@ pub fn send_fill_reminders(conn: &Connection, notifier: &dyn Notifier) -> Result
     Ok(sent)
 }
 
-/// 监听中断告警:推送给所有有持仓的用户,返回推送用户数。
+/// 监听中断告警:推送给所有持有实盘仓位的用户(模拟盘持仓无需线下操作),返回推送用户数。
 pub fn alert_holders(conn: &Connection, notifier: &dyn Notifier, minutes: i64) -> Result<usize> {
     let (title, md) = render_monitor_down(minutes);
     let mut sent = 0;
-    for uid in store::users_with_positions(conn)? {
+    for uid in store::users_with_real_positions(conn)? {
         match notifier.notify(conn, uid, &title, &md) {
             Ok(()) => sent += 1,
             Err(e) => eprintln!("[trade] 用户 {uid} 中断告警失败: {e:#}"),
@@ -158,9 +172,21 @@ fn run_loop(
         cfg.monitor_interval_secs,
         db_path.display()
     );
-    let notifier = PushNotifier {
-        warn_days,
-        grace_days,
+    // 网络发送(重试 + 超时)交给独立线程,避免慢 webhook 拖住这里 15 秒一轮的止盈止损监听。
+    // 发送线程起不来时(极罕见)退回同步 PushNotifier——功能仍可用,只是恢复了原来的阻塞风险。
+    let notifier: Box<dyn Notifier> = match notify::spawn_sender() {
+        Ok((_handle, tx)) => Box::new(QueuedPushNotifier {
+            warn_days,
+            grace_days,
+            tx,
+        }),
+        Err(e) => {
+            eprintln!("[trade] 推送发送线程启动失败,退回同步推送: {e:#}");
+            Box::new(PushNotifier {
+                warn_days,
+                grace_days,
+            })
+        }
     };
     let source = TencentQuotes;
     let mut backoff = Backoff::default();
@@ -168,70 +194,89 @@ fn run_loop(
     let mut last_remind: Option<NaiveDate> = None;
 
     loop {
+        // 心跳、异动转发、每日任务用这个较早的时刻;真正拉报价前再重新取一次(见下),
+        // 避免异动处理/日终任务耗时把止盈止损判定用的时间戳带偏。
         let now = chrono::Local::now().naive_local();
-        if let Err(e) = store::beat(&conn, "trade-monitor", now) {
-            eprintln!("[trade] 写心跳失败: {e:#}");
-        }
 
-        while let Ok(batch) = rx.try_recv() {
-            if !cfg.mover_signals {
-                continue;
+        // 任何一轮内部 panic(如报价源/第三方库的极端输入)都只记日志、按普通间隔重试,
+        // 线程本身绝不能因此退出——退出就意味着止盈止损彻底停摆且无人知晓。
+        let delay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Err(e) = store::beat(&conn, "trade-monitor", now) {
+                eprintln!("[trade] 写心跳失败: {e:#}");
             }
-            match movers::submit_mover_signals(&mut conn, &batch, now) {
-                Ok(r) => r
-                    .errors
-                    .iter()
-                    .for_each(|e| eprintln!("[trade] 异动信号: {e}")),
-                Err(e) => eprintln!("[trade] 异动信号处理失败: {e:#}"),
-            }
-        }
 
-        if due_daily(now, 9, 0, last_cancel) {
-            let midnight = now
-                .date()
-                .and_time(NaiveTime::from_hms_opt(0, 0, 0).expect("合法时刻"));
-            match ticket::cancel_unfilled(&conn, midnight) {
-                Ok(n) if n > 0 => println!("[trade] 撤销未回填工单 {n} 张"),
-                Ok(_) => {}
-                Err(e) => eprintln!("[trade] 撤销未回填工单失败: {e:#}"),
-            }
-            last_cancel = Some(now.date());
-        }
-        if due_daily(now, 15, 5, last_remind) {
-            if let Err(e) = send_fill_reminders(&conn, &notifier) {
-                eprintln!("[trade] 回填提醒失败: {e:#}");
-            }
-            last_remind = Some(now.date());
-        }
-
-        let delay = match monitor::run_tick(&mut conn, &source, now) {
-            Ok(report) => {
-                if backoff.on_success() {
-                    println!("[trade] 行情恢复,监听继续");
+            while let Ok(batch) = rx.try_recv() {
+                if !cfg.mover_signals {
+                    continue;
                 }
-                notify_new_tickets(&conn, &notifier, &report.new_real_tickets);
-                for e in report
-                    .errors
-                    .iter()
-                    .chain(report.paper.errors.iter().map(|(_, e)| e))
-                {
-                    eprintln!("[trade] {e}");
+                match movers::submit_mover_signals(&mut conn, &batch, now) {
+                    Ok(r) => r
+                        .errors
+                        .iter()
+                        .for_each(|e| eprintln!("[trade] 异动信号: {e}")),
+                    Err(e) => eprintln!("[trade] 异动信号处理失败: {e:#}"),
                 }
-                cfg.monitor_interval_secs
             }
-            Err(e) => {
-                eprintln!("[trade] 本轮监听失败: {e:#}");
-                backoff.on_failure(now);
-                if backoff.should_alert(now, cfg.alert_after_secs) {
-                    let minutes = backoff.failing_minutes(now);
-                    if let Err(e) = alert_holders(&conn, &notifier, minutes) {
-                        eprintln!("[trade] 中断告警失败: {e:#}");
+
+            if due_daily(now, 9, 0, last_cancel) {
+                let midnight = now
+                    .date()
+                    .and_time(NaiveTime::from_hms_opt(0, 0, 0).expect("合法时刻"));
+                match ticket::cancel_unfilled(&conn, midnight) {
+                    Ok(n) => {
+                        if n > 0 {
+                            println!("[trade] 撤销未回填工单 {n} 张");
+                        }
+                        last_cancel = Some(now.date());
                     }
-                    backoff.mark_alerted();
+                    Err(e) => eprintln!("[trade] 撤销未回填工单失败: {e:#}"),
                 }
-                backoff.delay_secs(cfg.monitor_interval_secs)
             }
-        };
+            // 只在 15:05–16:00 窗口内跑;过了 16:00 才轮到的话说明这一轮严重滞后,
+            // 「即将撤单」提醒已无意义,不该在深夜甚至次日凌晨补发。
+            if due_daily_window(now, (15, 5), (16, 0), last_remind) {
+                match send_fill_reminders(&conn, notifier.as_ref()) {
+                    Ok(_) => last_remind = Some(now.date()),
+                    Err(e) => eprintln!("[trade] 回填提醒失败: {e:#}"),
+                }
+            }
+
+            // 异动转发与日终任务耗时不确定;拉报价前重新取时刻,让止盈止损判定与
+            // 退避计时都基于「实际发起本轮监听」的时间,而非循环开始时的时间。
+            let tick_now = chrono::Local::now().naive_local();
+            match monitor::run_tick(&mut conn, &source, tick_now) {
+                Ok(report) => {
+                    if backoff.on_success() {
+                        println!("[trade] 行情恢复,监听继续");
+                    }
+                    notify_new_tickets(&conn, notifier.as_ref(), &report.new_real_tickets);
+                    for e in report
+                        .errors
+                        .iter()
+                        .chain(report.paper.errors.iter().map(|(_, e)| e))
+                    {
+                        eprintln!("[trade] {e}");
+                    }
+                    cfg.monitor_interval_secs
+                }
+                Err(e) => {
+                    eprintln!("[trade] 本轮监听失败: {e:#}");
+                    backoff.on_failure(tick_now);
+                    if backoff.should_alert(tick_now, cfg.alert_after_secs) {
+                        let minutes = backoff.failing_minutes(tick_now);
+                        if let Err(e) = alert_holders(&conn, notifier.as_ref(), minutes) {
+                            eprintln!("[trade] 中断告警失败: {e:#}");
+                        }
+                        backoff.mark_alerted();
+                    }
+                    backoff.delay_secs(cfg.monitor_interval_secs)
+                }
+            }
+        }))
+        .unwrap_or_else(|_| {
+            eprintln!("[trade] 监听本轮 panic,已恢复");
+            cfg.monitor_interval_secs
+        });
         std::thread::sleep(std::time::Duration::from_secs(delay));
     }
 }
@@ -285,5 +330,30 @@ mod tests {
             Some(NaiveDate::from_ymd_opt(2026, 9, 16).unwrap())
         ));
         assert!(!due_daily(at(19, 9, 5), 9, 0, None), "周六不跑");
+    }
+
+    #[test]
+    fn daily_window_bounds_the_reminder_job() {
+        assert!(
+            due_daily_window(at(16, 15, 5), (15, 5), (16, 0), None),
+            "窗口内"
+        );
+        assert!(
+            !due_daily_window(at(16, 16, 0), (15, 5), (16, 0), None),
+            "已到窗口终点,不再补跑"
+        );
+        assert!(
+            !due_daily_window(at(19, 15, 5), (15, 5), (16, 0), None),
+            "周六不跑"
+        );
+        assert!(
+            !due_daily_window(
+                at(16, 15, 30),
+                (15, 5),
+                (16, 0),
+                Some(NaiveDate::from_ymd_opt(2026, 9, 16).unwrap())
+            ),
+            "当日已跑过"
+        );
     }
 }

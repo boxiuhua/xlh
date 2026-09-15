@@ -393,6 +393,14 @@ pub fn users_with_positions(conn: &Connection) -> Result<Vec<i64>> {
     )
 }
 
+/// 持有实盘仓位的用户(监听中断告警只发给这些用户,模拟盘持仓无需线下操作)。
+pub fn users_with_real_positions(conn: &Connection) -> Result<Vec<i64>> {
+    user_ids(
+        conn,
+        "SELECT DISTINCT user_id FROM trade_positions WHERE account = 'real' ORDER BY user_id",
+    )
+}
+
 pub fn users_with_real_account(conn: &Connection) -> Result<Vec<i64>> {
     user_ids(
         conn,
@@ -676,6 +684,11 @@ mod tests {
             Some(12.5)
         );
         assert_eq!(users_with_positions(&c).unwrap(), vec![1, 2]);
+        assert_eq!(
+            users_with_real_positions(&c).unwrap(),
+            vec![1],
+            "用户 2 只有模拟盘持仓,不应计入"
+        );
         set_capital(&c, 3, Account::Real, 1000.0, at(16, 9, 0)).unwrap();
         set_capital(&c, 4, Account::Paper, 1000.0, at(16, 9, 0)).unwrap();
         assert_eq!(users_with_real_account(&c).unwrap(), vec![3]);

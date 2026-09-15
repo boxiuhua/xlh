@@ -43,6 +43,12 @@ pub fn from_toml_str(text: &str) -> Result<TradeCfg> {
             cfg.monitor_interval_secs
         ));
     }
+    if cfg.monitor_interval_secs > 3600 {
+        return Err(anyhow!(
+            "[trade] monitor_interval_secs 须 ≤ 3600,当前 {}",
+            cfg.monitor_interval_secs
+        ));
+    }
     if cfg.alert_after_secs < 60 {
         return Err(anyhow!(
             "[trade] alert_after_secs 须 ≥ 60,当前 {}",
@@ -87,6 +93,7 @@ mod tests {
     #[test]
     fn invalid_values_are_errors() {
         assert!(from_toml_str("[trade]\nmonitor_interval_secs = 1\n").is_err());
+        assert!(from_toml_str("[trade]\nmonitor_interval_secs = 3601\n").is_err());
         assert!(from_toml_str("[trade]\nalert_after_secs = 10\n").is_err());
         assert!(from_toml_str("[trade]\nenabled = \"yes\"\n").is_err());
     }

@@ -37,6 +37,69 @@ impl Notifier for PushNotifier {
     }
 }
 
+/// 待发送的推送。由监听线程解析好渠道后入队,发送线程负责网络 IO。
+pub struct NotifyJob {
+    pub user_id: i64,
+    pub channel: crate::push::config::ChannelCfg,
+    pub title: String,
+    pub md: String,
+}
+
+/// 只做授权与渠道解析(读库),把网络发送交给发送线程,避免慢 webhook 拖住止损监听。
+pub struct QueuedPushNotifier {
+    pub warn_days: i64,
+    pub grace_days: i64,
+    pub tx: std::sync::mpsc::Sender<NotifyJob>,
+}
+
+impl Notifier for QueuedPushNotifier {
+    fn notify(&self, conn: &Connection, user_id: i64, title: &str, md: &str) -> Result<()> {
+        let today = chrono::Local::now().date_naive();
+        if !crate::push::schedule::user_allowed(
+            conn,
+            user_id,
+            today,
+            self.warn_days,
+            self.grace_days,
+        ) {
+            return Ok(());
+        }
+        let Some(cfg) = crate::push::store::get(conn, user_id)? else {
+            return Ok(());
+        };
+        if cfg.channel.webhook.trim().is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(NotifyJob {
+                user_id,
+                channel: cfg.channel,
+                title: title.to_string(),
+                md: md.to_string(),
+            })
+            .map_err(|_| anyhow!("推送发送线程已退出"))
+    }
+}
+
+/// 启动独立的推送发送线程:网络 IO(含重试与超时)都在这个线程里做,
+/// 不阻塞 15 秒一轮的止盈止损监听循环。
+pub fn spawn_sender() -> std::io::Result<(
+    std::thread::JoinHandle<()>,
+    std::sync::mpsc::Sender<NotifyJob>,
+)> {
+    let (tx, rx) = std::sync::mpsc::channel::<NotifyJob>();
+    let handle = std::thread::Builder::new()
+        .name("trade-notify".into())
+        .spawn(move || {
+            for job in rx {
+                if let Err(e) = crate::push::channels::send(&job.channel, &job.title, &job.md) {
+                    eprintln!("[trade] 用户 {} 推送失败: {e:#}", job.user_id);
+                }
+            }
+        })?;
+    Ok((handle, tx))
+}
+
 pub fn side_label(side: Direction) -> &'static str {
     match side {
         Direction::Buy => "买入",
@@ -173,5 +236,41 @@ mod tests {
         .unwrap();
         assert_eq!(super::signal_reason(&c, 3).unwrap(), "触发止损");
         assert!(super::signal_reason(&c, 4).is_err());
+    }
+
+    #[test]
+    fn queued_notifier_enqueues_only_for_allowed_users_with_webhook() {
+        use super::{Notifier as _, NotifyJob, QueuedPushNotifier};
+
+        let conn = crate::web::auth::store::open_in_memory().unwrap();
+        crate::push::store::migrate(&conn).unwrap();
+        let far_future = NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
+
+        let uid = crate::web::auth::store::create_user(&conn, "u1", "hash", false).unwrap();
+        crate::web::auth::store::set_expiry(&conn, uid, far_future).unwrap();
+        let mut cfg = crate::push::config::default_config();
+        cfg.channel.webhook = "https://hook/x".into();
+        crate::push::store::upsert(&conn, uid, &cfg).unwrap();
+
+        let uid2 = crate::web::auth::store::create_user(&conn, "u2", "hash", false).unwrap();
+        crate::web::auth::store::set_expiry(&conn, uid2, far_future).unwrap();
+        let mut cfg2 = crate::push::config::default_config();
+        cfg2.channel.webhook = String::new();
+        crate::push::store::upsert(&conn, uid2, &cfg2).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel::<NotifyJob>();
+        let notifier = QueuedPushNotifier {
+            warn_days: 7,
+            grace_days: 3,
+            tx,
+        };
+        notifier.notify(&conn, uid, "标题", "正文").unwrap();
+        let job = rx.try_recv().expect("已授权且有 webhook 的用户应入队");
+        assert_eq!(job.user_id, uid);
+        assert_eq!(job.title, "标题");
+        assert_eq!(job.md, "正文");
+
+        notifier.notify(&conn, uid2, "标题2", "正文2").unwrap();
+        assert!(rx.try_recv().is_err(), "空 webhook 不应入队");
     }
 }

@@ -132,7 +132,14 @@ fn fill_reminders_are_grouped_per_user() {
 fn monitor_down_alert_goes_to_position_holders_only() {
     let c = db();
     hold(&c, 2);
+    let mut paper_only = Position::empty(1, Account::Paper, "600000");
+    paper_only.qty = 100;
+    store::upsert_position(&c, &paper_only, at(15, 15, 0)).unwrap();
     let rec = Recorder::default();
-    assert_eq!(alert_holders(&c, &rec, 3).unwrap(), 1);
+    assert_eq!(
+        alert_holders(&c, &rec, 3).unwrap(),
+        1,
+        "用户 1 只有模拟盘持仓,不应计入告警"
+    );
     assert_eq!(rec.0.borrow()[0].0, 2);
 }
