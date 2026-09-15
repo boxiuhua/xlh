@@ -89,19 +89,40 @@ impl Broker {
         Position { shares, avg_cost }
     }
 
+    /// 买入费用(按成交金额)。成交模型据此做「预算内最多买几手」。
+    pub fn buy_fee(&self, cash: f64) -> f64 {
+        self.fee.buy_fee(cash)
+    }
+
+    /// 在 `date` 可卖出的份额:只含**严格早于** `date` 买入的 lot(A 股 T+1)。
+    pub fn sellable_shares(&self, date: NaiveDate) -> f64 {
+        self.lots
+            .iter()
+            .filter(|l| l.date < date)
+            .map(|l| l.shares)
+            .sum()
+    }
+
     /// 按当日复权价 price 撮合一个订单，返回成交回报。
     pub fn execute(&mut self, order: &OrderEvent, price: f64) -> FillEvent {
         match order.direction {
             Direction::Buy => {
-                let cash = match order.qty {
-                    OrderQty::Cash(c) => c,
-                    _ => 0.0,
-                };
-                let fee = self.fee.buy_fee(cash);
-                let shares = if price > 0.0 {
-                    (cash - fee) / price
-                } else {
-                    0.0
+                let (shares, fee) = match order.qty {
+                    OrderQty::Cash(cash) => {
+                        let fee = self.fee.buy_fee(cash);
+                        let shares = if price > 0.0 {
+                            (cash - fee) / price
+                        } else {
+                            0.0
+                        };
+                        (shares, fee)
+                    }
+                    // A 股成交模型已按整手算好股数,费用按成交金额计。
+                    OrderQty::Shares(s) if s > 0.0 && price > 0.0 => {
+                        (s, self.fee.buy_fee(s * price))
+                    }
+                    // 与旧实现一致:非 Cash 买单视作 0 元买入。
+                    _ => (0.0, self.fee.buy_fee(0.0)),
                 };
                 if shares > 0.0 {
                     self.lots.push(Lot {
@@ -295,5 +316,50 @@ mod tests {
         );
         let pos = b.position();
         assert!(pos.avg_cost > 1.0 && pos.avg_cost < 2.0);
+    }
+
+    #[test]
+    fn buy_by_shares_charges_fee_on_value() {
+        let mut b = Broker::new(crate::stock::fee::StockFee::a_share());
+        let fill = b.execute(
+            &OrderEvent {
+                date: d(2024, 1, 2),
+                direction: Direction::Buy,
+                qty: OrderQty::Shares(900.0),
+            },
+            10.0,
+        );
+        assert!((fill.shares - 900.0).abs() < 1e-9);
+        // 市值 9000:佣金 2.25<5 取 5;过户 0.09 → 5.09
+        assert!((fill.fee - 5.09).abs() < 1e-9, "fee={}", fill.fee);
+        assert!((b.total_shares() - 900.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sellable_shares_excludes_same_day_lots() {
+        let mut b = Broker::new(fee_model());
+        for day in [2, 3] {
+            b.execute(
+                &OrderEvent {
+                    date: d(2024, 1, day),
+                    direction: Direction::Buy,
+                    qty: OrderQty::Cash(1000.0),
+                },
+                1.0,
+            );
+        }
+        // 每笔:费 1.5,份额 998.5
+        assert!(
+            b.sellable_shares(d(2024, 1, 2)).abs() < 1e-9,
+            "当日买入不可卖"
+        );
+        assert!((b.sellable_shares(d(2024, 1, 3)) - 998.5).abs() < 1e-9);
+        assert!((b.sellable_shares(d(2024, 1, 4)) - 1997.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn buy_fee_is_exposed() {
+        let b = Broker::new(crate::stock::fee::StockFee::a_share());
+        assert!((b.buy_fee(1000.0) - 5.01).abs() < 1e-9);
     }
 }
