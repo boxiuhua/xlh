@@ -3,5 +3,7 @@
 
 pub mod gate;
 pub mod model;
+pub mod router;
+pub mod service;
 pub mod store;
 pub mod ticket;
