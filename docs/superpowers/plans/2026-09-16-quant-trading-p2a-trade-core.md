@@ -32,6 +32,9 @@
 5. **持仓成本**含买入费用;卖出 `realized_pnl = (成交价 − 成本价) × 数量 − 卖出费用`。
 6. **T+1**:持仓记录 `last_buy_date` 与 `today_bought_qty`,可卖 = `qty − (last_buy_date == 今日 ? today_bought_qty : 0)`。
 7. **持仓校准表 `trade_position_adjusts`**、报价缓存 `trade_quotes`、策略相关表不在本计划(分别在计划 4、2b、3)。
+8. **账户范围**:`NewSignal.scope`(Both / RealOnly / PaperOnly)与准入推导出的账户取交集;止盈止损须按账户分别发信号,dedup_key 需含账户。
+9. **被拒信号可重试**:同 dedup_key 的信号若此前被闸门拒绝,再次提交会重新激活同一行并重新判定;已生成工单的信号仍返回 Duplicate。
+10. **事务**:`submit_signal` 与 `record_fill` 使用 IMMEDIATE 事务,避免 WAL 下与推送守护进程连接并发时的 BUSY_SNAPSHOT。
 
 ---
 
@@ -3003,7 +3006,7 @@ git commit -m "feat(trade): 模拟盘自动成交与信号提交全流程"
 
 ## 后续计划(不在本计划范围)
 
-- **计划 2b 运行时与信号**:`trade_quotes` 报价缓存与 trade-monitor 线程(15 秒快照、`fill_pending_paper`、`expire_due`、止盈止损与移动止盈信号、心跳、失败退避与告警)、策略 / 异动 / 手动信号接入、现有持仓导入、推送文案、9:25 / 15:05 / 次日 9:00 调度
+- **计划 2b 运行时与信号**:`trade_quotes` 报价缓存与 trade-monitor 线程(15 秒快照、`fill_pending_paper`、`expire_due`、止盈止损与移动止盈信号、心跳、失败退避与告警)、策略 / 异动 / 手动信号接入、现有持仓导入、推送文案、9:25 / 15:05 / 次日 9:00 调度、挂单占用资金(未成交买入工单预留现金)、`fill_pending_paper` 单工单错误隔离与滑点缓存、`expire_due` 覆盖模拟盘、`NewTicket.urgency`、停牌/过期报价视为无报价、模拟盘成交价基准决策
 - 计划 3 策略准入(为 `Admission` 提供真实状态)
-- 计划 4 Web `/trade` 页面、签名链接、持仓校准表、风控设置页
+- 计划 4 Web `/trade` 页面、签名链接、持仓校准表、风控设置页;另需补:按用户隔离的工单读取(`get_ticket_for_user`)、SQL 端状态过滤、部分成交重复最低佣金、输入校验(NaN / 0)
 - 计划 1 遗留且仍未吸收:T+0 ETF、`execution_for_market` 显式市场匹配、主板 ST 涨跌幅核实、`kline.rs` hfq 回退、`UnsupportedQty` 与跌停滑点封顶测试、`Broker` 买入 `Shares` 非正数保护测试 → 计划 2b 首个任务评估
