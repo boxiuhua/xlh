@@ -130,6 +130,16 @@ fn process_position(
             ..
         } => report.new_real_tickets.push(id),
         SubmitOutcome::Duplicate if p.account == Account::Real => {
+            // 过期重发同样受风控总开关与跌停约束:关闭交易时不该再挂新单;
+            // 跌停价挂卖单大概率无法成交,只会消耗当日工单额度并误导用户「已在处理」。
+            let rules = store::get_risk_rules(conn, p.user_id)?;
+            if !rules.enabled {
+                return Ok(());
+            }
+            let eps = 0.5 * 10f64.powi(-crate::stock::ashare::price_decimals(&p.code));
+            if q.limit_down.is_some_and(|d| q.price <= d + eps) {
+                return Ok(());
+            }
             // 同用户同代码同方向若已有另一张挂起的实盘卖出工单(即便所属信号不同),
             // 也不应重发——避免同一持仓同时存在多张待确认的卖出工单。
             if !ticket::has_open_ticket(conn, p.user_id, &p.code, Direction::Sell)? {
@@ -153,7 +163,7 @@ fn process_position(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trade::model::{Account, Position, TicketStatus};
+    use crate::trade::model::{Account, Position, RiskRules, TicketStatus};
     use chrono::NaiveDate;
 
     fn at(d: u32, h: u32, m: u32) -> NaiveDateTime {
@@ -237,6 +247,56 @@ mod tests {
     }
 
     #[test]
+    fn reissue_skipped_when_trading_disabled() {
+        let mut c = db_with_position(|p| p.stop_loss = Some(9.2));
+        let r1 = run_tick(&mut c, &quote(9.1, at(16, 10, 0)), at(16, 10, 0)).unwrap();
+        assert_eq!(r1.new_real_tickets.len(), 1, "首次止损应出单");
+
+        store::save_risk_rules(
+            &c,
+            1,
+            &RiskRules {
+                enabled: false,
+                ..RiskRules::default()
+            },
+            at(16, 10, 5),
+        )
+        .unwrap();
+
+        let r2 = run_tick(&mut c, &quote(9.0, at(16, 10, 31)), at(16, 10, 31)).unwrap();
+        assert_eq!(r2.expired, 1, "旧工单应正常到期");
+        assert!(
+            r2.new_real_tickets.is_empty(),
+            "总开关关闭时不应重发,{:?}",
+            r2.new_real_tickets
+        );
+    }
+
+    #[test]
+    fn reissue_skipped_at_limit_down() {
+        let mut c = db_with_position(|p| p.stop_loss = Some(9.2));
+        let r1 = run_tick(&mut c, &quote(9.1, at(16, 10, 0)), at(16, 10, 0)).unwrap();
+        assert_eq!(r1.new_real_tickets.len(), 1, "首次止损应出单");
+
+        // 10:31:旧工单到期,但现价 8.19 已触及跌停(8.19)→ 不应重发
+        let r2 = run_tick(&mut c, &quote(8.19, at(16, 10, 31)), at(16, 10, 31)).unwrap();
+        assert_eq!(r2.expired, 1);
+        assert!(
+            r2.new_real_tickets.is_empty(),
+            "跌停时不应重发,{:?}",
+            r2.new_real_tickets
+        );
+
+        // 10:32:价格回到跌停价之上 → 应正常重发,urgency 递增
+        let r3 = run_tick(&mut c, &quote(8.5, at(16, 10, 32)), at(16, 10, 32)).unwrap();
+        assert_eq!(r3.new_real_tickets.len(), 1, "脱离跌停后应重发");
+        let t = ticket::get_ticket(&c, r3.new_real_tickets[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.urgency, 1);
+    }
+
+    #[test]
     fn trailing_high_is_recorded_then_triggers() {
         let mut c = db_with_position(|p| p.trailing_pct = Some(0.05));
         let r1 = run_tick(&mut c, &quote(12.0, at(16, 10, 0)), at(16, 10, 0)).unwrap();
@@ -312,6 +372,31 @@ mod tests {
             "止损工单 B 仍挂起,移动止盈不应重发"
         );
         assert!(r4.errors.is_empty(), "{:?}", r4.errors);
+    }
+
+    #[test]
+    fn same_code_real_and_paper_exit_independently() {
+        let mut c = Connection::open_in_memory().unwrap();
+        store::migrate(&c).unwrap();
+        store::set_capital(&c, 1, Account::Real, 100_000.0, at(15, 9, 0)).unwrap();
+        for account in [Account::Real, Account::Paper] {
+            let mut p = Position::empty(1, account, "600000");
+            p.qty = 1000;
+            p.avg_cost = 10.0;
+            p.stop_loss = Some(9.2);
+            p.last_buy_date = Some(NaiveDate::from_ymd_opt(2026, 9, 15).unwrap());
+            store::upsert_position(&c, &p, at(15, 15, 0)).unwrap();
+        }
+
+        let r = run_tick(&mut c, &quote(9.1, at(16, 10, 0)), at(16, 10, 0)).unwrap();
+        assert_eq!(r.new_real_tickets.len(), 1, "实盘应挂起待确认工单");
+        assert!(
+            store::get_position(&c, 1, Account::Paper, "600000")
+                .unwrap()
+                .is_none(),
+            "模拟盘应已即时撮合清仓"
+        );
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
     }
 
     #[test]
