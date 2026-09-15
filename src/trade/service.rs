@@ -56,6 +56,8 @@ pub fn submit_signal(
     let last_signal_at = ticket::last_signal_at(&tx, sig.user_id, &sig.code, sig.side, signal_id)?;
     let tickets_today = ticket::count_real_tickets_on(&tx, sig.user_id, now.date())?;
     let realized_pnl_today = ticket::realized_pnl_on(&tx, sig.user_id, Account::Real, now.date())?;
+    let real_reserved_cash = ticket::reserved_cash(&tx, sig.user_id, Account::Real)?;
+    let paper_reserved_cash = ticket::reserved_cash(&tx, sig.user_id, Account::Paper)?;
 
     let decision = gate::evaluate(&GateInput {
         signal: sig,
@@ -66,6 +68,8 @@ pub fn submit_signal(
         paper_account: paper_account.as_ref(),
         real_position: real_position.as_ref(),
         paper_position: paper_position.as_ref(),
+        real_reserved_cash,
+        paper_reserved_cash,
         has_open_ticket,
         last_signal_at,
         tickets_today,
@@ -103,6 +107,7 @@ pub fn submit_signal(
                 expires_at,
                 deviation_th: rules.deviation_th,
                 status,
+                urgency: 0,
                 created_at: now,
             },
         )?;

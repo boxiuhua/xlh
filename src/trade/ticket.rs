@@ -2,6 +2,7 @@
 
 use crate::broker::Fee;
 use crate::event::Direction;
+use crate::stock::ashare::price_decimals;
 use crate::stock::fee::StockFee;
 use crate::trade::model::{
     fmt_ts, parse_side, parse_ts, side_str, Account, NewSignal, Position, SignalSource, Ticket,
@@ -30,6 +31,7 @@ pub struct NewTicket {
     pub expires_at: NaiveDateTime,
     pub deviation_th: f64,
     pub status: TicketStatus,
+    pub urgency: i64,
     pub created_at: NaiveDateTime,
 }
 
@@ -177,11 +179,22 @@ pub fn realized_pnl_on(
     )?)
 }
 
+/// 未完结买入工单占用的资金:Σ 建议价 × 未成交数量。
+pub fn reserved_cash(conn: &Connection, user_id: i64, account: Account) -> Result<f64> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(SUM(suggest_price * (qty - filled_qty)), 0.0) FROM trade_tickets
+         WHERE user_id = ?1 AND account = ?2 AND side = 'buy'
+           AND status IN ('pending', 'confirmed', 'partial')",
+        params![user_id, account.as_str()],
+        |r| r.get(0),
+    )?)
+}
+
 pub fn create_ticket(conn: &Connection, t: &NewTicket) -> Result<i64> {
     conn.execute(
         "INSERT INTO trade_tickets (user_id, signal_id, account, code, side, suggest_price, qty,
            filled_qty, expires_at, deviation_th, status, urgency, created_at, confirmed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, 0, ?11, ?12)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             t.user_id,
             t.signal_id,
@@ -193,6 +206,7 @@ pub fn create_ticket(conn: &Connection, t: &NewTicket) -> Result<i64> {
             fmt_ts(t.expires_at),
             t.deviation_th,
             t.status.as_str(),
+            t.urgency,
             fmt_ts(t.created_at),
             (t.status == TicketStatus::Confirmed).then(|| fmt_ts(t.created_at)),
         ],
@@ -311,6 +325,77 @@ pub fn list_open_paper(conn: &Connection) -> Result<Vec<Ticket>> {
     )
 }
 
+/// 全体用户已确认但未完全回填的实盘工单(15:05 提醒用)。
+pub fn list_unfilled_real(conn: &Connection) -> Result<Vec<Ticket>> {
+    query_tickets(
+        conn,
+        "account = 'real' AND status IN ('confirmed', 'partial')",
+        params![],
+    )
+}
+
+/// 止盈止损工单过期而条件仍成立:基于同一信号新建实盘工单,urgency + 1。
+/// 仅当该信号最近一张实盘工单为 expired 时重发(用户忽略、已成交、仍待确认均不重发)。
+pub fn reissue_expired_exit(
+    conn: &Connection,
+    user_id: i64,
+    dedup_key: &str,
+    qty: u64,
+    price: f64,
+    now: NaiveDateTime,
+) -> Result<Option<i64>> {
+    if qty == 0 {
+        return Ok(None);
+    }
+    let signal_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM trade_signals
+             WHERE user_id = ?1 AND dedup_key = ?2 AND source = 'exit' AND status = 'ticketed'",
+            params![user_id, dedup_key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(signal_id) = signal_id else {
+        return Ok(None);
+    };
+    let last_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM trade_tickets WHERE signal_id = ?1 AND account = 'real'
+             ORDER BY id DESC LIMIT 1",
+            [signal_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(last) = last_id
+        .map(|id| get_ticket(conn, id))
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    if last.status != TicketStatus::Expired {
+        return Ok(None);
+    }
+    let id = create_ticket(
+        conn,
+        &NewTicket {
+            user_id,
+            signal_id,
+            account: Account::Real,
+            code: last.code.clone(),
+            side: last.side,
+            suggest_price: price,
+            qty,
+            expires_at: default_expiry(SignalSource::Exit, now),
+            deviation_th: last.deviation_th,
+            status: TicketStatus::Pending,
+            urgency: last.urgency + 1,
+            created_at: now,
+        },
+    )?;
+    Ok(Some(id))
+}
+
 pub fn confirm(conn: &Connection, user_id: i64, id: i64, now: NaiveDateTime) -> Result<Transition> {
     let n = conn.execute(
         "UPDATE trade_tickets SET status = 'confirmed', confirmed_at = ?1
@@ -337,9 +422,13 @@ pub fn ignore(conn: &Connection, user_id: i64, id: i64, reason: &str) -> Result<
     })
 }
 
+/// 过期:实盘待确认、模拟盘待成交(模拟盘同样受有效期约束)。
 pub fn expire_due(conn: &Connection, now: NaiveDateTime) -> Result<usize> {
     Ok(conn.execute(
-        "UPDATE trade_tickets SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?1",
+        "UPDATE trade_tickets SET status = 'expired'
+         WHERE expires_at <= ?1
+           AND ((account = 'real' AND status = 'pending')
+             OR (account = 'paper' AND status IN ('confirmed', 'partial')))",
         [fmt_ts(now)],
     )?)
 }
@@ -352,8 +441,9 @@ pub fn cancel_unfilled(conn: &Connection, created_before: NaiveDateTime) -> Resu
     )?)
 }
 
-fn round2(x: f64) -> f64 {
-    (x * 100.0).round() / 100.0
+fn round_dec(x: f64, decimals: i32) -> f64 {
+    let m = 10f64.powi(decimals);
+    (x * m).round() / m
 }
 
 /// 回填一笔成交:校验 → 更新持仓 / 资金 → 写成交 → 推进工单状态。单事务。
@@ -403,8 +493,15 @@ pub fn record_fill(
             p.last_buy_date = Some(today);
             p.qty = new_qty;
             if was_empty {
-                p.stop_loss = Some(round2(price * (1.0 - rules.default_stop_loss_pct)));
-                p.take_profit = Some(round2(price * (1.0 + rules.default_take_profit_pct)));
+                let decimals = price_decimals(&t.code);
+                p.stop_loss = Some(round_dec(
+                    price * (1.0 - rules.default_stop_loss_pct),
+                    decimals,
+                ));
+                p.take_profit = Some(round_dec(
+                    price * (1.0 + rules.default_take_profit_pct),
+                    decimals,
+                ));
                 p.trailing_high = None;
             }
             (fee, None, p, -(value + fee))
@@ -524,10 +621,36 @@ mod tests {
                 expires_at: now + chrono::Duration::minutes(30),
                 deviation_th: 0.015,
                 status,
+                urgency: 0,
                 created_at: now,
             },
         )
         .unwrap()
+    }
+
+    fn new_ticket(
+        signal_id: i64,
+        account: Account,
+        code: &str,
+        side: Direction,
+        qty: u64,
+        status: TicketStatus,
+        now: NaiveDateTime,
+    ) -> NewTicket {
+        NewTicket {
+            user_id: 1,
+            signal_id,
+            account,
+            code: code.into(),
+            side,
+            suggest_price: 10.0,
+            qty,
+            expires_at: now + chrono::Duration::minutes(30),
+            deviation_th: 0.015,
+            status,
+            urgency: 0,
+            created_at: now,
+        }
     }
 
     #[test]
@@ -837,5 +960,161 @@ mod tests {
             "cash={}",
             a.available_cash
         );
+    }
+
+    #[test]
+    fn expire_due_covers_open_paper_tickets_but_not_confirmed_real() {
+        let c = db();
+        let sid = insert_signal(&c, &signal("exp-paper", Direction::Buy), at(15, 10, 0))
+            .unwrap()
+            .unwrap();
+        let paper = create_ticket(
+            &c,
+            &new_ticket(
+                sid,
+                Account::Paper,
+                "600000",
+                Direction::Buy,
+                100,
+                TicketStatus::Confirmed,
+                at(15, 10, 0),
+            ),
+        )
+        .unwrap();
+        let real = ticket(
+            &c,
+            Direction::Buy,
+            100,
+            TicketStatus::Confirmed,
+            at(15, 10, 1),
+        );
+        assert_eq!(expire_due(&c, at(15, 10, 40)).unwrap(), 1);
+        assert_eq!(
+            get_ticket(&c, paper).unwrap().unwrap().status,
+            TicketStatus::Expired
+        );
+        assert_eq!(
+            get_ticket(&c, real).unwrap().unwrap().status,
+            TicketStatus::Confirmed
+        );
+        let unfilled = list_unfilled_real(&c).unwrap();
+        assert_eq!(
+            unfilled.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![real]
+        );
+    }
+
+    #[test]
+    fn reserved_cash_counts_unfilled_part_of_open_buy_tickets() {
+        let mut c = db();
+        let b = ticket(
+            &c,
+            Direction::Buy,
+            1000,
+            TicketStatus::Pending,
+            at(15, 10, 0),
+        );
+        ticket(
+            &c,
+            Direction::Sell,
+            500,
+            TicketStatus::Pending,
+            at(15, 10, 1),
+        );
+        assert!((reserved_cash(&c, 1, Account::Real).unwrap() - 10_000.0).abs() < 1e-9);
+        assert_eq!(
+            confirm(&c, 1, b, at(15, 10, 2)).unwrap(),
+            Transition::Applied
+        );
+        record_fill(&mut c, 1, b, 10.0, 400, "manual", at(15, 10, 3)).unwrap();
+        assert!((reserved_cash(&c, 1, Account::Real).unwrap() - 6_000.0).abs() < 1e-9);
+        assert!(reserved_cash(&c, 1, Account::Paper).unwrap().abs() < 1e-12);
+        assert!(reserved_cash(&c, 2, Account::Real).unwrap().abs() < 1e-12);
+    }
+
+    #[test]
+    fn reissue_expired_exit_bumps_urgency_once_per_expiry() {
+        let c = db();
+        let key = "exit-real-600000-stop-2026-09-15";
+        let mut s = signal(key, Direction::Sell);
+        s.source = SignalSource::Exit;
+        let sid = insert_signal(&c, &s, at(15, 10, 0)).unwrap().unwrap();
+        mark_signal(&c, sid, "ticketed", None).unwrap();
+        let first = create_ticket(
+            &c,
+            &new_ticket(
+                sid,
+                Account::Real,
+                "600000",
+                Direction::Sell,
+                1000,
+                TicketStatus::Pending,
+                at(15, 10, 0),
+            ),
+        )
+        .unwrap();
+        assert!(
+            reissue_expired_exit(&c, 1, key, 1000, 9.1, at(15, 10, 20))
+                .unwrap()
+                .is_none(),
+            "未过期不重发"
+        );
+        assert_eq!(expire_due(&c, at(15, 10, 30)).unwrap(), 1);
+        let second = reissue_expired_exit(&c, 1, key, 1000, 9.1, at(15, 10, 31))
+            .unwrap()
+            .unwrap();
+        assert_ne!(second, first);
+        let t = get_ticket(&c, second).unwrap().unwrap();
+        assert_eq!(
+            (t.signal_id, t.urgency, t.qty, t.status),
+            (sid, 1, 1000, TicketStatus::Pending)
+        );
+        assert_eq!(t.expires_at, at(15, 11, 1));
+        assert!((t.suggest_price - 9.1).abs() < 1e-9);
+        assert!(
+            reissue_expired_exit(&c, 1, key, 1000, 9.1, at(15, 10, 32))
+                .unwrap()
+                .is_none(),
+            "已有待确认工单"
+        );
+        assert!(
+            reissue_expired_exit(&c, 2, key, 1000, 9.1, at(15, 11, 40))
+                .unwrap()
+                .is_none(),
+            "他人信号"
+        );
+
+        assert_eq!(ignore(&c, 1, second, "不卖").unwrap(), Transition::Applied);
+        assert!(
+            reissue_expired_exit(&c, 1, key, 1000, 9.1, at(15, 11, 40))
+                .unwrap()
+                .is_none(),
+            "用户忽略不重发"
+        );
+    }
+
+    #[test]
+    fn default_exit_levels_round_to_price_tick() {
+        let mut c = db();
+        let sid = insert_signal(&c, &signal("etf-buy", Direction::Buy), at(15, 10, 0))
+            .unwrap()
+            .unwrap();
+        let mut nt = new_ticket(
+            sid,
+            Account::Real,
+            "510300",
+            Direction::Buy,
+            1000,
+            TicketStatus::Confirmed,
+            at(15, 10, 0),
+        );
+        nt.suggest_price = 3.456;
+        let id = create_ticket(&c, &nt).unwrap();
+        record_fill(&mut c, 1, id, 3.456, 1000, "manual", at(15, 10, 1)).unwrap();
+        let p = store::get_position(&c, 1, Account::Real, "510300")
+            .unwrap()
+            .unwrap();
+        // 3.456 × 0.92 = 3.17952 → 3.180;3.456 × 1.2 = 4.1472 → 4.147
+        assert_eq!((p.stop_loss, p.take_profit), (Some(3.18), Some(4.147)));
     }
 }

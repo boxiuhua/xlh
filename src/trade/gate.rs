@@ -70,6 +70,10 @@ pub struct GateInput<'a> {
     pub paper_account: Option<&'a AccountState>,
     pub real_position: Option<&'a Position>,
     pub paper_position: Option<&'a Position>,
+    /// 实盘未完结买入工单占用资金
+    pub real_reserved_cash: f64,
+    /// 模拟盘未完结买入工单占用资金
+    pub paper_reserved_cash: f64,
     /// 同用户同代码同方向是否已有未完结实盘工单
     pub has_open_ticket: bool,
     /// 同代码同方向最近一次成功生成工单的信号时间(冷却用)
@@ -153,12 +157,16 @@ pub fn evaluate(inp: &GateInput) -> GateDecision {
     let today = inp.now.date();
     let mut plans = Vec::with_capacity(accounts.len());
     for (i, account) in accounts.iter().copied().enumerate() {
-        let (acc, pos) = match account {
-            Account::Real => (inp.real_account, inp.real_position),
-            Account::Paper => (inp.paper_account, inp.paper_position),
+        let (acc, pos, reserved) = match account {
+            Account::Real => (inp.real_account, inp.real_position, inp.real_reserved_cash),
+            Account::Paper => (
+                inp.paper_account,
+                inp.paper_position,
+                inp.paper_reserved_cash,
+            ),
         };
         let sized = match s.side {
-            Direction::Buy => size_buy_for(s, q, rules, acc, pos),
+            Direction::Buy => size_buy_for(s, q, rules, acc, pos, reserved),
             Direction::Sell => size_sell_for(s, pos, today),
         };
         match sized {
@@ -180,13 +188,14 @@ fn size_buy_for(
     rules: &RiskRules,
     acc: Option<&AccountState>,
     pos: Option<&Position>,
+    reserved: f64,
 ) -> Result<u64, GateReject> {
     let acc = acc.ok_or(GateReject::NoCapital)?;
     let held_value = pos.map_or(0.0, |p| p.qty as f64 * q.price);
     let budget = [
         s.suggest_cash.unwrap_or(rules.max_order_amount),
         rules.max_order_amount,
-        acc.available_cash,
+        acc.available_cash - reserved,
         acc.total_capital * rules.max_position_pct - held_value,
     ]
     .into_iter()
@@ -265,6 +274,8 @@ mod tests {
         last: Option<NaiveDateTime>,
         tickets_today: u32,
         pnl: f64,
+        real_reserved: f64,
+        paper_reserved: f64,
     }
 
     fn account(a: Account, total: f64) -> AccountState {
@@ -320,6 +331,8 @@ mod tests {
                 last: None,
                 tickets_today: 0,
                 pnl: 0.0,
+                real_reserved: 0.0,
+                paper_reserved: 0.0,
             }
         }
 
@@ -345,6 +358,8 @@ mod tests {
                 last_signal_at: self.last,
                 tickets_today: self.tickets_today,
                 realized_pnl_today: self.pnl,
+                real_reserved_cash: self.real_reserved,
+                paper_reserved_cash: self.paper_reserved,
                 now: now(),
             })
         }
@@ -542,6 +557,17 @@ mod tests {
         assert_eq!(size_buy("600000", 10.0, 0.0, 1005.01), 100);
         assert_eq!(size_buy("688001", 10.0, 0.0, 3000.0), 299);
         assert_eq!(size_buy("600000", 10.0, 0.0, -1.0), 0);
+    }
+
+    #[test]
+    fn open_buy_tickets_reserve_cash_per_account() {
+        // 实盘预留 90000 → 预算 min(50000, 50000, 10000, 20000) = 10000 → 执行价 10.01 → 900 股
+        let mut f = Fx::buy(SignalSource::Manual);
+        f.real_reserved = 90_000.0;
+        assert_eq!(
+            plans(f.run()),
+            vec![plan(Account::Real, 900), plan(Account::Paper, 1900)]
+        );
     }
 
     #[test]

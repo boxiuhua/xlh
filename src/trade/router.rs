@@ -151,6 +151,7 @@ mod tests {
                 expires_at: now + chrono::Duration::minutes(30),
                 deviation_th: 0.015,
                 status: TicketStatus::Confirmed,
+                urgency: 0,
                 created_at: now,
             },
         )
