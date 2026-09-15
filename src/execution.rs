@@ -56,7 +56,8 @@ pub struct RejectedOrder {
     pub reason: RejectReason,
 }
 
-pub trait ExecutionModel {
+/// 需 Send:后台评估线程会持有成交模型。
+pub trait ExecutionModel: Send {
     /// 口径名称,输出到回测结果供页面展示。
     fn name(&self) -> &'static str;
 
@@ -123,5 +124,11 @@ mod tests {
     fn reject_reason_serializes_snake_case() {
         let j = serde_json::to_string(&RejectReason::BelowOneLot).unwrap();
         assert_eq!(j, "\"below_one_lot\"");
+    }
+
+    #[test]
+    fn execution_models_are_send() {
+        fn assert_send<T: Send + ?Sized>() {}
+        assert_send::<Box<dyn ExecutionModel>>();
     }
 }

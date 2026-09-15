@@ -20,7 +20,7 @@ fn is_bse(code: &str) -> bool {
 }
 
 fn is_etf(code: &str) -> bool {
-    ["51", "52", "56", "58", "15", "16", "18"]
+    ["50", "51", "52", "56", "58", "15", "16", "18"]
         .iter()
         .any(|p| code.starts_with(p))
 }
@@ -117,6 +117,52 @@ pub fn step_down(n: u64, lot: BuyLot) -> u64 {
     }
 }
 
+/// 按最小价位取整,方向对交易者不利(保守):买入向上、卖出向下。
+pub fn round_price_to_tick(price: f64, decimals: i32, side: Direction) -> f64 {
+    let m = 10f64.powi(decimals);
+    match side {
+        Direction::Buy => ((price * m) - 1e-6).ceil() / m,
+        Direction::Sell => ((price * m) + 1e-6).floor() / m,
+    }
+}
+
+/// 含滑点的成交价:买 ×(1+s)、卖 ×(1−s),按最小价位取整,且不越过涨跌停价。
+/// 无涨跌停限制时传 `f64::INFINITY` / `0.0`。
+pub fn slipped_price(
+    side: Direction,
+    price: f64,
+    slippage: f64,
+    decimals: i32,
+    limit_up: f64,
+    limit_down: f64,
+) -> f64 {
+    match side {
+        Direction::Buy => {
+            round_price_to_tick(price * (1.0 + slippage), decimals, Direction::Buy).min(limit_up)
+        }
+        Direction::Sell => {
+            round_price_to_tick(price * (1.0 - slippage), decimals, Direction::Sell).max(limit_down)
+        }
+    }
+}
+
+/// 卖出股数:想卖 ≥ 可卖 → 全部可卖(允许零股);否则按步长向下取整;
+/// 科创板部分卖出不得少于 200 股。
+pub fn sell_qty(code: &str, want: u64, sellable: u64) -> u64 {
+    if sellable == 0 || want == 0 {
+        return 0;
+    }
+    if want >= sellable {
+        return sellable;
+    }
+    let lot = buy_lot(code);
+    let n = want / lot.step * lot.step;
+    if is_star(code) && n < lot.min {
+        return 0;
+    }
+    n
+}
+
 /// A 股成交口径:T 日开盘价 ± 滑点(不越过涨跌停价)、整手、开盘涨停不买/跌停不卖、T+1。
 ///
 /// 涨跌停与整手按**不复权**价计算;交给 Broker 的价格与份额换算回复权尺度,
@@ -171,7 +217,14 @@ impl ExecutionModel for AShareExecution {
                 let OrderQty::Cash(budget) = order.qty else {
                     return Err(RejectReason::UnsupportedQty);
                 };
-                let raw_price = (bar.open * (1.0 + self.slippage)).min(up);
+                let raw_price = slipped_price(
+                    Direction::Buy,
+                    bar.open,
+                    self.slippage,
+                    self.decimals,
+                    up,
+                    down,
+                );
                 let mut n = round_buy_shares(budget / raw_price, self.lot);
                 while n > 0 {
                     let value = n as f64 * raw_price;
@@ -216,7 +269,14 @@ impl ExecutionModel for AShareExecution {
                     }
                     raw_n as f64 / factor
                 };
-                let raw_price = (bar.open * (1.0 - self.slippage)).max(down);
+                let raw_price = slipped_price(
+                    Direction::Sell,
+                    bar.open,
+                    self.slippage,
+                    self.decimals,
+                    up,
+                    down,
+                );
                 Ok(Prepared {
                     order: OrderEvent {
                         date: order.date,
@@ -670,7 +730,7 @@ mod tests {
         let t = &e.trades()[0];
         assert_eq!(t.date, d(2024, 3, 1));
         assert!(close(t.shares, 900.0), "shares={}", t.shares);
-        assert!(close(t.price, 11.011), "price={}", t.price);
+        assert!(close(t.price, 11.02), "price={}", t.price);
     }
 
     #[test]
@@ -756,5 +816,60 @@ mod tests {
         assert_eq!(step_down(100, main), 0);
         assert_eq!(step_down(201, star), 200);
         assert_eq!(step_down(200, star), 0);
+    }
+
+    #[test]
+    fn round_price_to_tick_is_adverse_to_trader() {
+        assert!(close(round_price_to_tick(11.011, 2, Direction::Buy), 11.02));
+        assert!(close(
+            round_price_to_tick(11.011, 2, Direction::Sell),
+            11.01
+        ));
+        assert!(close(
+            round_price_to_tick(10.0 * 1.001, 2, Direction::Buy),
+            10.01
+        ));
+        assert!(close(
+            round_price_to_tick(10.0 * 0.999, 2, Direction::Sell),
+            9.99
+        ));
+        assert!(close(round_price_to_tick(3.4561, 3, Direction::Buy), 3.457));
+    }
+
+    #[test]
+    fn slipped_price_respects_limits() {
+        assert!(close(
+            slipped_price(Direction::Buy, 10.9, 0.05, 2, 11.0, 9.0),
+            11.0
+        ));
+        assert!(close(
+            slipped_price(Direction::Sell, 9.1, 0.05, 2, 11.0, 9.0),
+            9.0
+        ));
+        assert!(close(
+            slipped_price(Direction::Buy, 10.0, 0.001, 2, f64::INFINITY, 0.0),
+            10.01
+        ));
+    }
+
+    #[test]
+    fn sell_qty_by_board() {
+        assert_eq!(sell_qty("600000", 250, 1050), 200);
+        assert_eq!(sell_qty("600000", 50, 1050), 0);
+        assert_eq!(
+            sell_qty("600000", 2000, 1050),
+            1050,
+            "超出可卖 → 全部可卖(允许零股)"
+        );
+        assert_eq!(sell_qty("600000", 1050, 1050), 1050);
+        assert_eq!(sell_qty("688001", 150, 300), 0, "科创板部分卖出不足 200 股");
+        assert_eq!(sell_qty("688001", 250, 300), 250);
+        assert_eq!(sell_qty("688001", 150, 150), 150, "清仓允许不足 200 股");
+        assert_eq!(sell_qty("600000", 100, 0), 0);
+    }
+
+    #[test]
+    fn lof_prefix_50_uses_three_decimals() {
+        assert_eq!(price_decimals("501018"), 3);
     }
 }
