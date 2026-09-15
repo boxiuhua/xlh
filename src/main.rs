@@ -126,10 +126,33 @@ fn main() -> Result<()> {
             xlh::push::store::migrate(&conn)?;
             xlh::trade::store::migrate(&conn)?;
             xlh::push::store::migrate_legacy_push(&conn, std::path::Path::new("push.toml")).ok();
+            let trade_enabled = match xlh::trade::config::init(&cli.config) {
+                Ok(c) => c.enabled,
+                Err(e) => {
+                    eprintln!("⚠ [trade] 配置无效,交易监听未启用:{e}");
+                    false
+                }
+            };
             if once {
                 xlh::push::run_all_once(&conn, auth_cfg.warn_days, auth_cfg.grace_days)
             } else {
-                xlh::push::run_multi_daemon(&conn, auth_cfg.warn_days, auth_cfg.grace_days)
+                let sink = if trade_enabled {
+                    match xlh::trade::daemon::spawn(
+                        auth_cfg.db_path.clone(),
+                        xlh::trade::config::get().clone(),
+                        auth_cfg.warn_days,
+                        auth_cfg.grace_days,
+                    ) {
+                        Ok((_handle, sink)) => Some(sink),
+                        Err(e) => {
+                            eprintln!("⚠ [trade] 交易监听线程启动失败:{e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                xlh::push::run_multi_daemon(&conn, auth_cfg.warn_days, auth_cfg.grace_days, sink)
             }
         }
         Some(Commands::Admin { action }) => match action {

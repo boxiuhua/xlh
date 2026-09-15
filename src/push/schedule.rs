@@ -61,7 +61,12 @@ pub(crate) fn user_allowed(
 /// 每轮也写一次心跳。这不是锦上添花：推送守护是**独立进程**（可选的 xlh-push 容器），
 /// 没启动时 Web 上一切看着正常（配置能存、提示「已保存」），却永远不会推送。
 /// 心跳让 Web 能明确告诉用户「守护没在跑」，把这个静默失败变成可见的。
-pub fn run_multi(conn: &Connection, warn: i64, grace: i64) -> Result<()> {
+pub fn run_multi(
+    conn: &Connection,
+    warn: i64,
+    grace: i64,
+    trade: Option<crate::trade::daemon::MoverSink>,
+) -> Result<()> {
     println!("多用户推送守护已启动（Ctrl+C 退出）");
     // 启动即先跳一次，别让 Web 在头 60 秒里误报「未运行」
     if let Err(e) = super::store::beat(conn) {
@@ -99,7 +104,7 @@ pub fn run_multi(conn: &Connection, warn: i64, grace: i64) -> Result<()> {
         // 实时抓取失败绝不能拖垮既有的推送守护 —— 那是已上线、用户依赖的功能，
         // 而实时抓取是新增的、可选的。任何错误只记日志。
         if let Some((d, rc)) = rt.as_mut() {
-            if let Err(e) = realtime_tick(d, rc, conn, now, warn, grace) {
+            if let Err(e) = realtime_tick(d, rc, conn, now, warn, grace, trade.as_ref()) {
                 eprintln!("实时抓取本轮失败：{e}");
             }
         }
@@ -131,6 +136,7 @@ fn realtime_init() -> Option<(crate::stock::realtime::job::Daemon, Connection)> 
 }
 
 /// 一轮实时抓取 + 推送 + 收盘汇总。
+#[allow(clippy::too_many_arguments)]
 fn realtime_tick(
     d: &mut crate::stock::realtime::job::Daemon,
     rc: &mut Connection,
@@ -138,6 +144,7 @@ fn realtime_tick(
     now: DateTime<Local>,
     warn: i64,
     grace: i64,
+    trade: Option<&crate::trade::daemon::MoverSink>,
 ) -> Result<()> {
     use crate::stock::realtime::job;
 
@@ -159,6 +166,9 @@ fn realtime_tick(
     let Some(out) = d.tick(rc, naive)? else {
         return Ok(());
     };
+    if let Some(sink) = trade {
+        sink.send(out.movers.clone());
+    }
     println!(
         "[{}] 快照 {} 条，涨跌停 {} 只，异动 {} 只，推送 {} 只{}",
         naive.format("%H:%M"),
