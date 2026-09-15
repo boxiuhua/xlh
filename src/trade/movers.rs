@@ -14,6 +14,8 @@ use rusqlite::Connection;
 pub struct MoverReport {
     pub signals: usize,
     pub ticketed: usize,
+    /// 命中订阅但无今日新鲜报价而被跳过的异动数(不计入 signals)。
+    pub no_quote: usize,
     pub errors: Vec<String>,
 }
 
@@ -46,6 +48,30 @@ pub fn mover_signal(user_id: i64, m: &Mover, side: Direction) -> NewSignal {
         suggest_cash: None,
         suggest_qty: None,
     }
+}
+
+/// 为异动代码拉取实时报价并写入缓存(只保留今日时间戳),返回写入条数。
+///
+/// 异动信号需要涨跌停价才能在闸门正确判定「已涨停不追买/已跌停不追卖」;
+/// 异动榜自身的 `Mover.price` 只是触发时刻的快照价,不带涨跌停信息。
+pub fn refresh_mover_quotes(
+    conn: &Connection,
+    source: &dyn crate::trade::quotes::QuoteSource,
+    movers: &[Mover],
+    now: NaiveDateTime,
+) -> Result<usize> {
+    let mut codes: Vec<String> = movers.iter().map(|m| m.code.clone()).collect();
+    codes.sort();
+    codes.dedup();
+    if codes.is_empty() {
+        return Ok(0);
+    }
+    let fresh: Vec<Quote> = source
+        .fetch(&codes)?
+        .into_iter()
+        .filter(|q| q.ts.date() == now.date())
+        .collect();
+    store::upsert_quotes(conn, &fresh, now)
 }
 
 pub fn submit_mover_signals(
@@ -94,13 +120,13 @@ fn process_user(
             }
             TradeAction::Hold => continue,
         };
-        let quote = store::fresh_quote(conn, &m.code, now, 60)?.unwrap_or(Quote {
-            code: m.code.clone(),
-            price: m.price,
-            limit_up: None,
-            limit_down: None,
-            ts: m.ts,
-        });
+        // 无今日新鲜报价(未进异动扫描的报价缓存,或已陈旧)就没有可靠的涨跌停价,
+        // 宁可跳过也不能像旧实现那样拿 Mover 快照价拼一个 limit_up/down 皆为 None
+        // 的假报价——那会让涨跌停判定形同虚设。
+        let Some(quote) = store::fresh_quote(conn, &m.code, now, 60)? else {
+            report.no_quote += 1;
+            continue;
+        };
         let sig = mover_signal(uid, m, side);
         report.signals += 1;
         let ctx = SubmitContext {
@@ -120,6 +146,7 @@ mod tests {
     use super::*;
     use crate::stock::realtime::movers::{Baseline, Divergence, Horizon};
     use crate::trade::model::{Account, Position};
+    use crate::trade::quotes::QuoteSource;
     use crate::trade::ticket;
     use chrono::NaiveDate;
 
@@ -128,6 +155,37 @@ mod tests {
             .unwrap()
             .and_hms_opt(h, m, 0)
             .unwrap()
+    }
+
+    /// 直接写入报价缓存,绕开真实报价源:测试只关心 submit_mover_signals /
+    /// refresh_mover_quotes 各自的行为,不关心报价从哪来。
+    fn cache_quote(
+        c: &Connection,
+        code: &str,
+        price: f64,
+        limit_up: Option<f64>,
+        now: NaiveDateTime,
+    ) {
+        store::upsert_quotes(
+            c,
+            &[Quote {
+                code: code.into(),
+                price,
+                limit_up,
+                limit_down: None,
+                ts: now,
+            }],
+            now,
+        )
+        .unwrap();
+    }
+
+    struct StubSource(Vec<Quote>);
+
+    impl QuoteSource for StubSource {
+        fn fetch(&self, _codes: &[String]) -> Result<Vec<Quote>> {
+            Ok(self.0.clone())
+        }
     }
 
     fn mover(code: &str, divergence: Divergence) -> Mover {
@@ -164,6 +222,7 @@ mod tests {
     #[test]
     fn buy_mover_in_watchlist_becomes_paper_only_ticket() {
         let mut c = db(&["600000"]);
+        cache_quote(&c, "600000", 10.0, None, at(10, 31));
         let r = submit_mover_signals(
             &mut c,
             &[
@@ -205,6 +264,7 @@ mod tests {
         p.avg_cost = 9.0;
         p.last_buy_date = Some(NaiveDate::from_ymd_opt(2026, 9, 15).unwrap());
         store::upsert_position(&c, &p, at(9, 0)).unwrap();
+        cache_quote(&c, "600000", 10.0, None, at(10, 31));
         let r = submit_mover_signals(
             &mut c,
             &[mover("600000", Divergence::RetailChasing)],
@@ -228,6 +288,7 @@ mod tests {
             [],
         )
         .unwrap();
+        cache_quote(&c, "600000", 10.0, None, at(10, 31));
 
         let r = submit_mover_signals(
             &mut c,
@@ -267,5 +328,76 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.signals, 0, "空名单不生成交易信号");
+    }
+
+    #[test]
+    fn mover_without_fresh_quote_is_skipped() {
+        let mut c = db(&["600000"]);
+        // 未调用 refresh_mover_quotes / cache_quote,缓存中无该代码的今日报价。
+        let r = submit_mover_signals(
+            &mut c,
+            &[mover("600000", Divergence::MainAccumulating)],
+            at(10, 31),
+        )
+        .unwrap();
+        assert_eq!((r.signals, r.no_quote), (0, 1), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn mover_buy_at_limit_up_is_rejected() {
+        let mut c = db(&["600000"]);
+        cache_quote(&c, "600000", 11.0, Some(11.0), at(10, 31));
+        let r = submit_mover_signals(
+            &mut c,
+            &[mover("600000", Divergence::MainAccumulating)],
+            at(10, 31),
+        )
+        .unwrap();
+        assert_eq!(
+            (r.signals, r.ticketed, r.no_quote),
+            (1, 0, 0),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn refresh_mover_quotes_caches_today_only() {
+        let c = db(&["600000"]);
+        let today = at(10, 31);
+        let yesterday_ts = NaiveDate::from_ymd_opt(2026, 9, 15)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        let source = StubSource(vec![
+            Quote {
+                code: "600000".into(),
+                price: 10.0,
+                limit_up: None,
+                limit_down: None,
+                ts: today,
+            },
+            Quote {
+                code: "600036".into(),
+                price: 20.0,
+                limit_up: None,
+                limit_down: None,
+                ts: yesterday_ts,
+            },
+        ]);
+        let movers = [
+            mover("600000", Divergence::None),
+            mover("600036", Divergence::None),
+        ];
+        let n = refresh_mover_quotes(&c, &source, &movers, today).unwrap();
+        assert_eq!(n, 1, "只有今日行情应写入缓存");
+        assert!(
+            store::get_quote(&c, "600000").unwrap().is_some(),
+            "今日报价应缓存"
+        );
+        assert!(
+            store::get_quote(&c, "600036").unwrap().is_none(),
+            "昨日报价不应缓存"
+        );
     }
 }

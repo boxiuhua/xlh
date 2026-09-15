@@ -212,6 +212,12 @@ fn run_loop(
                 if !cfg.mover_signals {
                     continue;
                 }
+                // 先为本批异动代码刷新报价缓存(含涨跌停价);拉取失败不阻塞信号处理——
+                // 已有的陈旧缓存会被 fresh_quote 判定为不新鲜,submit_mover_signals
+                // 自然会跳过那些代码,而不是用不可靠的价格硬出信号。
+                if let Err(e) = movers::refresh_mover_quotes(&conn, &source, &batch, now) {
+                    eprintln!("[trade] 异动报价获取失败: {e:#}");
+                }
                 match movers::submit_mover_signals(&mut conn, &batch, now) {
                     Ok(r) => r
                         .errors
