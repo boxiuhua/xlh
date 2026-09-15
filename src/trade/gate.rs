@@ -2,7 +2,9 @@
 
 use crate::broker::Fee;
 use crate::event::Direction;
-use crate::stock::ashare::{buy_lot, price_decimals, round_buy_shares, sell_qty, step_down};
+use crate::stock::ashare::{
+    buy_lot, price_decimals, round_buy_shares, round_price_to_tick, sell_qty, step_down,
+};
 use crate::stock::fee::StockFee;
 use crate::trade::model::{
     Account, AccountState, NewSignal, Position, Quote, RiskRules, SignalSource,
@@ -131,7 +133,7 @@ pub fn evaluate(inp: &GateInput) -> GateDecision {
         _ => {}
     }
     let real_involved = accounts.contains(&Account::Real);
-    if real_involved && inp.tickets_today >= rules.max_daily_tickets {
+    if s.side == Direction::Buy && real_involved && inp.tickets_today >= rules.max_daily_tickets {
         return Reject(GateReject::DailyTicketCap);
     }
     if s.side == Direction::Buy && real_involved {
@@ -213,7 +215,11 @@ pub fn size_buy(code: &str, price: f64, slippage: f64, budget: f64) -> u64 {
     }
     let fee = StockFee::a_share();
     let lot = buy_lot(code);
-    let exec_price = price * (1.0 + slippage);
+    let exec_price = round_price_to_tick(
+        price * (1.0 + slippage),
+        price_decimals(code),
+        Direction::Buy,
+    );
     let mut n = round_buy_shares(budget / exec_price, lot);
     while n > 0 {
         let value = n as f64 * exec_price;
@@ -431,6 +437,16 @@ mod tests {
     }
 
     #[test]
+    fn daily_ticket_cap_does_not_block_sells() {
+        let mut f = Fx::sell(1000, yesterday());
+        f.tickets_today = 20;
+        assert_eq!(
+            plans(f.run()),
+            vec![plan(Account::Real, 1000), plan(Account::Paper, 1000)]
+        );
+    }
+
+    #[test]
     fn probation_strategy_trades_paper_only() {
         let mut f = Fx::buy(SignalSource::Strategy);
         f.admission = Admission::Probation;
@@ -471,6 +487,14 @@ mod tests {
         let mut f = Fx::buy(SignalSource::Manual);
         f.real_pos = Some(position(Account::Real, 1500, yesterday()));
         assert_eq!(plans(f.run())[0], plan(Account::Real, 400));
+    }
+
+    #[test]
+    fn negative_remaining_position_cap_is_below_one_lot() {
+        // 已持 2500 股 × 10 = 25000 > 上限 20000 → 剩余预算为负 → 不足一手
+        let mut f = Fx::buy(SignalSource::Manual);
+        f.real_pos = Some(position(Account::Real, 2500, yesterday()));
+        assert_eq!(rejected(f.run()), GateReject::BelowOneLot);
     }
 
     #[test]
