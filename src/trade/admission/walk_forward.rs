@@ -458,6 +458,14 @@ mod tests {
         out
     }
 
+    /// 锯齿行情:短均线会反复穿越长均线,确保回测真的产生买卖(而不是像单调
+    /// 上涨序列那样短均线一直在长均线上方,从不触发 Trend 策略的买卖信号)。
+    fn wave_prices(n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|i| 10.0 + (i as f64 / 3.0).sin() * 2.0 + i as f64 * 0.01)
+            .collect()
+    }
+
     fn cfg() -> WalkForwardCfg {
         WalkForwardCfg {
             train_days: 60,
@@ -619,8 +627,8 @@ mod tests {
 
     #[test]
     fn run_code_picks_params_in_train_and_measures_in_test() {
-        // 190 个交易日的上涨序列,3 个窗口
-        let prices: Vec<f64> = (0..190).map(|i| 10.0 + i as f64 * 0.05).collect();
+        // 190 个交易日的锯齿行情,3 个窗口,短均线会反复穿越长均线产生买卖
+        let prices = wave_prices(190);
         let b = bars(d(2024, 1, 1), &prices);
         let out = run_code("trend", "600000", &b, &grid(), &cfg()).unwrap();
         assert!(!out.windows.is_empty(), "应至少产出一个窗口");
@@ -628,11 +636,14 @@ mod tests {
             assert!(w.params.get("short_window").is_some(), "参数来自网格");
             assert!(w.oos_days > 0);
         }
+        assert!(
+            out.windows.iter().any(|w| w.oos.trade_count > 0),
+            "检验窗应产生成交"
+        );
         let m = out.metrics();
         assert_eq!(m.code, "600000");
         assert_eq!(m.windows, out.windows.len());
         assert!(m.years > 0.0);
-        assert!(m.buy_hold_return > 0.0, "上涨行情买入持有为正");
     }
 
     #[test]
@@ -670,35 +681,43 @@ mod tests {
         assert_eq!(aggregate(Vec::new()).positive_ratio, 0.0);
     }
 
-    /// F2:默认 `initial_cash = 0` 按需注入资金,收益/回撤不应随每笔金额大小而系统性偏移。
-    /// 手数取整与 5 元最低佣金会让结果有细微差异,因此只断言在 5 个百分点内接近,而非相等。
+    /// F2:默认 `initial_cash = 0` 按需注入资金——组合只注入「实际买入所需」的那笔钱,
+    /// 收益与回撤因此相对「真正投入的资金」度量。用一笔固定 `initial_cash = 100_000`
+    /// 的旧配置对比:同样的买卖,分母却掺进了从未用于持仓的闲置现金,把收益稀释、
+    /// 把回撤(相对峰值权益的跌幅)也稀释变小——回撤被低估正是不安全的方向。
     #[test]
-    fn metrics_do_not_depend_on_position_size() {
-        let prices: Vec<f64> = (0..190).map(|i| 10.0 + i as f64 * 0.05).collect();
+    fn position_size_does_not_dilute_return_and_drawdown() {
+        let prices = wave_prices(190);
         let b = bars(d(2024, 1, 1), &prices);
-        let grid_small = "short_window = [3]\nlong_window = [10]\namount = [20000.0]"
+        let g = "short_window = [3]\nlong_window = [10]\namount = [20000.0]"
             .parse::<toml::Table>()
             .unwrap();
-        let grid_large = "short_window = [3]\nlong_window = [10]\namount = [100000.0]"
-            .parse::<toml::Table>()
-            .unwrap();
-        let small = run_code("trend", "600000", &b, &grid_small, &cfg())
+
+        let zero_cash_cfg = cfg(); // initial_cash: 0.0(默认)
+        let padded_cash_cfg = WalkForwardCfg {
+            initial_cash: 100_000.0,
+            ..cfg()
+        };
+
+        let a = run_code("trend", "600000", &b, &g, &zero_cash_cfg)
             .unwrap()
             .metrics();
-        let large = run_code("trend", "600000", &b, &grid_large, &cfg())
+        let b_metrics = run_code("trend", "600000", &b, &g, &padded_cash_cfg)
             .unwrap()
             .metrics();
+
+        assert!(a.oos_trades > 0, "锯齿行情夹具应至少产生一笔样本外成交");
         assert!(
-            (small.oos_return - large.oos_return).abs() < 0.05,
-            "{} vs {}",
-            small.oos_return,
-            large.oos_return
+            a.oos_return.abs() > b_metrics.oos_return.abs() * 1.5,
+            "零闲置现金的收益应明显大于被 10 万闲置现金稀释后的收益: {} vs {}",
+            a.oos_return,
+            b_metrics.oos_return
         );
         assert!(
-            (small.oos_max_drawdown - large.oos_max_drawdown).abs() < 0.05,
-            "{} vs {}",
-            small.oos_max_drawdown,
-            large.oos_max_drawdown
+            a.oos_max_drawdown > b_metrics.oos_max_drawdown * 1.5,
+            "零闲置现金的回撤应明显大于被闲置现金稀释后的回撤(回撤被低估是不安全的方向): {} vs {}",
+            a.oos_max_drawdown,
+            b_metrics.oos_max_drawdown
         );
     }
 
