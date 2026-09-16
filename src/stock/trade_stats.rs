@@ -24,7 +24,9 @@ pub struct RoundTrip {
 }
 
 impl RoundTrip {
-    /// 本回合收益率;无成本(裸卖)返回 0。
+    /// 本回合收益率;无成本(裸卖)返回 0。注意:`trade_baseline`(见
+    /// `crate::trade::admission::walk_forward`)把收益率 <= 0 都算作亏损,
+    /// 所以裸卖的 0 会被计入连亏 / 拉低胜率,而不是被当成「中性、不计入统计」。
     pub fn ret(&self) -> f64 {
         if self.cost > 1e-9 {
             self.pnl / self.cost

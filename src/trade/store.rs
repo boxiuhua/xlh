@@ -895,7 +895,8 @@ pub fn list_status_events(
         .collect()
 }
 
-const JOB_COLS: &str = "id, user_id, strategy_id, kind, status, progress, error, created_at";
+const JOB_COLS: &str =
+    "id, user_id, strategy_id, kind, status, progress, error, created_at, started_at, finished_at";
 
 #[allow(clippy::type_complexity)]
 fn read_job(
@@ -909,6 +910,8 @@ fn read_job(
     Option<String>,
     Option<String>,
     String,
+    Option<String>,
+    Option<String>,
 )> {
     Ok((
         r.get(0)?,
@@ -919,6 +922,8 @@ fn read_job(
         r.get(5)?,
         r.get(6)?,
         r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
     ))
 }
 
@@ -933,9 +938,22 @@ fn to_job(
         Option<String>,
         Option<String>,
         String,
+        Option<String>,
+        Option<String>,
     ),
 ) -> Result<EvalJob> {
-    let (id, user_id, strategy_id, kind, status, progress, error, created_at) = raw;
+    let (
+        id,
+        user_id,
+        strategy_id,
+        kind,
+        status,
+        progress,
+        error,
+        created_at,
+        started_at,
+        finished_at,
+    ) = raw;
     Ok(EvalJob {
         id,
         user_id,
@@ -945,6 +963,8 @@ fn to_job(
         progress,
         error,
         created_at: parse_ts(&created_at)?,
+        started_at: started_at.as_deref().map(parse_ts).transpose()?,
+        finished_at: finished_at.as_deref().map(parse_ts).transpose()?,
     })
 }
 
@@ -1012,6 +1032,7 @@ pub fn claim_next_job(conn: &Connection, now: NaiveDateTime) -> Result<Option<Ev
     .transpose()
 }
 
+/// 仅供评估线程调用:不按 user_id 隔离;面向用户的取消 / 重试必须先用 EvalJob.user_id 校验归属。
 pub fn set_job_progress(
     conn: &Connection,
     job_id: i64,
@@ -1026,6 +1047,7 @@ pub fn set_job_progress(
 }
 
 /// 结束任务:`error` 为 None 记 done,否则记 failed。
+/// 仅供评估线程调用:不按 user_id 隔离;面向用户的取消 / 重试必须先用 EvalJob.user_id 校验归属。
 pub fn finish_job(
     conn: &Connection,
     job_id: i64,
@@ -1577,6 +1599,12 @@ mod tests {
 
         let claimed = claim_next_job(&c, at(16, 9, 3)).unwrap().unwrap();
         assert_eq!((claimed.id, claimed.status), (job, JobStatus::Running));
+        assert_eq!(
+            claimed.started_at,
+            Some(at(16, 9, 3)),
+            "F7:领取后记录开始时间"
+        );
+        assert_eq!(claimed.finished_at, None, "尚未结束");
         set_job_progress(&c, job, "3/10", at(16, 9, 4)).unwrap();
         finish_job(&c, job, None, at(16, 9, 5)).unwrap();
         let jobs = list_jobs(&c, 1, 10).unwrap();
@@ -1584,6 +1612,12 @@ mod tests {
         assert_eq!(
             (done.status, done.progress.as_deref()),
             (JobStatus::Done, Some("3/10"))
+        );
+        assert_eq!(done.started_at, Some(at(16, 9, 3)));
+        assert_eq!(
+            done.finished_at,
+            Some(at(16, 9, 5)),
+            "F7:结束后记录结束时间"
         );
         assert!(list_jobs(&c, 2, 10).unwrap().is_empty(), "用户隔离");
 

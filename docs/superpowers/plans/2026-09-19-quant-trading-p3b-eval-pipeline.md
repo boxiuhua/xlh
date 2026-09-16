@@ -1055,3 +1055,4 @@ git commit -m "feat(trade): trade-eval 评估线程、每日与每月调度接�
 - **计划 3d**:日线策略信号(收盘后计算、次日 09:25 发出、`admission_for` 接入 `submit_signal`)、`stock/recommend.rs` 迁移到 A 股口径、交易日历(节假日)
 - **计划 4**:网页策略管理与成绩单展示、`/trade` 确认页、持仓校准、风控设置、按用户隔离的工单读取
 - 计划 3a 遗留中未在本计划处理的:夏普衰减逐只中位数、`expand_grid` 重复展开与训练窗 clone、`aggregate` 默认 requested 的口径说明、`oos_annualized` 未参与判定
+- 计划 3c 必须处理:月度重跑没有合法入口(`apply_backtest_verdict` 仅接受 Backtesting;`Paper`/`Admitted` → `Backtesting` 不合法),需要一个 `apply_monthly_verdict`(失败时 Admitted → Suspended、Paper → Failed);watchdog 的连亏须逐只比较;`Transition::AlreadyHandled` 未区分「已被处理」与「非法转换」;`validate_new_strategy` 的 kind 列表与 `config::build_strategy_from` 各自维护。

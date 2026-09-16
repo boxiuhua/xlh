@@ -450,6 +450,10 @@ pub struct EvalJob {
     pub progress: Option<String>,
     pub error: Option<String>,
     pub created_at: NaiveDateTime,
+    /// 领取时间(F7):供计划 4 展示任务耗时。
+    pub started_at: Option<NaiveDateTime>,
+    /// 结束时间(F7):供计划 4 展示任务耗时。
+    pub finished_at: Option<NaiveDateTime>,
 }
 
 /// 定义指纹:类型 + 网格 + 排序后的股票池。定义一变即换版本,状态回到草稿。

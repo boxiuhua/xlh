@@ -462,6 +462,6 @@ mod tests {
             store::get_strategy(&c, 1, id).unwrap().unwrap().status,
             StrategyStatus::Draft
         );
-        assert!(store::list_status_events(&c, 1, id).unwrap().is_empty());
+        assert!(store::list_status_events(&c, id, 1).unwrap().is_empty());
     }
 }

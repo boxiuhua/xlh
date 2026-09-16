@@ -201,6 +201,7 @@ pub struct PoolMetrics {
     pub oos_sharpe: f64,
     pub oos_max_drawdown: f64,
     /// 池内求和,仅展示用;准入判定改用 `median_code_trades`(见 F6)。
+    /// 数的是成交笔数(买 + 卖),不是 round trip——一次买卖配对算两笔。
     pub oos_trades: usize,
     /// 每只样本外交易笔数的中位数(向下取整),准入按它判定,不随池扩大而被稀释。
     pub median_code_trades: usize,
@@ -381,6 +382,9 @@ pub fn run_code(
 }
 
 impl CodeResult {
+    /// `trade_baseline`(含 `max_consecutive_losses`)按窗口的时间顺序拼接各窗
+    /// `oos_returns` 后统一计算,因此一段连亏可以跨窗口边界延续,不会因为
+    /// 窗口切换而被人为截断。
     pub fn metrics(&self) -> CodeMetrics {
         let days: i64 = self.windows.iter().map(|w| w.oos_days).sum();
         let years = (days as f64 / 365.0).max(1e-9);
@@ -1075,10 +1079,11 @@ mod tests {
         let b = bars(d(2024, 1, 1), &prices);
         let out = run_code("trend", "600000", &b, &grid(), &cfg()).unwrap();
         let m = out.metrics();
-        assert_eq!(
-            m.trade_baseline.count,
-            m.oos_trades.min(m.trade_baseline.count),
-            "逐笔基线来自样本外成交"
+        // `oos_trades` 数的是成交笔数(买 + 卖),`trade_baseline` 数的是 round trip
+        // (卖出次数);一次 round trip 至少对应一次买、一次卖,所以回合数不会超过成交笔数。
+        assert!(
+            m.trade_baseline.count <= m.oos_trades,
+            "回合数不超过成交笔数"
         );
         assert!(m.trade_baseline.count > 0, "锯齿行情应产生成交");
         assert!(m.trade_baseline.win_rate >= 0.0 && m.trade_baseline.win_rate <= 1.0);
