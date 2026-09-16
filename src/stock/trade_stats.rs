@@ -12,20 +12,37 @@ pub struct TradeStats {
     pub realized_pnl: f64,
 }
 
-/// 对成交序列做 FIFO 成本匹配，还原每笔卖出的实现盈亏。买费摊入每股成本。
-pub fn trade_stats(trades: &[TradeRecord]) -> TradeStats {
-    let mut lots: std::collections::VecDeque<(f64, f64)> = std::collections::VecDeque::new(); // (剩余份额, 每股成本)
-    let mut round_trips = 0usize;
-    let mut wins = 0usize;
-    let mut gross_win = 0.0;
-    let mut gross_loss = 0.0; // 累计正值
+/// 一次卖出对应的 FIFO 回合。买入费用摊入每股成本,卖出费用从收入中扣除。
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct RoundTrip {
+    pub shares: f64,
+    /// 匹配到的买入成本(含买入费)
+    pub cost: f64,
+    /// 卖出收入(已扣卖出费)
+    pub proceeds: f64,
+    pub pnl: f64,
+}
 
+impl RoundTrip {
+    /// 本回合收益率;无成本(裸卖)返回 0。
+    pub fn ret(&self) -> f64 {
+        if self.cost > 1e-9 {
+            self.pnl / self.cost
+        } else {
+            0.0
+        }
+    }
+}
+
+/// FIFO 还原每次卖出的成本与盈亏。`trade_stats` 在其之上聚合。
+pub fn round_trips(trades: &[TradeRecord]) -> Vec<RoundTrip> {
+    let mut lots: std::collections::VecDeque<(f64, f64)> = std::collections::VecDeque::new();
+    let mut out = Vec::new();
     for t in trades {
         match t.direction {
             Direction::Buy => {
                 if t.shares > 1e-9 {
-                    let cost_per_share = t.price + t.fee / t.shares;
-                    lots.push_back((t.shares, cost_per_share));
+                    lots.push_back((t.shares, t.price + t.fee / t.shares));
                 }
             }
             Direction::Sell => {
@@ -39,24 +56,37 @@ pub fn trade_stats(trades: &[TradeRecord]) -> TradeStats {
                     cost += take * lot_cost;
                     let left = lot_shares - take;
                     if left > 1e-9 {
-                        lots.front_mut().unwrap().0 = left;
+                        lots.front_mut().expect("刚读到队首").0 = left;
                     } else {
                         lots.pop_front();
                     }
                     remaining -= take;
                 }
                 let matched = t.shares - remaining;
-                let pnl = matched * t.price - t.fee - cost;
-                round_trips += 1;
-                if pnl > 0.0 {
-                    wins += 1;
-                    gross_win += pnl;
-                } else {
-                    gross_loss += -pnl;
-                }
+                let proceeds = matched * t.price - t.fee;
+                out.push(RoundTrip {
+                    shares: matched,
+                    cost,
+                    proceeds,
+                    pnl: proceeds - cost,
+                });
             }
         }
     }
+    out
+}
+
+/// 对成交序列做 FIFO 成本匹配，还原每笔卖出的实现盈亏。买费摊入每股成本。
+pub fn trade_stats(trades: &[TradeRecord]) -> TradeStats {
+    let rts = round_trips(trades);
+    let round_trips = rts.len();
+    let wins = rts.iter().filter(|rt| rt.pnl > 0.0).count();
+    let gross_win: f64 = rts.iter().filter(|rt| rt.pnl > 0.0).map(|rt| rt.pnl).sum();
+    let gross_loss: f64 = rts
+        .iter()
+        .filter(|rt| rt.pnl <= 0.0)
+        .map(|rt| -rt.pnl)
+        .sum();
 
     let losses = round_trips - wins;
     let win_rate = if round_trips > 0 {
@@ -176,5 +206,50 @@ mod tests {
             sell(d(2024, 2, 1), 100.0, 1.0, 0.0),
         ]);
         assert!((s.realized_pnl + 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn round_trips_report_cost_and_return_per_sell() {
+        // 买 100 @10 费 5 → 每股成本 10.05;卖 100 @12 费 6 → pnl = 1200 - 6 - 1005 = 189
+        let trades = vec![
+            TradeRecord {
+                date: d(2024, 1, 2),
+                direction: Direction::Buy,
+                shares: 100.0,
+                price: 10.0,
+                fee: 5.0,
+            },
+            TradeRecord {
+                date: d(2024, 1, 3),
+                direction: Direction::Sell,
+                shares: 100.0,
+                price: 12.0,
+                fee: 6.0,
+            },
+        ];
+        let rts = round_trips(&trades);
+        assert_eq!(rts.len(), 1);
+        assert!((rts[0].cost - 1005.0).abs() < 1e-9);
+        assert!((rts[0].pnl - 189.0).abs() < 1e-9);
+        assert!((rts[0].ret() - 189.0 / 1005.0).abs() < 1e-9);
+        // 聚合口径与既有 trade_stats 一致
+        let st = trade_stats(&trades);
+        assert_eq!((st.round_trips, st.wins), (1, 1));
+        assert!((st.realized_pnl - 189.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn round_trips_without_lots_are_ignored_for_cost() {
+        // 无持仓直接卖:成本 0,收益率按 0 处理,但仍计一次 round trip(与既有统计一致)
+        let trades = vec![TradeRecord {
+            date: d(2024, 1, 2),
+            direction: Direction::Sell,
+            shares: 100.0,
+            price: 12.0,
+            fee: 6.0,
+        }];
+        let rts = round_trips(&trades);
+        assert_eq!(rts.len(), 1);
+        assert_eq!(rts[0].ret(), 0.0);
     }
 }

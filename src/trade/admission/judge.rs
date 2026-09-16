@@ -106,6 +106,17 @@ pub struct BacktestBaseline {
     pub max_drawdown: f64,
 }
 
+impl BacktestBaseline {
+    /// 从池内回测指标取基线:逐笔收益均值与标准差来自 `trade_baseline`,回撤取样本外最大回撤。
+    pub fn from_pool(m: &PoolMetrics) -> Self {
+        Self {
+            avg_trade_return: m.trade_baseline.avg_return,
+            trade_return_sd: m.trade_baseline.return_sd,
+            max_drawdown: m.oos_max_drawdown,
+        }
+    }
+}
+
 /// 观察期关(spec §10.5):时长、笔数、平均每笔收益不低于回测均值 − 1σ、回撤不超过回测。
 /// 异动类策略无历史回测,`baseline` 传 `None` 时只检查时长与笔数。
 pub fn judge_paper(
@@ -149,7 +160,7 @@ pub fn judge_paper(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trade::admission::walk_forward::{CodeMetrics, PoolMetrics};
+    use crate::trade::admission::walk_forward::{CodeMetrics, PoolMetrics, TradeBaseline};
 
     fn pool(
         sharpe: f64,
@@ -173,6 +184,7 @@ mod tests {
                 years,
                 data_years: years,
                 buy_hold_return: 0.05,
+                trade_baseline: TradeBaseline::default(),
                 window_details: Vec::new(),
             }],
             oos_return: ret,
@@ -185,6 +197,7 @@ mod tests {
             years,
             data_years: years,
             buy_hold_return: 0.05,
+            trade_baseline: TradeBaseline::default(),
             // 单只股票、全部可评估:覆盖率关不应在这些通用夹具里被触发。
             requested: 1,
             skipped: Vec::new(),
@@ -275,6 +288,7 @@ mod tests {
                 years: 4.0,
                 data_years: 4.0,
                 buy_hold_return: 0.05,
+                trade_baseline: TradeBaseline::default(),
                 window_details: Vec::new(),
             })
             .collect();
@@ -416,5 +430,16 @@ mod tests {
         assert!(!v.passed);
         assert_eq!(v.reasons.len(), 1, "{:?}", v.reasons);
         assert!(v.reasons[0].contains("交易日"), "{:?}", v.reasons);
+    }
+
+    #[test]
+    fn baseline_is_derived_from_pool_metrics() {
+        let mut m = pool(1.0, 0.20, 40, 0.60, 4.0, 0.30, 1.4);
+        m.trade_baseline.avg_return = 0.03;
+        m.trade_baseline.return_sd = 0.01;
+        let b = BacktestBaseline::from_pool(&m);
+        assert!((b.avg_trade_return - 0.03).abs() < 1e-9);
+        assert!((b.trade_return_sd - 0.01).abs() < 1e-9);
+        assert!((b.max_drawdown - 0.20).abs() < 1e-9);
     }
 }

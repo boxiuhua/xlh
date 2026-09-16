@@ -10,6 +10,7 @@ use crate::stock::ashare::AShareExecution;
 use crate::stock::backtest;
 use crate::stock::data::{StockBar, StockData};
 use crate::stock::fee::StockFee;
+use crate::stock::trade_stats::round_trips;
 use anyhow::{anyhow, Result};
 use chrono::{Duration, NaiveDate};
 use serde::Serialize;
@@ -92,6 +93,44 @@ pub fn buy_and_hold_return(bars: &[StockBar], from: NaiveDate, to: NaiveDate) ->
     }
 }
 
+/// 逐笔收益的基线统计。观察期与 watchdog 都与它比较。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct TradeBaseline {
+    pub avg_return: f64,
+    /// 总体标准差
+    pub return_sd: f64,
+    pub win_rate: f64,
+    pub max_consecutive_losses: usize,
+    pub count: usize,
+}
+
+pub fn trade_baseline(returns: &[f64]) -> TradeBaseline {
+    if returns.is_empty() {
+        return TradeBaseline::default();
+    }
+    let n = returns.len() as f64;
+    let avg = returns.iter().sum::<f64>() / n;
+    let var = returns.iter().map(|r| (r - avg) * (r - avg)).sum::<f64>() / n;
+    let wins = returns.iter().filter(|r| **r > 0.0).count();
+    let mut streak = 0usize;
+    let mut worst = 0usize;
+    for r in returns {
+        if *r <= 0.0 {
+            streak += 1;
+            worst = worst.max(streak);
+        } else {
+            streak = 0;
+        }
+    }
+    TradeBaseline {
+        avg_return: avg,
+        return_sd: var.sqrt(),
+        win_rate: wins as f64 / n,
+        max_consecutive_losses: worst,
+        count: returns.len(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowResult {
     pub window: Window,
@@ -99,6 +138,8 @@ pub struct WindowResult {
     pub is_sharpe: f64,
     pub oos: Summary,
     pub oos_days: i64,
+    /// 样本外每次卖出的收益率(FIFO round trip),用于逐笔收益基线(见 `trade_baseline`)。
+    pub oos_returns: Vec<f64>,
 }
 
 /// 单个检验窗的精简记录(F4):供 `trade_strategy_evals.metrics_json` 保存逐窗选中的
@@ -143,6 +184,8 @@ pub struct CodeMetrics {
     /// K 线总跨度(年):`data_to - data_from`,准入按它判定是否 ≥ `min_years`(见 F1)。
     pub data_years: f64,
     pub buy_hold_return: f64,
+    /// 逐笔收益基线:由所有样本外窗口的 round trip 收益率拼接而成。
+    pub trade_baseline: TradeBaseline,
     /// 逐窗选中的参数与指标(F4),供成绩单展示。
     pub window_details: Vec<WindowSummary>,
 }
@@ -165,6 +208,8 @@ pub struct PoolMetrics {
     /// 池内 K 线总跨度(年)中位数,数据年限准入按它判定(见 F1)。
     pub data_years: f64,
     pub buy_hold_return: f64,
+    /// 池内逐笔收益基线:avg/sd/win_rate 取各票中位数,max_consecutive_losses 取最大,count 求和。
+    pub trade_baseline: TradeBaseline,
     /// 股票池长度(F5):与 `codes.len()` 的比值低于 `min_evaluated_ratio` 时准入不通过。
     pub requested: usize,
     /// 未能评估的代码及原因(加载失败 / 回测失败 / 数据不足)。
@@ -279,12 +324,14 @@ pub fn run_code(
         let oos_days = (test.last().unwrap().date - test.first().unwrap().date)
             .num_days()
             .max(1);
+        let oos_returns = round_trips(&oos.trades).iter().map(|rt| rt.ret()).collect();
         out.push(WindowResult {
             window: w,
             params,
             is_sharpe,
             oos: oos.summary,
             oos_days,
+            oos_returns,
         });
     }
     // F7:买入持有基准只累乘「被保留」的检验窗,跳过的窗口(数据不足)与
@@ -340,6 +387,13 @@ impl CodeResult {
             years: days as f64 / 365.0,
             data_years: (self.data_to - self.data_from).num_days() as f64 / 365.0,
             buy_hold_return: self.buy_hold_return,
+            trade_baseline: trade_baseline(
+                &self
+                    .windows
+                    .iter()
+                    .flat_map(|w| w.oos_returns.iter().copied())
+                    .collect::<Vec<_>>(),
+            ),
             window_details: self
                 .windows
                 .iter()
@@ -367,6 +421,17 @@ pub fn aggregate(codes: Vec<CodeMetrics>) -> PoolMetrics {
     } else {
         positive as f64 / codes.len() as f64
     };
+    let trade_baseline = TradeBaseline {
+        avg_return: median(codes.iter().map(|c| c.trade_baseline.avg_return).collect()),
+        return_sd: median(codes.iter().map(|c| c.trade_baseline.return_sd).collect()),
+        win_rate: median(codes.iter().map(|c| c.trade_baseline.win_rate).collect()),
+        max_consecutive_losses: codes
+            .iter()
+            .map(|c| c.trade_baseline.max_consecutive_losses)
+            .max()
+            .unwrap_or(0),
+        count: codes.iter().map(|c| c.trade_baseline.count).sum(),
+    };
     PoolMetrics {
         oos_return: median(codes.iter().map(|c| c.oos_return).collect()),
         oos_sharpe: median(codes.iter().map(|c| c.oos_sharpe).collect()),
@@ -378,6 +443,7 @@ pub fn aggregate(codes: Vec<CodeMetrics>) -> PoolMetrics {
         years: median(codes.iter().map(|c| c.years).collect()),
         data_years: median(codes.iter().map(|c| c.data_years).collect()),
         buy_hold_return: median(codes.iter().map(|c| c.buy_hold_return).collect()),
+        trade_baseline,
         requested: codes.len(),
         skipped: Vec::new(),
         codes,
@@ -553,6 +619,7 @@ mod tests {
                     is_sharpe: 2.0,
                     oos: summary(0.10, 1.0, 0.10, 5),
                     oos_days: 100,
+                    oos_returns: Vec::new(),
                 },
                 WindowResult {
                     window: w,
@@ -560,6 +627,7 @@ mod tests {
                     is_sharpe: 3.0,
                     oos: summary(0.20, 2.0, 0.30, 7),
                     oos_days: 300,
+                    oos_returns: Vec::new(),
                 },
             ],
             buy_hold_return: 0.05,
@@ -660,6 +728,7 @@ mod tests {
             years: 1.0,
             data_years: 3.0,
             buy_hold_return: 0.05,
+            trade_baseline: TradeBaseline::default(),
             window_details: Vec::new(),
         };
         let p = aggregate(vec![
@@ -797,6 +866,7 @@ mod tests {
                     is_sharpe: 2.0,
                     oos: summary(0.10, 1.0, 0.10, 5),
                     oos_days: 100,
+                    oos_returns: Vec::new(),
                 },
                 WindowResult {
                     window: w,
@@ -804,6 +874,7 @@ mod tests {
                     is_sharpe: 3.0,
                     oos: summary(0.20, 2.0, 0.30, 7),
                     oos_days: 300,
+                    oos_returns: Vec::new(),
                 },
             ],
             buy_hold_return: 0.05,
@@ -864,5 +935,79 @@ mod tests {
             out.buy_hold_return,
             expected
         );
+    }
+
+    /// 本测试模块内的小助手:构造一个 `CodeMetrics`,除 `code`/`oos_return` 外其余填 0 / 空。
+    fn sample_code_metrics(code: &str, ret: f64) -> CodeMetrics {
+        CodeMetrics {
+            code: code.into(),
+            windows: 0,
+            oos_return: ret,
+            oos_annualized: 0.0,
+            oos_sharpe: 0.0,
+            oos_max_drawdown: 0.0,
+            oos_trades: 0,
+            is_sharpe: 0.0,
+            years: 0.0,
+            data_years: 0.0,
+            buy_hold_return: 0.0,
+            trade_baseline: TradeBaseline::default(),
+            window_details: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn trade_baseline_summarises_returns() {
+        let b = trade_baseline(&[0.10, -0.05, 0.20, -0.02, -0.03]);
+        assert_eq!((b.count, b.max_consecutive_losses), (5, 2));
+        assert!((b.win_rate - 0.4).abs() < 1e-9);
+        assert!((b.avg_return - 0.04).abs() < 1e-9);
+        // 总体标准差:sqrt(Σ(x-μ)²/n)
+        let var = [0.10, -0.05, 0.20, -0.02, -0.03]
+            .iter()
+            .map(|x| (x - 0.04) * (x - 0.04))
+            .sum::<f64>()
+            / 5.0;
+        assert!((b.return_sd - var.sqrt()).abs() < 1e-9);
+        let empty = trade_baseline(&[]);
+        assert_eq!((empty.count, empty.max_consecutive_losses), (0, 0));
+        assert_eq!(
+            (empty.avg_return, empty.return_sd, empty.win_rate),
+            (0.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn code_metrics_carry_trade_baseline_from_oos_windows() {
+        let prices = wave_prices(190);
+        let b = bars(d(2024, 1, 1), &prices);
+        let out = run_code("trend", "600000", &b, &grid(), &cfg()).unwrap();
+        let m = out.metrics();
+        assert_eq!(
+            m.trade_baseline.count,
+            m.oos_trades.min(m.trade_baseline.count),
+            "逐笔基线来自样本外成交"
+        );
+        assert!(m.trade_baseline.count > 0, "锯齿行情应产生成交");
+        assert!(m.trade_baseline.win_rate >= 0.0 && m.trade_baseline.win_rate <= 1.0);
+    }
+
+    #[test]
+    fn pool_baseline_takes_medians_and_worst_streak() {
+        let mk = |avg: f64, sd: f64, wr: f64, streak: usize, n: usize| TradeBaseline {
+            avg_return: avg,
+            return_sd: sd,
+            win_rate: wr,
+            max_consecutive_losses: streak,
+            count: n,
+        };
+        let mut a = sample_code_metrics("a", 0.1);
+        a.trade_baseline = mk(0.02, 0.01, 0.5, 2, 10);
+        let mut b = sample_code_metrics("b", 0.2);
+        b.trade_baseline = mk(0.04, 0.03, 0.7, 5, 20);
+        let p = aggregate(vec![a, b]);
+        assert!((p.trade_baseline.avg_return - 0.03).abs() < 1e-9, "中位数");
+        assert_eq!(p.trade_baseline.max_consecutive_losses, 5, "取最差");
+        assert_eq!(p.trade_baseline.count, 30, "求和");
     }
 }
