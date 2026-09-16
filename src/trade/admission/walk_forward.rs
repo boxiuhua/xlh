@@ -101,6 +101,19 @@ pub struct WindowResult {
     pub oos_days: i64,
 }
 
+/// 单个检验窗的精简记录(F4):供 `trade_strategy_evals.metrics_json` 保存逐窗选中的
+/// 参数与指标(计划 3b 的成绩单据此展示每一窗用了什么参数、跑出什么结果)。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WindowSummary {
+    pub train_from: NaiveDate,
+    pub train_to: NaiveDate,
+    pub test_to: NaiveDate,
+    pub params: toml::Value,
+    pub oos_return: f64,
+    pub oos_sharpe: f64,
+    pub oos_trades: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeResult {
     pub code: String,
@@ -130,6 +143,8 @@ pub struct CodeMetrics {
     /// K 线总跨度(年):`data_to - data_from`,准入按它判定是否 ≥ `min_years`(见 F1)。
     pub data_years: f64,
     pub buy_hold_return: f64,
+    /// 逐窗选中的参数与指标(F4),供成绩单展示。
+    pub window_details: Vec<WindowSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -139,8 +154,10 @@ pub struct PoolMetrics {
     pub oos_return: f64,
     pub oos_sharpe: f64,
     pub oos_max_drawdown: f64,
-    /// 池内求和
+    /// 池内求和,仅展示用;准入判定改用 `median_code_trades`(见 F6)。
     pub oos_trades: usize,
+    /// 每只样本外交易笔数的中位数(向下取整),准入按它判定,不随池扩大而被稀释。
+    pub median_code_trades: usize,
     pub is_sharpe: f64,
     /// 样本外收益为正的股票占比
     pub positive_ratio: f64,
@@ -148,6 +165,10 @@ pub struct PoolMetrics {
     /// 池内 K 线总跨度(年)中位数,数据年限准入按它判定(见 F1)。
     pub data_years: f64,
     pub buy_hold_return: f64,
+    /// 股票池长度(F5):与 `codes.len()` 的比值低于 `min_evaluated_ratio` 时准入不通过。
+    pub requested: usize,
+    /// 未能评估的代码及原因(加载失败 / 回测失败 / 数据不足)。
+    pub skipped: Vec<(String, String)>,
 }
 
 fn metric_of(s: &Summary, metric: &str) -> f64 {
@@ -170,6 +191,20 @@ fn median(mut xs: Vec<f64>) -> f64 {
         xs[n / 2]
     } else {
         (xs[n / 2 - 1] + xs[n / 2]) / 2.0
+    }
+}
+
+/// 整数中位数,偶数个时取中间两值的平均并向下取整(整数除法自动下取)(见 F6)。
+fn median_usize(mut xs: Vec<usize>) -> usize {
+    if xs.is_empty() {
+        return 0;
+    }
+    xs.sort_unstable();
+    let n = xs.len();
+    if n % 2 == 1 {
+        xs[n / 2]
+    } else {
+        (xs[n / 2 - 1] + xs[n / 2]) / 2
     }
 }
 
@@ -239,22 +274,28 @@ pub fn run_code(
             &params,
             cfg,
         )?;
+        // F7:窗口跨度按实际检验 K 线首末算,而不是按日历天数——`step_days > test_days`
+        // 或数据缺口都会让日历跨度偏离真实交易日跨度。此处 test 非空(已过 MIN_TEST_BARS 检查)。
+        let oos_days = (test.last().unwrap().date - test.first().unwrap().date)
+            .num_days()
+            .max(1);
         out.push(WindowResult {
             window: w,
             params,
             is_sharpe,
             oos: oos.summary,
-            oos_days: (w.test_to - w.train_to).num_days().max(1),
+            oos_days,
         });
     }
-    let (from, to) = match (out.first(), out.last()) {
-        (Some(a), Some(b)) => (a.window.train_to, b.window.test_to),
-        _ => (first.date, last.date),
-    };
+    // F7:买入持有基准只累乘「被保留」的检验窗,跳过的窗口(数据不足)与
+    // step_days > test_days 造成的空档都不计入,与策略侧的样本外收益覆盖同一段时间。
+    let buy_hold_return = out.iter().fold(1.0, |acc, w| {
+        acc * (1.0 + buy_and_hold_return(bars, w.window.train_to, w.window.test_to))
+    }) - 1.0;
     Ok(CodeResult {
         code: code.to_string(),
         windows: out,
-        buy_hold_return: buy_and_hold_return(bars, from, to),
+        buy_hold_return,
         data_from: first.date,
         data_to: last.date,
     })
@@ -299,10 +340,26 @@ impl CodeResult {
             years: days as f64 / 365.0,
             data_years: (self.data_to - self.data_from).num_days() as f64 / 365.0,
             buy_hold_return: self.buy_hold_return,
+            window_details: self
+                .windows
+                .iter()
+                .map(|w| WindowSummary {
+                    train_from: w.window.train_from,
+                    train_to: w.window.train_to,
+                    test_to: w.window.test_to,
+                    params: w.params.clone(),
+                    oos_return: w.oos.total_return,
+                    oos_sharpe: w.oos.sharpe,
+                    oos_trades: w.oos.trade_count,
+                })
+                .collect(),
         }
     }
 }
 
+/// 纯聚合:只从已评估的 `codes` 计算池内指标,不知道股票池原本请求了多少只。
+/// 因此 `requested` 默认等于 `codes.len()`、`skipped` 默认为空——视作「全部请求都被评估」;
+/// `run_pool` 用真实的池长度与跳过列表覆盖这两个字段(见 F5)。
 pub fn aggregate(codes: Vec<CodeMetrics>) -> PoolMetrics {
     let positive = codes.iter().filter(|c| c.oos_return > 0.0).count();
     let ratio = if codes.is_empty() {
@@ -315,19 +372,23 @@ pub fn aggregate(codes: Vec<CodeMetrics>) -> PoolMetrics {
         oos_sharpe: median(codes.iter().map(|c| c.oos_sharpe).collect()),
         oos_max_drawdown: median(codes.iter().map(|c| c.oos_max_drawdown).collect()),
         oos_trades: codes.iter().map(|c| c.oos_trades).sum(),
+        median_code_trades: median_usize(codes.iter().map(|c| c.oos_trades).collect()),
         is_sharpe: median(codes.iter().map(|c| c.is_sharpe).collect()),
         positive_ratio: ratio,
         years: median(codes.iter().map(|c| c.years).collect()),
         data_years: median(codes.iter().map(|c| c.data_years).collect()),
         buy_hold_return: median(codes.iter().map(|c| c.buy_hold_return).collect()),
+        requested: codes.len(),
+        skipped: Vec::new(),
         codes,
     }
 }
 
 /// 对整个股票池跑前推回测。K 线由调用方注入(测试用切片,生产用缓存加载)。
 ///
-/// 先校验网格与策略参数是否合法(配置错误直接 `Err`,不会被误判成某只股票的问题);
-/// 校验通过后逐只股票跑,单只股票的问题彼此隔离,记录到返回的跳过列表(代码、原因):
+/// 先校验网格里每一个参数组合是否合法(配置错误直接 `Err`,不会被误判成某只股票的问题,
+/// 见 F9);校验通过后逐只股票跑,单只股票的问题彼此隔离,记录到 `PoolMetrics.skipped`
+/// (代码、原因):
 /// - K 线加载失败:"加载失败: {原因}"
 /// - `run_code` 运行期出错:"回测失败: {原因}"
 /// - 未产出任何有效窗口(训练/检验数据不足):"数据不足,无有效窗口"
@@ -337,12 +398,16 @@ pub fn run_pool<F>(
     grid: &toml::Table,
     cfg: &WalkForwardCfg,
     mut load: F,
-) -> Result<(PoolMetrics, Vec<(String, String)>)>
+) -> Result<PoolMetrics>
 where
     F: FnMut(&str) -> Result<Vec<StockBar>>,
 {
     let combos = expand_grid(grid)?;
-    build_strategy_from(kind, &Some(combos[0].clone()), &[])?;
+    // F9:逐个校验网格里的每个参数组合,而不是只看第一个——训练窗按 `cfg.metric`
+    // 选出的组合可能是网格里任意一个,只有第一个合法不能保证其余的都合法。
+    for c in &combos {
+        build_strategy_from(kind, &Some(c.clone()), &[])?;
+    }
 
     let mut metrics = Vec::new();
     let mut skipped = Vec::new();
@@ -356,7 +421,10 @@ where
             Err(e) => skipped.push((code.clone(), format!("加载失败: {e:#}"))),
         }
     }
-    Ok((aggregate(metrics), skipped))
+    let mut m = aggregate(metrics);
+    m.requested = pool.len();
+    m.skipped = skipped;
+    Ok(m)
 }
 
 #[cfg(test)]
@@ -581,6 +649,7 @@ mod tests {
             years: 1.0,
             data_years: 3.0,
             buy_hold_return: 0.05,
+            window_details: Vec::new(),
         };
         let p = aggregate(vec![
             mk("a", 0.10, 1.0, 0.10, 20),
@@ -591,10 +660,13 @@ mod tests {
         assert!((p.oos_sharpe - 1.0).abs() < 1e-9);
         assert!((p.oos_max_drawdown - 0.20).abs() < 1e-9);
         assert_eq!(p.oos_trades, 42, "求和");
+        assert_eq!(p.median_code_trades, 12, "中位数(10,12,20 取中间)");
         assert!((p.positive_ratio - 2.0 / 3.0).abs() < 1e-9);
         assert!((p.buy_hold_return - 0.05).abs() < 1e-9);
         assert!((p.is_sharpe - 2.0).abs() < 1e-9);
         assert!((p.data_years - 3.0).abs() < 1e-9);
+        assert_eq!(p.requested, 3, "纯聚合默认视作全部请求都被评估");
+        assert!(p.skipped.is_empty());
         assert_eq!(aggregate(Vec::new()).positive_ratio, 0.0);
     }
 
@@ -634,7 +706,7 @@ mod tests {
     fn run_pool_skips_unloadable_codes() {
         let prices: Vec<f64> = (0..190).map(|i| 10.0 + i as f64 * 0.05).collect();
         let good = bars(d(2024, 1, 1), &prices);
-        let (metrics, skipped) = run_pool(
+        let metrics = run_pool(
             "trend",
             &["600000".to_string(), "000001".to_string()],
             &grid(),
@@ -646,9 +718,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(metrics.codes.len(), 1);
-        assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].0, "000001");
-        assert!(skipped[0].1.contains("加载失败"), "{}", skipped[0].1);
+        assert_eq!(metrics.requested, 2, "F5:池长度");
+        assert_eq!(metrics.skipped.len(), 1);
+        assert_eq!(metrics.skipped[0].0, "000001");
+        assert!(
+            metrics.skipped[0].1.contains("加载失败"),
+            "{}",
+            metrics.skipped[0].1
+        );
     }
 
     #[test]
@@ -659,5 +736,114 @@ mod tests {
             Ok(Vec::new())
         });
         assert!(result.is_err());
+    }
+
+    /// F9:网格里排在后面的组合非法(short >= long)也要在跑池前直接报错,
+    /// 不能只查第一个组合就放行。
+    #[test]
+    fn run_pool_rejects_invalid_later_combo() {
+        let bad_grid = "short_window = [3, 20]\nlong_window = [10]\namount = [20000.0]"
+            .parse::<toml::Table>()
+            .unwrap();
+        let result = run_pool("trend", &["600000".to_string()], &bad_grid, &cfg(), |_| {
+            Ok(Vec::new())
+        });
+        assert!(result.is_err(), "20/10 违反 short < long,应在跑池前报错");
+    }
+
+    /// F4:逐窗选中的参数与指标应保留在 `window_details` 里,供成绩单展示。
+    #[test]
+    fn metrics_keep_per_window_params() {
+        let w = Window {
+            train_from: d(2024, 1, 1),
+            train_to: d(2024, 3, 1),
+            test_to: d(2024, 4, 1),
+        };
+        let p1 = toml::Value::try_from(toml::Table::from_iter([(
+            "short_window".to_string(),
+            toml::Value::Integer(3),
+        )]))
+        .unwrap();
+        let p2 = toml::Value::try_from(toml::Table::from_iter([(
+            "short_window".to_string(),
+            toml::Value::Integer(5),
+        )]))
+        .unwrap();
+        let out = CodeResult {
+            code: "600000".to_string(),
+            windows: vec![
+                WindowResult {
+                    window: w,
+                    params: p1.clone(),
+                    is_sharpe: 2.0,
+                    oos: summary(0.10, 1.0, 0.10, 5),
+                    oos_days: 100,
+                },
+                WindowResult {
+                    window: w,
+                    params: p2,
+                    is_sharpe: 3.0,
+                    oos: summary(0.20, 2.0, 0.30, 7),
+                    oos_days: 300,
+                },
+            ],
+            buy_hold_return: 0.05,
+            data_from: d(2024, 1, 1),
+            data_to: d(2025, 4, 1),
+        };
+        let m = out.metrics();
+        assert_eq!(m.window_details.len(), 2);
+        assert_eq!(m.window_details[0].params, p1);
+        assert_eq!(m.window_details[0].train_from, w.train_from);
+        assert_eq!(m.window_details[0].test_to, w.test_to);
+        assert!((m.window_details[0].oos_return - 0.10).abs() < 1e-9);
+        assert!((m.window_details[0].oos_sharpe - 1.0).abs() < 1e-9);
+        assert_eq!(m.window_details[0].oos_trades, 5);
+    }
+
+    /// F7:一个中间窗口因训练数据不足被跳过时,买入持有基准只累乘被保留的窗口,
+    /// 与被跳过的窗口互不重叠(用 `step_days` 远大于 `train_days + test_days` 隔开各窗)。
+    #[test]
+    fn buy_hold_matches_kept_windows_only() {
+        let gapped_cfg = WalkForwardCfg {
+            train_days: 60,
+            test_days: 30,
+            step_days: 150,
+            ..WalkForwardCfg::default()
+        };
+        let start = d(2024, 1, 1);
+        let prices: Vec<f64> = (0..300).map(|i| 10.0 + i as f64 * 0.03).collect();
+        let full = bars(start, &prices);
+        // 挖掉中间窗口(索引 1)的整个训练区间 [150,210),让它因训练数据不足被跳过;
+        // 该区间与窗口 0([0,90])、窗口 2([300,390])完全不重叠。
+        let gap_from = start + chrono::Duration::days(150);
+        let gap_to = start + chrono::Duration::days(210);
+        let with_gap: Vec<StockBar> = full
+            .iter()
+            .copied()
+            .filter(|b| b.date < gap_from || b.date >= gap_to)
+            .collect();
+
+        let ws = windows(
+            with_gap.first().unwrap().date,
+            with_gap.last().unwrap().date,
+            &gapped_cfg,
+        );
+        assert_eq!(ws.len(), 3, "{ws:?}");
+
+        let out = run_code("trend", "600000", &with_gap, &grid(), &gapped_cfg).unwrap();
+        assert_eq!(out.windows.len(), 2, "中间窗口应因训练数据不足被跳过");
+        assert_eq!(out.windows[0].window, ws[0]);
+        assert_eq!(out.windows[1].window, ws[2]);
+
+        let expected = (1.0 + buy_and_hold_return(&with_gap, ws[0].train_to, ws[0].test_to))
+            * (1.0 + buy_and_hold_return(&with_gap, ws[2].train_to, ws[2].test_to))
+            - 1.0;
+        assert!(
+            (out.buy_hold_return - expected).abs() < 1e-9,
+            "{} vs {}",
+            out.buy_hold_return,
+            expected
+        );
     }
 }
