@@ -216,6 +216,21 @@ pub struct PoolMetrics {
     pub skipped: Vec<(String, String)>,
 }
 
+/// 池内进度回调。`on_code(code, 已完成, 总数)` 返回 false 表示取消,剩余代码记为「已取消」。
+pub struct PoolProgress<'a> {
+    pub on_code: &'a mut dyn FnMut(&str, usize, usize) -> bool,
+}
+
+/// 训练窗选参依据必须是已知指标,否则静默回退到 sharpe 会让配置形同虚设。
+pub fn validate_metric(metric: &str) -> Result<()> {
+    match metric {
+        "sharpe" | "total_return" | "annualized" | "max_drawdown" => Ok(()),
+        other => Err(anyhow!(
+            "未知选参指标 {other};可选 sharpe | total_return | annualized | max_drawdown"
+        )),
+    }
+}
+
 fn metric_of(s: &Summary, metric: &str) -> f64 {
     match metric {
         "total_return" => s.total_return,
@@ -280,6 +295,7 @@ pub fn run_code(
     grid: &toml::Table,
     cfg: &WalkForwardCfg,
 ) -> Result<CodeResult> {
+    validate_metric(&cfg.metric)?;
     let combos = expand_grid(grid)?;
     let (Some(first), Some(last)) = (bars.first(), bars.last()) else {
         return Err(anyhow!("{code} 无 K 线数据"));
@@ -464,6 +480,7 @@ pub fn run_pool<F>(
     grid: &toml::Table,
     cfg: &WalkForwardCfg,
     mut load: F,
+    progress: Option<&mut PoolProgress>,
 ) -> Result<PoolMetrics>
 where
     F: FnMut(&str) -> Result<Vec<StockBar>>,
@@ -477,7 +494,9 @@ where
 
     let mut metrics = Vec::new();
     let mut skipped = Vec::new();
-    for code in pool {
+    let total = pool.len();
+    let mut progress = progress;
+    for (done, code) in pool.iter().enumerate() {
         match load(code) {
             Ok(bars) => match run_code(kind, code, &bars, grid, cfg) {
                 Ok(r) if !r.windows.is_empty() => metrics.push(r.metrics()),
@@ -485,6 +504,14 @@ where
                 Err(e) => skipped.push((code.clone(), format!("回测失败: {e:#}"))),
             },
             Err(e) => skipped.push((code.clone(), format!("加载失败: {e:#}"))),
+        }
+        if let Some(p) = progress.as_deref_mut() {
+            if !(p.on_code)(code, done + 1, total) {
+                for rest in pool.iter().skip(done + 1) {
+                    skipped.push((rest.clone(), "已取消".to_string()));
+                }
+                break;
+            }
         }
     }
     let mut m = aggregate(metrics);
@@ -803,6 +830,7 @@ mod tests {
                 "600000" => Ok(good.clone()),
                 _ => Err(anyhow::anyhow!("无数据")),
             },
+            None,
         )
         .unwrap();
         assert_eq!(metrics.codes.len(), 1);
@@ -820,9 +848,14 @@ mod tests {
     fn run_pool_rejects_invalid_grid() {
         // 非数组的网格值应被视为配置错误,直接返回 Err,而不是把它算成某只股票被跳过。
         let bad_grid = "short_window = 3".parse::<toml::Table>().unwrap();
-        let result = run_pool("trend", &["600000".to_string()], &bad_grid, &cfg(), |_| {
-            Ok(Vec::new())
-        });
+        let result = run_pool(
+            "trend",
+            &["600000".to_string()],
+            &bad_grid,
+            &cfg(),
+            |_| Ok(Vec::new()),
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -833,9 +866,14 @@ mod tests {
         let bad_grid = "short_window = [3, 20]\nlong_window = [10]\namount = [20000.0]"
             .parse::<toml::Table>()
             .unwrap();
-        let result = run_pool("trend", &["600000".to_string()], &bad_grid, &cfg(), |_| {
-            Ok(Vec::new())
-        });
+        let result = run_pool(
+            "trend",
+            &["600000".to_string()],
+            &bad_grid,
+            &cfg(),
+            |_| Ok(Vec::new()),
+            None,
+        );
         assert!(result.is_err(), "20/10 违反 short < long,应在跑池前报错");
     }
 
@@ -990,6 +1028,39 @@ mod tests {
         );
         assert!(m.trade_baseline.count > 0, "锯齿行情应产生成交");
         assert!(m.trade_baseline.win_rate >= 0.0 && m.trade_baseline.win_rate <= 1.0);
+    }
+
+    #[test]
+    fn progress_reports_each_code_and_cancels() {
+        let prices = wave_prices(190);
+        let good = bars(d(2024, 1, 1), &prices);
+        let mut seen: Vec<(String, usize, usize)> = Vec::new();
+        let mut cb = |code: &str, done: usize, total: usize| {
+            seen.push((code.to_string(), done, total));
+            done < 1 // 第一只之后取消
+        };
+        let mut p = PoolProgress { on_code: &mut cb };
+        let m = run_pool(
+            "trend",
+            &["600000".into(), "000001".into()],
+            &grid(),
+            &cfg(),
+            |_| Ok(good.clone()),
+            Some(&mut p),
+        )
+        .unwrap();
+        assert_eq!(seen.len(), 1, "取消后不再继续");
+        assert_eq!(m.codes.len(), 1);
+        assert!(m
+            .skipped
+            .iter()
+            .any(|(c, r)| c == "000001" && r.contains("取消")));
+    }
+
+    #[test]
+    fn unknown_metric_is_rejected() {
+        assert!(validate_metric("sharpe").is_ok());
+        assert!(validate_metric("sharp").is_err());
     }
 
     #[test]

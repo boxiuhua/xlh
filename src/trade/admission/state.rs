@@ -10,9 +10,32 @@ use anyhow::Result;
 use chrono::{NaiveDate, NaiveDateTime};
 use rusqlite::{params, Connection};
 
+/// 合法转换表(spec §10.2)。`mover` 的 Draft/Failed/Suspended → Paper 由 `submit_for_backtest` 走这里。
+pub fn is_legal_transition(from: StrategyStatus, to: StrategyStatus) -> bool {
+    use StrategyStatus::*;
+    matches!(
+        (from, to),
+        (Draft, Backtesting)
+            | (Draft, Paper)
+            | (Backtesting, Paper)
+            | (Backtesting, Failed)
+            | (Failed, Backtesting)
+            | (Failed, Paper)
+            | (Paper, Admitted)
+            | (Paper, Failed)
+            | (Paper, Suspended)
+            | (Admitted, Suspended)
+            | (Suspended, Backtesting)
+            | (Suspended, Paper)
+    )
+}
+
 /// `update_status` 的核心逻辑,接受任意 `&Connection`(含事务句柄的 `Deref`),
 /// 供调用方决定事务边界——`update_status` 自己开关事务,`apply_backtest_verdict`
 /// 则把它并入自己的事务,与落库评估一起提交(见 F8)。
+///
+/// 非法转换(不在 `is_legal_transition` 表内)一律不写库、不写事件,直接返回
+/// `AlreadyHandled`,与「状态已变」的条件 UPDATE 未命中同等对待。
 fn transition_status(
     conn: &Connection,
     user_id: i64,
@@ -22,6 +45,9 @@ fn transition_status(
     reason: &str,
     now: NaiveDateTime,
 ) -> Result<Transition> {
+    if !is_legal_transition(expect, to) {
+        return Ok(Transition::AlreadyHandled);
+    }
     let n = conn.execute(
         "UPDATE trade_strategies SET status = ?1, status_reason = ?2, updated_at = ?3
          WHERE id = ?4 AND user_id = ?5 AND status = ?6",
@@ -359,23 +385,15 @@ mod tests {
     #[test]
     fn admission_maps_status_to_gate_admission() {
         let c = db();
-        let id = strategy(&c, "rsi");
+        let id = strategy(&c, "mover");
         assert_eq!(admission_for(&c, 1, None).unwrap(), Admission::NotRequired);
         assert_eq!(
             admission_for(&c, 1, Some(id)).unwrap(),
             Admission::Blocked,
             "草稿不得交易"
         );
-        update_status(
-            &c,
-            1,
-            id,
-            StrategyStatus::Draft,
-            StrategyStatus::Paper,
-            "观察",
-            at(16, 9, 2),
-        )
-        .unwrap();
+        // Draft → Paper 仅对 mover 合法,走 submit_for_backtest(异动类直接进观察期)。
+        submit_for_backtest(&c, 1, id, at(16, 9, 2)).unwrap();
         assert_eq!(
             admission_for(&c, 1, Some(id)).unwrap(),
             Admission::Probation
@@ -412,5 +430,38 @@ mod tests {
 
     fn day(d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 9, d).unwrap()
+    }
+
+    #[test]
+    fn illegal_transitions_are_refused() {
+        let c = db();
+        let id = strategy(&c, "rsi");
+        assert!(!is_legal_transition(
+            StrategyStatus::Draft,
+            StrategyStatus::Admitted
+        ));
+        assert!(is_legal_transition(
+            StrategyStatus::Paper,
+            StrategyStatus::Admitted
+        ));
+        assert_eq!(
+            update_status(
+                &c,
+                1,
+                id,
+                StrategyStatus::Draft,
+                StrategyStatus::Admitted,
+                "越权",
+                at(16, 9, 1)
+            )
+            .unwrap(),
+            Transition::AlreadyHandled,
+            "非法转换不得写库"
+        );
+        assert_eq!(
+            store::get_strategy(&c, 1, id).unwrap().unwrap().status,
+            StrategyStatus::Draft
+        );
+        assert!(store::list_status_events(&c, 1, id).unwrap().is_empty());
     }
 }

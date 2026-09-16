@@ -627,7 +627,42 @@ fn to_strategy(
     })
 }
 
+/// 策略定义校验:名称、股票池、类型与网格都要在入库前拦住,
+/// 否则错误要等到跑完整轮回测才以「未通过」的形式暴露。
+pub fn validate_new_strategy(s: &NewStrategy) -> Result<()> {
+    if s.name.trim().is_empty() {
+        return Err(anyhow!("策略名称不能为空"));
+    }
+    if !matches!(
+        s.kind.as_str(),
+        "dca" | "smart_dca" | "trend" | "rsi" | "adaptive" | "mover"
+    ) {
+        return Err(anyhow!("未知策略类型: {}", s.kind));
+    }
+    if s.pool.is_empty() {
+        return Err(anyhow!("股票池不能为空"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for code in &s.pool {
+        if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(anyhow!("股票代码须为 6 位数字: {code}"));
+        }
+        if !seen.insert(code.as_str()) {
+            return Err(anyhow!("股票池含重复代码: {code}"));
+        }
+    }
+    let grid: toml::Table = s
+        .grid_toml
+        .parse()
+        .map_err(|e| anyhow!("参数网格解析失败: {e}"))?;
+    if grid.is_empty() {
+        return Err(anyhow!("参数网格不能为空"));
+    }
+    Ok(())
+}
+
 pub fn create_strategy(conn: &Connection, s: &NewStrategy, now: NaiveDateTime) -> Result<i64> {
+    validate_new_strategy(s)?;
     let hash = strategy_version_hash(&s.kind, &s.grid_toml, &s.pool);
     conn.execute(
         "INSERT INTO trade_strategies (user_id, name, kind, grid_toml, pool_json, version_hash,
@@ -690,6 +725,7 @@ pub fn update_definition(
     s: &NewStrategy,
     now: NaiveDateTime,
 ) -> Result<DefinitionUpdate> {
+    validate_new_strategy(s)?;
     let Some(cur) = get_strategy(conn, user_id, id)? else {
         return Ok(DefinitionUpdate::NotFound);
     };
@@ -1117,6 +1153,30 @@ mod tests {
                     .into(),
             pool: vec!["600000".into(), "000001".into()],
         }
+    }
+
+    #[test]
+    fn new_strategy_is_validated() {
+        let c = db();
+        let mut s = new_strategy();
+        s.pool = vec!["600000".into(), "600000".into()];
+        assert!(create_strategy(&c, &s, at(16, 9, 0)).is_err(), "重复代码");
+        let mut s = new_strategy();
+        s.pool = Vec::new();
+        assert!(create_strategy(&c, &s, at(16, 9, 0)).is_err(), "空池");
+        let mut s = new_strategy();
+        s.kind = "nope".into();
+        assert!(
+            create_strategy(&c, &s, at(16, 9, 0)).is_err(),
+            "未知策略类型"
+        );
+        let mut s = new_strategy();
+        s.grid_toml = "rsi_window = ".into();
+        assert!(
+            create_strategy(&c, &s, at(16, 9, 0)).is_err(),
+            "网格无法解析"
+        );
+        assert!(create_strategy(&c, &new_strategy(), at(16, 9, 0)).is_ok());
     }
 
     #[test]

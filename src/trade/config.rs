@@ -172,12 +172,8 @@ pub fn from_toml_str(text: &str) -> Result<TradeCfg> {
             wf.test_days
         ));
     }
-    if !["sharpe", "total_return", "annualized", "max_drawdown"].contains(&wf.metric.as_str()) {
-        return Err(anyhow!(
-            "[trade.walk_forward] metric 须是 sharpe|total_return|annualized|max_drawdown,当前 {}",
-            wf.metric
-        ));
-    }
+    crate::trade::admission::walk_forward::validate_metric(&wf.metric)
+        .map_err(|e| anyhow!("[trade.walk_forward] {e}"))?;
     if wf.initial_cash < 0.0 {
         return Err(anyhow!(
             "[trade.walk_forward] initial_cash 须 >= 0,当前 {}",
