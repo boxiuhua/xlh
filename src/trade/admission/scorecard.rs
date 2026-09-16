@@ -1,6 +1,8 @@
 //! 四栏成绩单:样本外(来自最近一次前推回测)、模拟盘、实盘,以及执行损耗。
 
-use crate::trade::admission::stats::{self, equity_drawdown, sell_pnls, trade_returns, FillRow};
+use crate::trade::admission::stats::{
+    self, realized_drawdown, sell_pnls, trade_returns, trade_units, FillRow,
+};
 use crate::trade::admission::walk_forward::PoolMetrics;
 use crate::trade::model::{Account, StrategyStatus};
 use crate::trade::store;
@@ -18,12 +20,14 @@ pub struct StageMetrics {
     pub realized_pnl: f64,
 }
 
+/// 入参仍是成交流水;内部先按工单合并成逻辑交易,笔数与连亏才与回测同口径。
 pub fn stage_metrics(fills: &[FillRow]) -> StageMetrics {
-    let pnls = sell_pnls(fills);
+    let units = trade_units(fills);
+    let pnls = sell_pnls(&units);
     if pnls.is_empty() {
         return StageMetrics::default();
     }
-    let returns = trade_returns(fills);
+    let returns = trade_returns(&units);
     let wins = pnls.iter().filter(|p| **p > 0.0).count();
     StageMetrics {
         trades: pnls.len(),
@@ -33,7 +37,7 @@ pub fn stage_metrics(fills: &[FillRow]) -> StageMetrics {
         } else {
             returns.iter().sum::<f64>() / returns.len() as f64
         },
-        max_drawdown: equity_drawdown(&pnls),
+        max_drawdown: realized_drawdown(fills),
         realized_pnl: pnls.iter().sum(),
     }
 }
@@ -55,6 +59,9 @@ pub fn scorecard(conn: &Connection, user_id: i64, strategy_id: i64) -> Result<Op
     let Some(s) = store::get_strategy(conn, user_id, strategy_id)? else {
         return Ok(None);
     };
+    // 这里的 `.ok()` 是有意的:成绩单纯展示,旧版本落库的 metrics_json 反序列化失败时
+    // 少一栏样本外数据即可,不该让整张成绩单打不开。判定路径(`worker::latest_pool_metrics`)
+    // 恰恰相反——那里必须 fail-closed 上抛错误,否则基线静默缺失会把策略直接放行进实盘。
     let oos = match store::latest_eval(conn, strategy_id, user_id, "oos")? {
         Some((json, _)) => serde_json::from_str::<PoolMetrics>(&json).ok(),
         None => None,
@@ -90,6 +97,7 @@ mod tests {
     fn sell(pnl: f64, price: f64, signal_id: i64) -> FillRow {
         FillRow {
             account: Account::Real,
+            ticket_id: signal_id,
             code: "600000".into(),
             side: Direction::Sell,
             price,
@@ -101,17 +109,49 @@ mod tests {
         }
     }
 
+    /// 买 1000 @10、费 10 → 投入 10 010,回撤的分母。
+    fn buy(signal_id: i64) -> FillRow {
+        FillRow {
+            side: Direction::Buy,
+            realized_pnl: None,
+            price: 10.0,
+            filled_at: at(16, 9, 30),
+            ..sell(0.0, 10.0, signal_id)
+        }
+    }
+
     #[test]
     fn stage_metrics_summarise_fills() {
         let m = stage_metrics(&[
+            buy(0),
             sell(100.0, 11.0, 1),
             sell(-50.0, 11.0, 2),
             sell(20.0, 11.0, 3),
         ]);
-        assert_eq!(m.trades, 3);
+        assert_eq!(m.trades, 3, "买入不计入笔数");
         assert!((m.win_rate - 2.0 / 3.0).abs() < 1e-9);
         assert!((m.realized_pnl - 70.0).abs() < 1e-9);
-        assert!(m.max_drawdown > 0.0);
+        // 权益 10 010 → 10 110(峰值)→ 10 060 → 10 080:最深回撤 50 / 10 110
+        assert!(
+            (m.max_drawdown - 50.0 / 10_110.0).abs() < 1e-12,
+            "{}",
+            m.max_drawdown
+        );
         assert_eq!(stage_metrics(&[]), StageMetrics::default());
+    }
+
+    /// 裁决 5:分批成交按工单合并——三批卖出只是 1 笔。
+    #[test]
+    fn stage_metrics_merge_partial_fills_of_one_ticket() {
+        let batch: Vec<FillRow> = (0..3)
+            .map(|i| FillRow {
+                filled_at: at(16, 10, i),
+                ..sell(-10.0, 11.0, 9)
+            })
+            .collect();
+        let m = stage_metrics(&batch);
+        assert_eq!(m.trades, 1, "同一工单三批成交是 1 笔");
+        assert!((m.realized_pnl - (-30.0)).abs() < 1e-9);
+        assert_eq!(m.win_rate, 0.0);
     }
 }

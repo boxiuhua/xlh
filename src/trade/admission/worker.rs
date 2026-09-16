@@ -9,7 +9,7 @@ use crate::trade::admission::walk_forward::{self, PoolMetrics, PoolProgress, Wal
 use crate::trade::config::AdmissionCfg;
 use crate::trade::model::{EvalJob, EvalKind, StrategyStatus};
 use crate::trade::store;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDateTime;
 use rusqlite::Connection;
 
@@ -20,17 +20,22 @@ pub struct JobContext<'a> {
 }
 
 /// 最近一次前推回测的池内指标(供观察期与 watchdog 取基线)。
+///
+/// 反序列化失败必须上抛而不能吞成 `None`:判定路径把「没有基线」当成「只查天数和笔数」,
+/// 一次 schema 变更(本分支就因 `trade_baseline` 加字段补过 `#[serde(default)]`)会让
+/// 所有非 mover 策略零业绩证据地被准入。展示路径(`scorecard.rs`)才可以容错。
 fn latest_pool_metrics(
     conn: &Connection,
     user_id: i64,
     strategy_id: i64,
 ) -> Result<Option<PoolMetrics>> {
-    Ok(
-        match store::latest_eval(conn, strategy_id, user_id, "oos")? {
-            Some((json, _)) => serde_json::from_str::<PoolMetrics>(&json).ok(),
-            None => None,
-        },
-    )
+    match store::latest_eval(conn, strategy_id, user_id, "oos")? {
+        Some((json, _)) => Ok(Some(
+            serde_json::from_str::<PoolMetrics>(&json)
+                .with_context(|| format!("策略 {strategy_id} 的 oos 评估结果无法反序列化"))?,
+        )),
+        None => Ok(None),
+    }
 }
 
 pub fn run_job<F>(conn: &mut Connection, job: &EvalJob, ctx: &JobContext, load: F) -> Result<String>
@@ -120,14 +125,19 @@ where
             )?
             .unwrap_or(s.updated_at);
             let stats = stats::paper_stats(conn, job.user_id, job.strategy_id, since, ctx.now)?;
-            let baseline = if s.kind == "mover" {
+            let is_mover = s.kind == "mover";
+            let baseline = if is_mover {
                 None
             } else {
                 latest_pool_metrics(conn, job.user_id, job.strategy_id)?
                     .map(|m| BacktestBaseline::from_pool(&m))
             };
-            let verdict =
-                judge::judge_paper(&stats, baseline.as_ref(), s.kind == "mover", ctx.admission);
+            // fail-closed:非异动类策略缺回测基线时,`judge_paper` 只会检查天数与笔数,
+            // 等于零业绩证据就授予实盘信号权限。这里必须拒绝,与 Watchdog 分支一致。
+            if !is_mover && baseline.is_none() {
+                return Ok("跳过:缺回测基线,无法判定观察期".to_string());
+            }
+            let verdict = judge::judge_paper(&stats, baseline.as_ref(), is_mover, ctx.admission);
             if !verdict.passed {
                 return Ok(format!("观察期未达标:{}", verdict.reasons.join(";")));
             }
@@ -149,11 +159,21 @@ where
             let Some(metrics) = latest_pool_metrics(conn, job.user_id, job.strategy_id)? else {
                 return Ok("跳过:无回测基线".to_string());
             };
+            // 统计窗口从**本次准入**起算:回撤与连亏是永不衰减的运行最大值,取全历史会让
+            // 复活(Suspended → Backtesting → Paper → Admitted)后的第一次 watchdog
+            // 拿同一份旧证据再次暂停,策略永远无法康复。老数据没有事件行时退回全历史。
+            let since = store::last_transition_at(
+                conn,
+                job.strategy_id,
+                job.user_id,
+                StrategyStatus::Admitted,
+            )?;
             let stats = stats::watchdog_stats(
                 conn,
                 job.user_id,
                 job.strategy_id,
                 ctx.admission.watchdog_window,
+                since,
             )?;
             let baseline = BacktestBaseline::from_pool(&metrics);
             match judge::judge_watchdog(
@@ -273,6 +293,7 @@ mod tests {
         strategy_id: i64,
         account: Account,
         side: crate::event::Direction,
+        price: f64,
         realized: Option<f64>,
         key: &str,
         now: NaiveDateTime,
@@ -285,7 +306,7 @@ mod tests {
             name: None,
             side,
             scope: AccountScope::Both,
-            ref_price: 11.0,
+            ref_price: price,
             reason: "测试".into(),
             ai_note: None,
             dedup_key: key.into(),
@@ -301,7 +322,7 @@ mod tests {
                 account,
                 code: "600000".into(),
                 side,
-                suggest_price: 11.0,
+                suggest_price: price,
                 qty: 1000,
                 expires_at: now + chrono::Duration::minutes(30),
                 deviation_th: 0.015,
@@ -313,12 +334,13 @@ mod tests {
         .unwrap();
         c.execute(
             "INSERT INTO trade_fills (ticket_id, user_id, account, code, side, price, qty, fee, realized_pnl, source, filled_at)
-             VALUES (?1, ?2, ?3, '600000', ?4, 11.0, 1000, 10.61, ?5, 'test', ?6)",
+             VALUES (?1, ?2, ?3, '600000', ?4, ?5, 1000, 10.61, ?6, 'test', ?7)",
             rusqlite::params![
                 tid,
                 1i64,
                 account.as_str(),
                 crate::trade::model::side_str(side),
+                price,
                 realized,
                 crate::trade::model::fmt_ts(now),
             ],
@@ -335,6 +357,7 @@ mod tests {
                 strategy_id,
                 Account::Paper,
                 crate::event::Direction::Sell,
+                11.0,
                 Some(pnl),
                 &format!("paper{i}"),
                 t,
@@ -351,11 +374,64 @@ mod tests {
                 strategy_id,
                 Account::Real,
                 crate::event::Direction::Sell,
+                11.0,
                 Some(-50.0),
                 &format!("real{i}"),
                 t,
             );
         }
+    }
+
+    /// 一份真实的回测基线:样本外最大回撤 20%、胜率 55%、最长连亏 4 笔,落库为 `oos` 评估。
+    fn seed_baseline(c: &Connection, strategy_id: i64, now: NaiveDateTime) {
+        let mut m = crate::trade::admission::walk_forward::aggregate(Vec::new());
+        m.oos_max_drawdown = 0.20;
+        m.trade_baseline.win_rate = 0.55;
+        m.trade_baseline.max_consecutive_losses = 4;
+        let s = store::get_strategy(c, 1, strategy_id).unwrap().unwrap();
+        store::save_eval(
+            c,
+            strategy_id,
+            1,
+            &s.version_hash,
+            "oos",
+            &serde_json::to_string(&m).unwrap(),
+            at(15, 9, 0).date(),
+            now.date(),
+            now,
+        )
+        .unwrap();
+    }
+
+    /// 把策略推到 `Admitted`(回测 → 观察期 → 准入),返回策略 id。
+    fn admitted_strategy(c: &Connection, kind: &str) -> i64 {
+        let id = strategy(c, kind);
+        state::submit_for_backtest(c, 1, id, at(15, 9, 0)).unwrap();
+        state::apply_backtest_verdict(
+            c,
+            1,
+            id,
+            &crate::trade::admission::walk_forward::aggregate(Vec::new()),
+            &crate::trade::admission::judge::Verdict {
+                passed: true,
+                reasons: Vec::new(),
+            },
+            at(15, 9, 0).date(),
+            at(16, 9, 0).date(),
+            at(15, 9, 1),
+        )
+        .unwrap();
+        state::update_status(
+            c,
+            1,
+            id,
+            StrategyStatus::Paper,
+            StrategyStatus::Admitted,
+            "准入",
+            at(15, 9, 2),
+        )
+        .unwrap();
+        id
     }
 
     #[test]
@@ -438,35 +514,113 @@ mod tests {
         );
     }
 
+    /// 裁决 3:非异动类策略缺回测基线时不得准入——`judge_paper` 在 `baseline = None`
+    /// 下只剩天数与笔数两道关,放行等于零业绩证据授予实盘信号权限。
     #[test]
-    fn watchdog_job_suspends_admitted_strategy_on_deep_drawdown() {
+    fn paper_check_refuses_to_admit_without_a_backtest_baseline() {
         let mut c = db();
-        let id = strategy(&c, "trend");
-        state::submit_for_backtest(&c, 1, id, at(15, 9, 0)).unwrap();
-        state::apply_backtest_verdict(
-            &c,
-            1,
-            id,
-            &crate::trade::admission::walk_forward::aggregate(Vec::new()),
-            &crate::trade::admission::judge::Verdict {
-                passed: true,
-                reasons: Vec::new(),
-            },
-            at(15, 9, 0).date(),
-            at(16, 9, 0).date(),
-            at(15, 9, 1),
-        )
-        .unwrap();
+        let id = strategy(&c, "trend"); // 非 mover
+        state::submit_for_backtest(&c, 1, id, at(1, 9, 0)).unwrap(); // → Backtesting
+                                                                     // 直接进观察期,不落任何 oos 评估(模拟 schema 变更后基线读不出来的情形)
         state::update_status(
             &c,
             1,
             id,
+            StrategyStatus::Backtesting,
             StrategyStatus::Paper,
-            StrategyStatus::Admitted,
-            "准入",
-            at(15, 9, 2),
+            "进入观察期",
+            NaiveDate::from_ymd_opt(2026, 8, 3)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
         )
         .unwrap();
+        // 天数(8-03 → 9-16 共 33 个工作日 ≥ 20)与笔数(12 ≥ 10)都达标
+        seed_paper_fills(&mut c, id, 12, 100.0);
+        assert!(
+            store::latest_eval(&c, id, 1, "oos").unwrap().is_none(),
+            "前提:没有任何 oos 评估"
+        );
+        let (wf, adm) = ctx(at(16, 15, 0));
+        let j = job(&c, id, EvalKind::PaperCheck);
+        let note = run_job(
+            &mut c,
+            &j,
+            &JobContext {
+                wf: &wf,
+                admission: &adm,
+                now: at(16, 15, 0),
+            },
+            |_| Ok(Vec::new()),
+        )
+        .unwrap();
+        assert!(note.contains("缺回测基线"), "{note}");
+        assert_eq!(
+            store::get_strategy(&c, 1, id).unwrap().unwrap().status,
+            StrategyStatus::Paper,
+            "缺基线不得准入"
+        );
+    }
+
+    /// 裁决 3:落库的 `metrics_json` 读不出来时必须上抛,不得静默退化成「无基线」。
+    #[test]
+    fn unreadable_baseline_is_an_error_not_a_silent_admission() {
+        let mut c = db();
+        let id = strategy(&c, "trend");
+        state::submit_for_backtest(&c, 1, id, at(1, 9, 0)).unwrap();
+        state::update_status(
+            &c,
+            1,
+            id,
+            StrategyStatus::Backtesting,
+            StrategyStatus::Paper,
+            "进入观察期",
+            NaiveDate::from_ymd_opt(2026, 8, 3)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+        )
+        .unwrap();
+        seed_paper_fills(&mut c, id, 12, 100.0);
+        let s = store::get_strategy(&c, 1, id).unwrap().unwrap();
+        // 模拟 schema 变更后旧记录无法反序列化
+        store::save_eval(
+            &c,
+            id,
+            1,
+            &s.version_hash,
+            "oos",
+            "{\"totally\":\"not a PoolMetrics\"}",
+            at(15, 9, 0).date(),
+            at(16, 9, 0).date(),
+            at(16, 9, 0),
+        )
+        .unwrap();
+        let (wf, adm) = ctx(at(16, 15, 0));
+        let j = job(&c, id, EvalKind::PaperCheck);
+        let err = run_job(
+            &mut c,
+            &j,
+            &JobContext {
+                wf: &wf,
+                admission: &adm,
+                now: at(16, 15, 0),
+            },
+            |_| Ok(Vec::new()),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("无法反序列化"), "{err:#}");
+        assert_eq!(
+            store::get_strategy(&c, 1, id).unwrap().unwrap().status,
+            StrategyStatus::Paper,
+            "读不出基线不得准入"
+        );
+    }
+
+    #[test]
+    fn watchdog_job_keeps_admitted_when_baseline_is_empty() {
+        let mut c = db();
+        let id = admitted_strategy(&c, "trend");
         // 回测基线为空(aggregate(vec![]) 的 max_drawdown = 0)→ 回撤规则不触发,连亏规则也不触发
         seed_real_losses(&mut c, id, 5);
         let (wf, adm) = ctx(at(16, 15, 0));
@@ -486,6 +640,132 @@ mod tests {
             store::get_strategy(&c, 1, id).unwrap().unwrap().status,
             StrategyStatus::Admitted,
             "空基线不应误暂停"
+        );
+    }
+
+    /// 裁决 4:端到端的真暂停——真实基线 + 真实成交流水,经 `run_job` 走到 `Suspended`。
+    /// 这是唯一能同时抓住「回撤分母」「统计窗口」「基线缺失」三个接缝缺陷的用例。
+    #[test]
+    fn watchdog_job_suspends_admitted_strategy_on_real_drawdown() {
+        let mut c = db();
+        let id = admitted_strategy(&c, "trend");
+        seed_baseline(&c, id, at(15, 9, 3));
+        // 建仓:买 1000 @10,费 10.61 → 投入 10 010.61
+        seed_fill(
+            &mut c,
+            id,
+            Account::Real,
+            crate::event::Direction::Buy,
+            10.0,
+            None,
+            "rb",
+            at(16, 9, 30),
+        );
+        // 割肉:卖 1000 @6,已实现 −4 000 → 回撤 4000 / 10 010.61 ≈ 39.96% > 20% × 1.5
+        seed_fill(
+            &mut c,
+            id,
+            Account::Real,
+            crate::event::Direction::Sell,
+            6.0,
+            Some(-4000.0),
+            "rs",
+            at(16, 10, 0),
+        );
+        let (wf, adm) = ctx(at(16, 15, 0));
+        let j = job(&c, id, EvalKind::Watchdog);
+        let note = run_job(
+            &mut c,
+            &j,
+            &JobContext {
+                wf: &wf,
+                admission: &adm,
+                now: at(16, 15, 0),
+            },
+            |_| Ok(Vec::new()),
+        )
+        .unwrap();
+        assert!(note.contains("已暂停"), "{note}");
+        let got = store::get_strategy(&c, 1, id).unwrap().unwrap();
+        assert_eq!(got.status, StrategyStatus::Suspended);
+        assert!(
+            got.status_reason.as_deref().unwrap_or("").contains("回撤"),
+            "{:?}",
+            got.status_reason
+        );
+    }
+
+    /// 裁决 2:watchdog 只看本次准入之后的成交,否则被暂停的策略复活后会被同一份
+    /// 旧证据立刻再次暂停,永远无法康复。
+    #[test]
+    fn watchdog_job_ignores_fills_from_before_this_admission() {
+        let mut c = db();
+        let id = strategy(&c, "trend");
+        state::submit_for_backtest(&c, 1, id, at(15, 9, 0)).unwrap();
+        state::apply_backtest_verdict(
+            &c,
+            1,
+            id,
+            &crate::trade::admission::walk_forward::aggregate(Vec::new()),
+            &crate::trade::admission::judge::Verdict {
+                passed: true,
+                reasons: Vec::new(),
+            },
+            at(15, 9, 0).date(),
+            at(16, 9, 0).date(),
+            at(15, 9, 1),
+        )
+        .unwrap();
+        seed_baseline(&c, id, at(15, 9, 3));
+        // 上一轮实盘的惨状:投入 10 010.61,亏掉 4 000(回撤 ≈ 40%)
+        seed_fill(
+            &mut c,
+            id,
+            Account::Real,
+            crate::event::Direction::Buy,
+            10.0,
+            None,
+            "oldb",
+            at(15, 10, 0),
+        );
+        seed_fill(
+            &mut c,
+            id,
+            Account::Real,
+            crate::event::Direction::Sell,
+            6.0,
+            Some(-4000.0),
+            "olds",
+            at(15, 10, 1),
+        );
+        // 复活:重新准入(事件时间在旧成交之后)
+        state::update_status(
+            &c,
+            1,
+            id,
+            StrategyStatus::Paper,
+            StrategyStatus::Admitted,
+            "重新准入",
+            at(16, 9, 0),
+        )
+        .unwrap();
+        let (wf, adm) = ctx(at(16, 15, 0));
+        let j = job(&c, id, EvalKind::Watchdog);
+        let note = run_job(
+            &mut c,
+            &j,
+            &JobContext {
+                wf: &wf,
+                admission: &adm,
+                now: at(16, 15, 0),
+            },
+            |_| Ok(Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(note, "实盘表现正常", "旧回撤不得再次开火");
+        assert_eq!(
+            store::get_strategy(&c, 1, id).unwrap().unwrap().status,
+            StrategyStatus::Admitted
         );
     }
 }

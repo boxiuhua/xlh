@@ -160,7 +160,7 @@ pub fn judge_paper(
 /// 实盘监控统计(spec §10.5)。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WatchdogStats {
-    /// 累计已实现盈亏曲线的最大回撤
+    /// 权益曲线(投入资金峰值 + 累计已实现盈亏)的最大回撤,与回测 `oos_max_drawdown` 同口径
     pub drawdown: f64,
     /// 最近窗口内的胜率
     pub recent_win_rate: f64,
@@ -178,6 +178,9 @@ pub fn judge_watchdog(
     backtest_max_streak: usize,
     cfg: &AdmissionCfg,
 ) -> Option<String> {
+    // 有意不加最小笔数守卫(与下面的胜率规则不同):分母修正为投入资金后,
+    // `drawdown` 是真实发生的资金损失比例,不是小样本里的统计噪声——两笔就亏掉
+    // 回测最大回撤 1.5 倍的资金,本来就该立刻停手。胜率则是频率估计,必须有样本量。
     if baseline.max_drawdown > 0.0 && s.drawdown > baseline.max_drawdown * cfg.drawdown_multiple {
         return Some(format!(
             "实盘回撤 {:.1}% 超过回测 {:.1}% 的 {:.1} 倍",
