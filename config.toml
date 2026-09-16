@@ -56,3 +56,11 @@ max_push_per_tick = 5
 # monitor_interval_secs = 15    # 交易时段报价轮询间隔(秒)
 # alert_after_secs = 180        # 连续失败多久推送「止损监听中断」
 # mover_signals = true          # 实时异动转为观察期(仅模拟盘)交易信号
+
+# [trade.eval]
+# enabled = true       # 是否启动策略评估线程
+# poll_secs = 30       # 空闲时轮询任务队列的间隔(秒)
+# daily_hour = 16      # 每日入队「观察期检查 / 实盘监控」的时刻
+# daily_minute = 30
+# monthly_day = 1      # 每月重跑前推回测的日与时
+# monthly_hour = 17

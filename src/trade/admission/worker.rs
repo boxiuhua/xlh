@@ -73,6 +73,23 @@ where
             if outcome.cancelled {
                 return Ok("已取消".to_string());
             }
+            // 月度重跑与首次回测对「数据不足」的处理必须不同:首次回测(仍在
+            // Backtesting)按 spec §10.3/§12 fail-closed,直接判未通过。但已在
+            // Paper/Admitted 的策略月度重跑时,`run_pool` 把单只代码的加载失败
+            // 吸收进 `skipped` 而不是报错——行情源抽风、限流或断网都会让大半池子
+            // 加载失败,`aggregate` 于是给出 data_years=0、全零指标的假阴性,
+            // `judge_backtest` 会因为 `min_years`/`min_evaluated_ratio` 判定未通过,
+            // 进而把一个健康策略暂停。这不是「不达标」,是「这个月量不到数据」,
+            // 必须原样跳过、不写评估、不改状态,好让任务能在下次重跑时重试。
+            if s.status != StrategyStatus::Backtesting {
+                let requested = outcome.metrics.requested;
+                if requested > 0
+                    && (outcome.metrics.codes.len() as f64 / requested as f64)
+                        < ctx.admission.min_evaluated_ratio
+                {
+                    return Ok("跳过:池内数据不足,本月不裁决".to_string());
+                }
+            }
             let verdict = judge::judge_backtest(&outcome.metrics, ctx.admission);
             let (from, to) = (ctx.now.date(), ctx.now.date());
             let transition = if s.status == StrategyStatus::Backtesting {
@@ -463,6 +480,40 @@ mod tests {
             "评估结果落库"
         );
         assert!(!note.is_empty());
+    }
+
+    /// 月度重跑遇到「拉不到数据」(行情源限流/断网,不是策略真的不达标)不能
+    /// 当成未通过处理:既不能降级 `Admitted`,也不能落一条全零指标的 `oos` 评估
+    /// 覆盖掉此前真实的基线,否则下一轮 watchdog/观察期判定会用假基线。
+    #[test]
+    fn walk_forward_monthly_rerun_skips_verdict_when_pool_data_is_unavailable() {
+        let mut c = db();
+        let id = admitted_strategy(&c, "trend");
+        seed_baseline(&c, id, at(15, 9, 3));
+        let before = store::latest_eval(&c, id, 1, "oos").unwrap().unwrap();
+        let j = job(&c, id, EvalKind::WalkForward);
+        let (wf, adm) = ctx(at(16, 15, 0));
+        let note = run_job(
+            &mut c,
+            &j,
+            &JobContext {
+                wf: &wf,
+                admission: &adm,
+                now: at(16, 15, 0),
+            },
+            // 模拟行情源不可用:池内每只代码都加载失败(`run_pool` 把它吸收进
+            // skipped,不会直接报错),而不是网络异常一路 `?` 冒泡上去。
+            |_| Err(anyhow::anyhow!("网络不可用")),
+        )
+        .unwrap();
+        assert!(note.contains("池内数据不足"), "{note}");
+        assert_eq!(
+            store::get_strategy(&c, 1, id).unwrap().unwrap().status,
+            StrategyStatus::Admitted,
+            "拉不到数据不得暂停健康策略"
+        );
+        let after = store::latest_eval(&c, id, 1, "oos").unwrap().unwrap();
+        assert_eq!(after, before, "跳过时不应覆盖已有基线");
     }
 
     #[test]

@@ -380,7 +380,7 @@ pub struct StrategyDef {
 }
 
 /// 评估任务类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvalKind {
     /// 滚动前推回测

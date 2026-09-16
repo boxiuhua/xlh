@@ -97,6 +97,35 @@ impl WalkForwardTuning {
     }
 }
 
+/// 评估线程配置(计划 3d):自动入队与执行前推回测/观察期检查/看门狗。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EvalCfg {
+    /// 是否启动评估线程
+    pub enabled: bool,
+    /// 空闲时轮询队列的间隔(秒)
+    pub poll_secs: u64,
+    /// 每日入队 PaperCheck / Watchdog 的时刻
+    pub daily_hour: u32,
+    pub daily_minute: u32,
+    /// 每月重跑 WalkForward 的日、时
+    pub monthly_day: u32,
+    pub monthly_hour: u32,
+}
+
+impl Default for EvalCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_secs: 30,
+            daily_hour: 16,
+            daily_minute: 30,
+            monthly_day: 1,
+            monthly_hour: 17,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TradeCfg {
@@ -112,6 +141,7 @@ pub struct TradeCfg {
     /// 前推回测成交滑点(比例)
     pub slippage: f64,
     pub walk_forward: WalkForwardTuning,
+    pub eval: EvalCfg,
 }
 
 impl Default for TradeCfg {
@@ -124,6 +154,7 @@ impl Default for TradeCfg {
             admission: AdmissionCfg::default(),
             slippage: 0.001,
             walk_forward: WalkForwardTuning::default(),
+            eval: EvalCfg::default(),
         }
     }
 }
@@ -298,6 +329,26 @@ pub fn from_toml_str(text: &str) -> Result<TradeCfg> {
         return Err(anyhow!(
             "[trade.admission] watchdog_min_trades 须 >= 1,当前 {}",
             a.watchdog_min_trades
+        ));
+    }
+    let e = &cfg.eval;
+    if e.poll_secs < 5 {
+        return Err(anyhow!(
+            "[trade.eval] poll_secs 须 ≥ 5,当前 {}",
+            e.poll_secs
+        ));
+    }
+    if e.daily_hour > 23 || e.monthly_hour > 23 {
+        return Err(anyhow!("[trade.eval] 小时须在 0..=23"));
+    }
+    if e.daily_minute > 59 {
+        return Err(anyhow!("[trade.eval] daily_minute 须在 0..=59"));
+    }
+    // 28 之后的日子并非每月都有,会导致 2 月整月不重跑
+    if e.monthly_day < 1 || e.monthly_day > 28 {
+        return Err(anyhow!(
+            "[trade.eval] monthly_day 须在 1..=28,当前 {}",
+            e.monthly_day
         ));
     }
     Ok(cfg)
@@ -487,6 +538,37 @@ mod tests {
         assert!(
             from_toml_str("[trade]\n[trade.walk_forward]\ninitial_cash = -1.0\n").is_err(),
             "initial_cash 须 >= 0"
+        );
+    }
+
+    #[test]
+    fn eval_cfg_defaults_and_validation() {
+        let c = from_toml_str("[trade]\n").unwrap().eval;
+        assert!(c.enabled);
+        assert_eq!(c.poll_secs, 30);
+        assert_eq!((c.daily_hour, c.daily_minute), (16, 30));
+        assert_eq!((c.monthly_day, c.monthly_hour), (1, 17));
+
+        let c = from_toml_str("[trade.eval]\npoll_secs = 60\ndaily_hour = 15\n")
+            .unwrap()
+            .eval;
+        assert_eq!((c.poll_secs, c.daily_hour), (60, 15));
+
+        assert!(
+            from_toml_str("[trade.eval]\npoll_secs = 0\n").is_err(),
+            "轮询须 ≥ 5 秒"
+        );
+        assert!(from_toml_str("[trade.eval]\ndaily_hour = 24\n").is_err());
+        assert!(from_toml_str("[trade.eval]\ndaily_minute = 60\n").is_err());
+        assert!(from_toml_str("[trade.eval]\nmonthly_day = 0\n").is_err());
+        assert!(
+            from_toml_str("[trade.eval]\nmonthly_day = 29\n").is_err(),
+            "避开 2 月无此日"
+        );
+        assert!(from_toml_str("[trade.eval]\nmonthly_hour = 24\n").is_err());
+        assert!(
+            from_toml_str("[trade.eval]\nunknown = 1\n").is_err(),
+            "拒绝未知键"
         );
     }
 

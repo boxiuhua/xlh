@@ -668,8 +668,17 @@ fn run_loop(db_path: PathBuf, cfg: TradeCfg) {
                 admission: &cfg.admission,
                 eval: &cfg.eval,
             };
+            // 前推回测要尽可能长的历史(准入的数据年限关默认 3 年,训练窗还要再往前推),
+            // 统一取 12 年;`load_or_fetch` 命中缓存就不会真的联网。
+            let end = now.date();
+            let start = end - chrono::Duration::days(365 * 12);
             let out = tick(&mut conn, &deps, &mut state, now, |code| {
-                crate::stock::data::load_bars(code)
+                crate::stock::data::cache::load_or_fetch(
+                    code,
+                    std::path::Path::new(".cache/stock"),
+                    start,
+                    end,
+                )
             });
             for e in &out.errors {
                 eprintln!("[trade] {e}");
@@ -688,7 +697,9 @@ fn run_loop(db_path: PathBuf, cfg: TradeCfg) {
 }
 ```
 
-> `cfg.walk_forward.to_cfg(cfg.slippage)` 与 `crate::stock::data::load_bars(code)` 按当前代码的实际名字调整:前者在 `config.rs` 里把 `WalkForwardTuning` 转成 `WalkForwardCfg`(若尚无此方法则按 `walk_forward.rs` 的用法补一个),后者取 `src/stock/data.rs` 中既有的东财 K 线加载函数(若需要复权/日期区间参数,按 `walk_forward` 现有调用方的写法传)。每轮重建 `WalkForwardCfg` 开销可忽略,但若借用检查不便,可在循环外构造一次。
+> 两处已核对(直接照用,无需再找):`WalkForwardTuning::to_cfg(&self, slippage: f64) -> WalkForwardCfg` 在 `src/trade/config.rs:88`;K 线加载用 `crate::stock::data::cache::load_or_fetch(input, cache_dir, start, end) -> Result<Vec<StockBar>>`(`src/stock/data/cache.rs:50`),缓存目录与选股页一致,取 `.cache/stock`(见 `src/web/stock.rs:19` 的 `stock_cache()` 与 `:303` 的调用)。
+>
+> `WalkForwardCfg` 在循环外构造一次即可(`to_cfg` 每轮重建也无妨,但 `EvalDeps` 借用它,放循环外更省事);`start`/`end` 每轮重算,跨日时自动跟进。
 
 `src/main.rs` 的 Push 分支,在 `daemon::spawn(...)` 之后追加:
 
