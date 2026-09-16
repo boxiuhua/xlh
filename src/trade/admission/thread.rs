@@ -94,11 +94,25 @@ where
         admission: deps.admission,
         now,
     };
-    let (note, error) = match worker::run_job(conn, &job, &ctx, load) {
-        Ok(note) => (note, None),
-        Err(err) => {
+    // `run_job` 内部 panic(如回测代码遇到极端输入)只用外层 `catch_unwind` 兜底会
+    // 恢复线程,但领到的任务行仍停在 running:`state.reclaimed` 本轮已经是
+    // true,不会再有人回收,`enqueue_eval` 的 queued/running 去重又会让同策略
+    // 同类型永远排不进队——必须在这里把 panic 当成 Err,才能照常 `finish_job`。
+    // `state::*` 用 `unchecked_transaction()`,其 RAII 守卫在 unwind 时 Drop 会
+    // 回滚,数据库不会残留半截写入;这里只是把「任务」这一行标记失败。
+    let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        worker::run_job(&mut *conn, &job, &ctx, load)
+    }));
+    let (note, error) = match run_result {
+        Ok(Ok(note)) => (note, None),
+        Ok(Err(err)) => {
             let msg = format!("{err:#}");
             out.errors.push(format!("任务 {} 执行失败: {msg}", job.id));
+            (msg.clone(), Some(msg))
+        }
+        Err(payload) => {
+            let msg = format!("任务执行 panic: {}", panic_message(&payload));
+            out.errors.push(format!("任务 {} {msg}", job.id));
             (msg.clone(), Some(msg))
         }
     };
@@ -108,6 +122,17 @@ where
     }
     out.ran = Some((job.strategy_id, note));
     out
+}
+
+/// 从 panic payload 里尽量取出可读文本;取不到就给个占位,不能让收尾逻辑崩掉。
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "未知 panic".to_string()
+    }
 }
 
 pub fn spawn(db_path: PathBuf, cfg: TradeCfg) -> std::io::Result<std::thread::JoinHandle<()>> {
@@ -298,6 +323,80 @@ mod tests {
         assert!(!r.errors.is_empty(), "失败被记录");
         let j = store::get_job(&c, 1, /* job_id */ 1).unwrap().unwrap();
         assert_eq!(j.status, crate::trade::model::JobStatus::Failed);
-        assert!(j.error.unwrap().contains("网格") || j.finished_at.is_some());
+        // 实际报错来自 `expand_grid`("...必须是数组，例如 k = [..]"),不含「网格」
+        // 二字;原断言用 `|| j.finished_at.is_some()` 兜底是永真式,`finish_job`
+        // 总会写 finished_at,右侧条件形同虚设,这里直接钉死真实文案。
+        assert!(
+            j.error.as_deref().unwrap().contains("必须是数组"),
+            "{:?}",
+            j.error
+        );
+    }
+
+    /// panic 与 `Err` 走同一条收尾路径:`run_job` 内部 panic(经由 `load` 闭包注入)
+    /// 只被外层线程的 `catch_unwind` 兜住会恢复线程但留下 running 的任务行——
+    /// `state.reclaimed` 本轮已是 true,不会再有人回收,而 `enqueue_eval` 的
+    /// queued/running 去重会让同策略同类型永远排不进队。`tick` 内必须自己把
+    /// panic 当成 `Err` 处理并照常 `finish_job`。
+    #[test]
+    fn a_panicking_job_is_recorded_failed_not_left_running() {
+        let mut c = db();
+        let id = store::create_strategy(
+            &c,
+            &NewStrategy {
+                user_id: 1,
+                name: "S".into(),
+                kind: "trend".into(),
+                grid_toml: "short_window = [3, 5]\nlong_window = [10]\namount = [20000.0]".into(),
+                pool: vec!["600000".into()],
+            },
+            at(16, 9, 0),
+        )
+        .unwrap();
+        state::submit_for_backtest(&c, 1, id, at(16, 9, 1)).unwrap();
+        store::enqueue_eval(&c, 1, id, EvalKind::WalkForward, at(16, 9, 2)).unwrap();
+        let (wf, adm, ev) = deps();
+        let d = EvalDeps {
+            wf: &wf,
+            admission: &adm,
+            eval: &ev,
+        };
+        let mut st = TickState {
+            reclaimed: true,
+            ..Default::default()
+        };
+        // load 闭包 panic,模拟回测代码遇到极端输入
+        let r = tick(
+            &mut c,
+            &d,
+            &mut st,
+            at(16, 10, 0),
+            |_| -> Result<Vec<StockBar>> { panic!("模拟加载 K 线时崩溃") },
+        );
+        assert!(
+            r.errors.iter().any(|e| e.contains("panic")),
+            "panic 应被记录为错误: {:?}",
+            r.errors
+        );
+        let j = store::get_job(&c, 1, 1).unwrap().unwrap();
+        assert_eq!(
+            j.status,
+            crate::trade::model::JobStatus::Failed,
+            "panic 后任务不能停在 running"
+        );
+        assert!(
+            j.error.as_deref().unwrap_or("").contains("panic"),
+            "{:?}",
+            j.error
+        );
+        assert!(j.finished_at.is_some());
+
+        // 同策略同类型此后仍能重新入队,证明没有永久卡死在 running
+        assert!(
+            store::enqueue_eval(&c, 1, id, EvalKind::WalkForward, at(16, 11, 0))
+                .unwrap()
+                .is_some(),
+            "panic 后应可重新入队"
+        );
     }
 }
