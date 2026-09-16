@@ -379,6 +379,79 @@ pub struct StrategyDef {
     pub updated_at: NaiveDateTime,
 }
 
+/// 评估任务类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalKind {
+    /// 滚动前推回测
+    WalkForward,
+    /// 观察期检查
+    PaperCheck,
+    /// 实盘表现监控
+    Watchdog,
+}
+
+impl EvalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EvalKind::WalkForward => "walk_forward",
+            EvalKind::PaperCheck => "paper_check",
+            EvalKind::Watchdog => "watchdog",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "walk_forward" => EvalKind::WalkForward,
+            "paper_check" => EvalKind::PaperCheck,
+            "watchdog" => EvalKind::Watchdog,
+            _ => return Err(anyhow!("未知评估任务类型: {s}")),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobStatus {
+    Queued,
+    Running,
+    Done,
+    Failed,
+}
+
+impl JobStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobStatus::Queued => "queued",
+            JobStatus::Running => "running",
+            JobStatus::Done => "done",
+            JobStatus::Failed => "failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "queued" => JobStatus::Queued,
+            "running" => JobStatus::Running,
+            "done" => JobStatus::Done,
+            "failed" => JobStatus::Failed,
+            _ => return Err(anyhow!("未知任务状态: {s}")),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvalJob {
+    pub id: i64,
+    pub user_id: i64,
+    pub strategy_id: i64,
+    pub kind: EvalKind,
+    pub status: JobStatus,
+    pub progress: Option<String>,
+    pub error: Option<String>,
+    pub created_at: NaiveDateTime,
+}
+
 /// 定义指纹:类型 + 网格 + 排序后的股票池。定义一变即换版本,状态回到草稿。
 pub fn strategy_version_hash(kind: &str, grid_toml: &str, pool: &[String]) -> String {
     use sha2::{Digest, Sha256};
@@ -431,6 +504,21 @@ mod tests {
             AccountScope::PaperOnly,
         ] {
             assert_eq!(AccountScope::parse(sc.as_str()).unwrap(), sc);
+        }
+        for k in [
+            EvalKind::WalkForward,
+            EvalKind::PaperCheck,
+            EvalKind::Watchdog,
+        ] {
+            assert_eq!(EvalKind::parse(k.as_str()).unwrap(), k);
+        }
+        for js in [
+            JobStatus::Queued,
+            JobStatus::Running,
+            JobStatus::Done,
+            JobStatus::Failed,
+        ] {
+            assert_eq!(JobStatus::parse(js.as_str()).unwrap(), js);
         }
         assert_eq!(
             parse_side(side_str(Direction::Sell)).unwrap(),

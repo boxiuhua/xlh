@@ -1,8 +1,8 @@
 //! 交易表结构与账户 / 风控 / 持仓读写。所有查询按 user_id 隔离。
 
 use crate::trade::model::{
-    fmt_ts, parse_ts, strategy_version_hash, Account, AccountState, NewStrategy, Position, Quote,
-    RiskRules, StrategyDef, StrategyStatus, DATE_FMT,
+    fmt_ts, parse_ts, strategy_version_hash, Account, AccountState, EvalJob, EvalKind, JobStatus,
+    NewStrategy, Position, Quote, RiskRules, StrategyDef, StrategyStatus, DATE_FMT,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{NaiveDate, NaiveDateTime};
@@ -137,6 +137,19 @@ CREATE TABLE IF NOT EXISTS trade_strategy_events (
   at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trade_strategy_events ON trade_strategy_events(strategy_id, id);
+CREATE TABLE IF NOT EXISTS trade_eval_jobs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     INTEGER NOT NULL,
+  strategy_id INTEGER NOT NULL,
+  kind        TEXT NOT NULL,
+  status      TEXT NOT NULL,
+  progress    TEXT,
+  error       TEXT,
+  created_at  TEXT NOT NULL,
+  started_at  TEXT,
+  finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_trade_eval_jobs_status ON trade_eval_jobs(status, id);
 "#;
 
 /// 表已存在但缺列时补建:`CREATE TABLE IF NOT EXISTS` 对已存在的旧表是空操作,
@@ -878,6 +891,142 @@ pub fn list_status_events(
         .collect()
 }
 
+const JOB_COLS: &str = "id, user_id, strategy_id, kind, status, progress, error, created_at";
+
+#[allow(clippy::type_complexity)]
+fn read_job(
+    r: &Row,
+) -> rusqlite::Result<(
+    i64,
+    i64,
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+)> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+    ))
+}
+
+#[allow(clippy::type_complexity)]
+fn to_job(
+    raw: (
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    ),
+) -> Result<EvalJob> {
+    let (id, user_id, strategy_id, kind, status, progress, error, created_at) = raw;
+    Ok(EvalJob {
+        id,
+        user_id,
+        strategy_id,
+        kind: EvalKind::parse(&kind)?,
+        status: JobStatus::parse(&status)?,
+        progress,
+        error,
+        created_at: parse_ts(&created_at)?,
+    })
+}
+
+/// 入队一个评估任务;同策略同类型已排队 / 运行中则返回 None(幂等)。
+pub fn enqueue_eval(
+    conn: &Connection,
+    user_id: i64,
+    strategy_id: i64,
+    kind: EvalKind,
+    now: NaiveDateTime,
+) -> Result<Option<i64>> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM trade_eval_jobs
+           WHERE user_id = ?1 AND strategy_id = ?2 AND kind = ?3 AND status IN ('queued', 'running'))",
+        params![user_id, strategy_id, kind.as_str()],
+        |r| r.get(0),
+    )?;
+    if exists {
+        return Ok(None);
+    }
+    conn.execute(
+        "INSERT INTO trade_eval_jobs (user_id, strategy_id, kind, status, created_at)
+         VALUES (?1, ?2, ?3, 'queued', ?4)",
+        params![user_id, strategy_id, kind.as_str(), fmt_ts(now)],
+    )?;
+    Ok(Some(conn.last_insert_rowid()))
+}
+
+/// 领取最早的排队任务并置为运行中。无任务返回 None。
+pub fn claim_next_job(conn: &Connection, now: NaiveDateTime) -> Result<Option<EvalJob>> {
+    conn.query_row(
+        &format!(
+            "UPDATE trade_eval_jobs SET status = 'running', started_at = ?1
+             WHERE id = (SELECT id FROM trade_eval_jobs WHERE status = 'queued' ORDER BY id LIMIT 1)
+             RETURNING {JOB_COLS}"
+        ),
+        [fmt_ts(now)],
+        read_job,
+    )
+    .optional()?
+    .map(to_job)
+    .transpose()
+}
+
+pub fn set_job_progress(
+    conn: &Connection,
+    job_id: i64,
+    progress: &str,
+    _now: NaiveDateTime,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE trade_eval_jobs SET progress = ?1 WHERE id = ?2",
+        params![progress, job_id],
+    )?;
+    Ok(())
+}
+
+/// 结束任务:`error` 为 None 记 done,否则记 failed。
+pub fn finish_job(
+    conn: &Connection,
+    job_id: i64,
+    error: Option<&str>,
+    now: NaiveDateTime,
+) -> Result<()> {
+    let status = if error.is_some() {
+        JobStatus::Failed
+    } else {
+        JobStatus::Done
+    };
+    conn.execute(
+        "UPDATE trade_eval_jobs SET status = ?1, error = ?2, finished_at = ?3 WHERE id = ?4",
+        params![status.as_str(), error, fmt_ts(now), job_id],
+    )?;
+    Ok(())
+}
+
+pub fn list_jobs(conn: &Connection, user_id: i64, limit: usize) -> Result<Vec<EvalJob>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {JOB_COLS} FROM trade_eval_jobs WHERE user_id = ?1 ORDER BY id DESC LIMIT ?2"
+    ))?;
+    let raws = stmt
+        .query_map(params![user_id, limit as i64], read_job)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    raws.into_iter().map(to_job).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,7 +1193,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 11);
+        assert_eq!(n, 12);
     }
 
     #[test]
@@ -1377,5 +1526,50 @@ mod tests {
             at(16, 9, 7),
         )
         .is_err());
+    }
+
+    #[test]
+    fn eval_queue_dedups_claims_and_finishes() {
+        let c = db();
+        let id = create_strategy(&c, &new_strategy(), at(16, 9, 0)).unwrap();
+        let job = enqueue_eval(&c, 1, id, EvalKind::WalkForward, at(16, 9, 1))
+            .unwrap()
+            .unwrap();
+        assert!(
+            enqueue_eval(&c, 1, id, EvalKind::WalkForward, at(16, 9, 2))
+                .unwrap()
+                .is_none(),
+            "同类型已排队"
+        );
+        assert!(
+            enqueue_eval(&c, 1, id, EvalKind::Watchdog, at(16, 9, 2))
+                .unwrap()
+                .is_some(),
+            "不同类型可并存"
+        );
+
+        let claimed = claim_next_job(&c, at(16, 9, 3)).unwrap().unwrap();
+        assert_eq!((claimed.id, claimed.status), (job, JobStatus::Running));
+        set_job_progress(&c, job, "3/10", at(16, 9, 4)).unwrap();
+        finish_job(&c, job, None, at(16, 9, 5)).unwrap();
+        let jobs = list_jobs(&c, 1, 10).unwrap();
+        let done = jobs.iter().find(|j| j.id == job).unwrap();
+        assert_eq!(
+            (done.status, done.progress.as_deref()),
+            (JobStatus::Done, Some("3/10"))
+        );
+        assert!(list_jobs(&c, 2, 10).unwrap().is_empty(), "用户隔离");
+
+        // 完成后可再次入队;失败记录原因
+        let again = enqueue_eval(&c, 1, id, EvalKind::WalkForward, at(16, 9, 6))
+            .unwrap()
+            .unwrap();
+        let claimed = claim_next_job(&c, at(16, 9, 7)).unwrap().unwrap();
+        assert_ne!(claimed.id, job);
+        finish_job(&c, again, Some("加载失败"), at(16, 9, 8)).unwrap();
+        let jobs = list_jobs(&c, 1, 10).unwrap();
+        let failed = jobs.iter().find(|j| j.id == again).unwrap();
+        assert_eq!(failed.status, JobStatus::Failed);
+        assert_eq!(failed.error.as_deref(), Some("加载失败"));
     }
 }
