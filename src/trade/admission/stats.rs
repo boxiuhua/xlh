@@ -111,6 +111,8 @@ pub struct TradeUnit {
     /// `avg_cost`(买入费用已在成本内)同口径。
     pub cost: f64,
     pub realized_pnl: Option<f64>,
+    /// **最后**一笔分批成交的时间;而向量本身按**首**笔出现排序,所以逻辑交易的先后
+    /// 与实际了结先后可能略有出入(分批成交交错时),对笔数 / 连亏 / 胜率均无影响。
     pub at: NaiveDateTime,
 }
 
@@ -119,7 +121,13 @@ pub fn trade_units(fills: &[FillRow]) -> Vec<TradeUnit> {
     let mut seen: BTreeMap<i64, usize> = BTreeMap::new();
     let mut out: Vec<TradeUnit> = Vec::new();
     for f in fills {
-        let cost = f.price * f.qty as f64 - f.realized_pnl.unwrap_or(0.0) - f.fee;
+        // 卖出的成本靠 realized 反推;`realized_pnl` 为 NULL 的分批(未来 qmt 导入可能出现)
+        // 没有反推依据,把它的全额毛收入计进成本会把 `trade_returns` 压掉一半,直接跳过。
+        let cost = if f.side == Direction::Sell && f.realized_pnl.is_none() {
+            0.0
+        } else {
+            f.price * f.qty as f64 - f.realized_pnl.unwrap_or(0.0) - f.fee
+        };
         match seen.get(&f.ticket_id) {
             Some(&i) => {
                 let u = &mut out[i];
@@ -165,63 +173,116 @@ pub fn trade_returns(units: &[TradeUnit]) -> Vec<f64> {
         .collect()
 }
 
-/// 该策略投入的资金峰值:按成交流水重建持仓成本(买入含费用的加权平均成本,
-/// 与 `ticket.rs` 的 `avg_cost` 同口径),取各时刻未平仓成本合计的最大值。
+/// 逐笔重建持仓成本,回调 `(截至当前的投入资金**运行峰值**, 累计已实现盈亏)`。
+///
+/// 每条成交回调**两次**:先是「资金已到位、这笔盈亏尚未实现」的水位,再是实现之后的水位。
+/// 少了前一个点,窗口里第一笔就亏损的策略会没有高水位可比(权益曲线只有谷底一个点),
+/// 回撤退化成 0.0 —— 而按本次准入截断成交后,这恰恰是常见形态。
+///
+/// 买入按 `price × qty + fee` 计入成本(与 `ticket.rs` 的 `avg_cost` 同口径),卖出按
+/// 比例减少成本。峰值在**减仓之前**取样:卖出当刻那笔仓位的资金仍在场上,是这笔盈亏的分母。
+fn walk_deployed(fills: &[FillRow], mut on_step: impl FnMut(f64, f64)) {
+    // code → (未平仓股数, 未平仓成本合计)
+    let mut open: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
+    let mut deployed = 0.0f64;
+    let mut cum = 0.0f64;
+    for f in fills {
+        let qty = f.qty as f64;
+        {
+            let slot = open.entry(f.code.as_str()).or_insert((0.0, 0.0));
+            match f.side {
+                Direction::Buy => {
+                    slot.1 += f.price * qty + f.fee;
+                    slot.0 += qty;
+                }
+                Direction::Sell if slot.1 <= 0.0 => {
+                    // 开仓买入落在统计窗口之外(watchdog 按本次准入截断成交)时,窗口里
+                    // 只看得到卖出。用流水反推成本 `price × qty − realized − fee` 给持仓
+                    // 补票,否则分母为 0、再大的亏损回撤也是 0.0 ——「带仓被暂停、复活后
+                    // 割肉」恰恰是 watchdog 最该开火的场景。`realized` 缺失时无从反推。
+                    // 只在完全没有在册成本时补:部分在册(持 500 卖 1000)仍按持仓封顶。
+                    if let Some(r) = f.realized_pnl {
+                        let basis = f.price * qty - r - f.fee;
+                        if basis > 0.0 {
+                            *slot = (qty, basis);
+                        }
+                    }
+                }
+                Direction::Sell => {}
+            }
+        }
+        deployed = deployed.max(open.values().map(|(_, cost)| *cost).sum::<f64>());
+        on_step(deployed, cum);
+        if f.side == Direction::Sell {
+            let slot = open.entry(f.code.as_str()).or_insert((0.0, 0.0));
+            // 卖出数量超过持仓时按持仓封顶(实盘可能有本系统之外建的仓)
+            let sold = qty.min(slot.0);
+            if slot.0 > 0.0 {
+                slot.1 -= slot.1 / slot.0 * sold;
+                slot.0 -= sold;
+            }
+            if slot.0 <= 0.0 {
+                *slot = (0.0, 0.0);
+            }
+        }
+        cum += f.realized_pnl.unwrap_or(0.0);
+        on_step(deployed, cum);
+    }
+}
+
+/// 该策略投入的资金峰值:各时刻未平仓成本合计的最大值。
 ///
 /// 回测端 `initial_cash = 0`、组合按需注资,其 equity 就是投入资金;实盘要与之
 /// 可比,分母必须是投入资金而不是峰值利润(否则回撤被高估约一个数量级)。
+/// 注意这是**整个窗口**的全局峰值,只适合展示;回撤请用 `realized_drawdown`,
+/// 它用的是逐笔的运行峰值(见 `walk_deployed`)。
 pub fn peak_deployed(fills: &[FillRow]) -> f64 {
-    // code → (未平仓股数, 未平仓成本合计)
-    let mut open: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
     let mut peak = 0.0f64;
-    for f in fills {
-        let slot = open.entry(f.code.as_str()).or_insert((0.0, 0.0));
-        match f.side {
-            Direction::Buy => {
-                slot.1 += f.price * f.qty as f64 + f.fee;
-                slot.0 += f.qty as f64;
-            }
-            Direction::Sell => {
-                // 卖出数量超过持仓时按持仓封顶(实盘可能有本系统之外建的仓)
-                let sold = (f.qty as f64).min(slot.0);
-                if slot.0 > 0.0 {
-                    slot.1 -= slot.1 / slot.0 * sold;
-                    slot.0 -= sold;
-                }
-                if slot.0 <= 0.0 {
-                    *slot = (0.0, 0.0);
-                }
-            }
-        }
-        peak = peak.max(open.values().map(|(_, cost)| *cost).sum::<f64>());
-    }
-    peak.max(0.0)
+    walk_deployed(fills, |deployed, _| peak = deployed);
+    peak
 }
 
-/// 纯函数内核:给定资金基数与逐笔盈亏序列,算权益曲线的最大回撤。
-/// `capital_base <= 0` 返回 0.0。
-pub fn equity_drawdown(pnls: &[f64], capital_base: f64) -> f64 {
-    if !capital_base.is_finite() || capital_base <= 0.0 {
-        return 0.0;
-    }
-    let mut equity = capital_base;
-    let mut peak = capital_base;
+/// 纯函数内核:权益曲线相对高水位的最大回撤,与回测端 `metrics.rs::max_drawdown`
+/// 同式(`1 − equity / peak_equity`,`peak_equity ≤ 0` 的点不计)。
+pub fn drawdown_of_equity(equity: &[f64]) -> f64 {
+    let mut peak = f64::MIN;
     let mut worst = 0.0f64;
-    for p in pnls {
-        equity += p;
-        peak = peak.max(equity);
+    for e in equity {
+        peak = peak.max(*e);
         if peak > 0.0 {
-            worst = worst.max((peak - equity) / peak);
+            worst = worst.max((peak - e) / peak);
         }
     }
     worst
 }
 
-/// 累计已实现盈亏曲线相对**权益高水位**的最大回撤,权益 = 投入资金峰值 + 累计盈亏。
-/// 与回测的 `max_drawdown` 同口径:两边都是「相对高水位损失掉的资金比例」。
+/// 纯函数内核的**资金基数恒定**特例:一次性投入 `capital_base`、之后不再加减仓时的
+/// 权益回撤。`capital_base <= 0` 返回 0.0。
+///
+/// 实际成交流水的基数会随加仓变化,所以 `realized_drawdown` 不走这里,而是逐笔用
+/// 当时的投入峰值做基数(见 `walk_deployed`);本函数留作该口径的可读参照。
+pub fn equity_drawdown(pnls: &[f64], capital_base: f64) -> f64 {
+    if !capital_base.is_finite() || capital_base <= 0.0 {
+        return 0.0;
+    }
+    let mut equity = capital_base;
+    let curve: Vec<f64> = std::iter::once(capital_base)
+        .chain(pnls.iter().map(|p| {
+            equity += p;
+            equity
+        }))
+        .collect();
+    drawdown_of_equity(&curve)
+}
+
+/// 已实现盈亏曲线相对**权益高水位**的最大回撤,权益 = 截至当笔的投入资金峰值 + 累计盈亏。
+/// 与回测的 `max_drawdown` 同口径:两边都是「相对高水位损失掉的资金比例」,且两边的
+/// 分母都只用**到当前为止**的信息——事后加仓不得追溯性地稀释已经发生的回撤。
 /// 无成交或投入为 0 时返回 0.0。
 pub fn realized_drawdown(fills: &[FillRow]) -> f64 {
-    equity_drawdown(&sell_pnls(&trade_units(fills)), peak_deployed(fills))
+    let mut curve = Vec::with_capacity(fills.len() * 2);
+    walk_deployed(fills, |deployed, cum| curve.push(deployed + cum));
+    drawdown_of_equity(&curve)
 }
 
 /// 含首尾的工作日数;`to` 早于 `from` 返回 0。
@@ -612,6 +673,72 @@ mod tests {
         assert_eq!(realized_drawdown(&[]), 0.0);
     }
 
+    /// 修复轮 2 · 发现 1:分母必须是**当时**的投入资金峰值,不能用整个窗口的全局峰值——
+    /// 否则事后加仓会追溯性地缩小早期的回撤(准入初期正在加仓,watchdog 恰好被解除武装)。
+    #[test]
+    fn drawdown_does_not_shrink_when_capital_ramps_up_later() {
+        // 投入 10 000 后割肉 4 000 → 权益 10 000 → 6 000,回撤 0.40
+        let base = vec![
+            raw(1, Direction::Buy, 10.0, 1000, 0.0, None),
+            raw(2, Direction::Sell, 6.0, 1000, 0.0, Some(-4000.0)),
+        ];
+        assert!((realized_drawdown(&base) - 0.4).abs() < 1e-12);
+        // 之后再投入 100 000:权益 6 000 → 106 000(注资抬高水位),但那一刻的回撤已成事实
+        let mut ramped = base.clone();
+        ramped.push(raw(3, Direction::Buy, 10.0, 10_000, 0.0, None));
+        assert!(
+            (realized_drawdown(&ramped) - 0.4).abs() < 1e-12,
+            "事后加仓不得把已发生的回撤稀释成 {}",
+            realized_drawdown(&ramped)
+        );
+        // 全局峰值口径下会退化成 4000 / 100 000 = 0.04,差 10 倍
+        assert!((peak_deployed(&ramped) - 100_000.0).abs() < 1e-9);
+    }
+
+    /// 修复轮 2 · 发现 2:开仓买入落在统计窗口之外时(watchdog 按本次准入截断成交),
+    /// 必须用卖出流水反推持仓成本,否则分母为 0、再大的亏损回撤也是 0.0。
+    #[test]
+    fn sell_without_an_in_window_buy_uses_the_implied_basis() {
+        // 只看得到一笔卖出:反推成本 = 6 × 1000 − (−4 000) − 0 = 10 000 → 回撤 0.40
+        let orphan = vec![raw(1, Direction::Sell, 6.0, 1000, 0.0, Some(-4000.0))];
+        assert!((peak_deployed(&orphan) - 10_000.0).abs() < 1e-9);
+        let dd = realized_drawdown(&orphan);
+        assert!((dd - 0.4).abs() < 1e-12, "{dd}");
+        // realized 缺失时无从反推,仍然是 0(没有可用的分母)
+        let unknown = vec![raw(1, Direction::Sell, 6.0, 1000, 0.0, None)];
+        assert_eq!(peak_deployed(&unknown), 0.0);
+        assert_eq!(realized_drawdown(&unknown), 0.0);
+        // 已有在册成本时不补票:持 1000 却卖 5000 仍按持仓封顶(见 peak_deployed 测试)
+        let partial = vec![
+            raw(1, Direction::Buy, 10.0, 1000, 5.0, None),
+            raw(2, Direction::Sell, 11.0, 5000, 7.0, Some(1.0)),
+        ];
+        assert!((peak_deployed(&partial) - 10_005.0).abs() < 1e-9);
+    }
+
+    /// 修复轮 2 · 发现 3:同一工单里 `realized_pnl` 为 NULL 的分批没有反推依据,
+    /// 把它的全额毛收入计进成本会把 `trade_returns` 压掉一半。
+    #[test]
+    fn trade_unit_cost_skips_sell_fills_without_realized_pnl() {
+        let fills = vec![
+            raw(7, Direction::Sell, 11.0, 1000, 10.61, Some(-10.0)),
+            FillRow {
+                filled_at: at(16, 10, 1),
+                ..raw(7, Direction::Sell, 11.0, 1000, 10.61, None)
+            },
+        ];
+        let units = trade_units(&fills);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].realized_pnl, Some(-10.0));
+        // 成本只算有 realized 的那一批:11 000 + 10 − 10.61 = 10 999.39(不是 21 990 上下)
+        assert!(
+            (units[0].cost - 10_999.39).abs() < 1e-9,
+            "{}",
+            units[0].cost
+        );
+        assert!((trade_returns(&units)[0] - (-10.0 / 10_999.39)).abs() < 1e-12);
+    }
+
     #[test]
     fn workdays_skip_weekends() {
         // 2026-09-14(周一)到 2026-09-18(周五)= 5 个工作日;跨周末仍是 5 + 1
@@ -725,20 +852,19 @@ mod tests {
     fn paper_and_watchdog_stats_come_from_fills() {
         let mut c = db();
         let s = strategy(&c, 1);
-        // 先建仓:买 1000 @10,费 10.61 → 投入 10 010.61(回撤的分母)
-        seed(
-            &mut c,
-            1,
-            Some(s),
-            Account::Paper,
-            Direction::Buy,
-            10.0,
-            None,
-            "pb",
-            at(16, 9, 30),
-        );
-        // 三笔模拟盘卖出:+100、−50、+20
+        // 三轮「买 1000 @10(费 10.61)→ 卖 1000 @11」,每轮投入 10 010.61(回撤的分母)
         for (i, pnl) in [100.0, -50.0, 20.0].iter().enumerate() {
+            seed(
+                &mut c,
+                1,
+                Some(s),
+                Account::Paper,
+                Direction::Buy,
+                10.0,
+                None,
+                &format!("pb{i}"),
+                at(16, 9, 30 + i as u32),
+            );
             seed(
                 &mut c,
                 1,
@@ -754,7 +880,8 @@ mod tests {
         let ps = paper_stats(&c, 1, s, at(14, 9, 0), at(16, 15, 0)).unwrap();
         assert_eq!(ps.trades, 3, "买入不算交易笔数");
         assert_eq!(ps.days, 3, "9-14 周一 到 9-16 周三");
-        // 权益 10 010.61 → 10 110.61(峰值)→ 10 060.61 → 10 080.61 → 回撤 50 / 10 110.61
+        // 投入峰值恒为 10 010.61(每轮先平后建),权益 → 10 110.61(峰值)→ 10 060.61
+        // → 10 080.61,最深回撤 50 / 10 110.61
         assert!(
             (ps.max_drawdown - 50.0 / 10_110.61).abs() < 1e-12,
             "{}",

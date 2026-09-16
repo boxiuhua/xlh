@@ -122,10 +122,13 @@ mod tests {
 
     #[test]
     fn stage_metrics_summarise_fills() {
+        // 三轮「买 1000 @10(费 10)→ 卖 1000 @11」:投入峰值恒为 10 010
         let m = stage_metrics(&[
             buy(0),
             sell(100.0, 11.0, 1),
+            buy(10),
             sell(-50.0, 11.0, 2),
+            buy(20),
             sell(20.0, 11.0, 3),
         ]);
         assert_eq!(m.trades, 3, "买入不计入笔数");
