@@ -13,7 +13,7 @@ use crate::stock::fee::StockFee;
 use crate::stock::trade_stats::round_trips;
 use anyhow::{anyhow, Result};
 use chrono::{Duration, NaiveDate};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// 一个窗口内至少要有多少根 K 线才算数(约 2 个月 / 1 个月)。
 const MIN_TRAIN_BARS: usize = 40;
@@ -94,7 +94,7 @@ pub fn buy_and_hold_return(bars: &[StockBar], from: NaiveDate, to: NaiveDate) ->
 }
 
 /// 逐笔收益的基线统计。观察期与 watchdog 都与它比较。
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TradeBaseline {
     pub avg_return: f64,
     /// 总体标准差
@@ -144,7 +144,7 @@ pub struct WindowResult {
 
 /// 单个检验窗的精简记录(F4):供 `trade_strategy_evals.metrics_json` 保存逐窗选中的
 /// 参数与指标(计划 3b 的成绩单据此展示每一窗用了什么参数、跑出什么结果)。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowSummary {
     pub train_from: NaiveDate,
     pub train_to: NaiveDate,
@@ -169,7 +169,7 @@ pub struct CodeResult {
 ///
 /// 聚合口径(见计划「相对 spec 的实现细化」1):收益连乘、年化按总检验天数折算、
 /// 夏普按检验天数加权平均、最大回撤取各窗最大、交易笔数求和。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeMetrics {
     pub code: String,
     pub windows: usize,
@@ -185,12 +185,15 @@ pub struct CodeMetrics {
     pub data_years: f64,
     pub buy_hold_return: f64,
     /// 逐笔收益基线:由所有样本外窗口的 round trip 收益率拼接而成。
+    /// `#[serde(default)]`(F6):本分支之前落库的 `metrics_json` 没有这个字段,
+    /// 反序列化时补 `TradeBaseline::default()`,否则旧记录读不回来。
+    #[serde(default)]
     pub trade_baseline: TradeBaseline,
     /// 逐窗选中的参数与指标(F4),供成绩单展示。
     pub window_details: Vec<WindowSummary>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PoolMetrics {
     pub codes: Vec<CodeMetrics>,
     /// 池内中位数
@@ -211,7 +214,9 @@ pub struct PoolMetrics {
     /// 池内逐笔收益基线:合并口径为按笔数加权(总方差定律合并均值与标准差,
     /// win_rate 同样按笔数加权,count 求和);`max_consecutive_losses` 是**单只**
     /// 股票内的最长连亏(实盘是全池交错的,计划 3c 的 watchdog 必须逐只比较,
-    /// 不能直接拿全池连亏比)。
+    /// 不能直接拿全池连亏比)。`#[serde(default)]`(F6):兼容本分支之前落库、
+    /// 没有这个字段的旧 `metrics_json`。
+    #[serde(default)]
     pub trade_baseline: TradeBaseline,
     /// 股票池长度(F5):与 `codes.len()` 的比值低于 `min_evaluated_ratio` 时准入不通过。
     pub requested: usize,
@@ -1227,5 +1232,91 @@ mod tests {
             a.trade_baseline.max_consecutive_losses
         );
         assert_eq!(p.trade_baseline.count, a.trade_baseline.count);
+    }
+
+    /// F6:计划 3c 要从 `trade_strategy_evals.metrics_json` 读回基线,`PoolMetrics`
+    /// 及其内部类型都要能反序列化,而不只是序列化。
+    #[test]
+    fn pool_metrics_round_trip_json() {
+        let window = WindowSummary {
+            train_from: d(2024, 1, 1),
+            train_to: d(2024, 3, 1),
+            test_to: d(2024, 4, 1),
+            params: toml::Value::try_from(toml::Table::from_iter([(
+                "short_window".to_string(),
+                toml::Value::Integer(3),
+            )]))
+            .unwrap(),
+            oos_return: 0.1,
+            oos_sharpe: 1.0,
+            oos_trades: 5,
+        };
+        let code = CodeMetrics {
+            code: "600000".into(),
+            windows: 1,
+            oos_return: 0.1,
+            oos_annualized: 0.1,
+            oos_sharpe: 1.0,
+            oos_max_drawdown: 0.05,
+            oos_trades: 5,
+            is_sharpe: 1.2,
+            years: 1.0,
+            data_years: 3.0,
+            buy_hold_return: 0.05,
+            trade_baseline: TradeBaseline {
+                avg_return: 0.02,
+                return_sd: 0.01,
+                win_rate: 0.6,
+                max_consecutive_losses: 2,
+                count: 5,
+            },
+            window_details: vec![window],
+        };
+        let pool = aggregate(vec![code]);
+
+        let json = serde_json::to_string(&pool).unwrap();
+        let back: PoolMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(pool, back);
+    }
+
+    /// F6:本分支之前落库的 `metrics_json` 没有 `trade_baseline` 字段,
+    /// `#[serde(default)]` 要保证这些旧记录仍能解析成功。
+    #[test]
+    fn legacy_metrics_json_without_trade_baseline_parses() {
+        let json = r#"{
+            "codes": [{
+                "code": "600000",
+                "windows": 1,
+                "oos_return": 0.1,
+                "oos_annualized": 0.1,
+                "oos_sharpe": 1.0,
+                "oos_max_drawdown": 0.05,
+                "oos_trades": 3,
+                "is_sharpe": 1.2,
+                "years": 1.0,
+                "data_years": 3.0,
+                "buy_hold_return": 0.05,
+                "window_details": []
+            }],
+            "oos_return": 0.1,
+            "oos_sharpe": 1.0,
+            "oos_max_drawdown": 0.05,
+            "oos_trades": 3,
+            "median_code_trades": 3,
+            "is_sharpe": 1.2,
+            "positive_ratio": 1.0,
+            "years": 1.0,
+            "data_years": 3.0,
+            "buy_hold_return": 0.05,
+            "requested": 1,
+            "skipped": []
+        }"#;
+        let m: PoolMetrics = serde_json::from_str(json).unwrap();
+        assert_eq!(m.trade_baseline, TradeBaseline::default(), "池级默认基线");
+        assert_eq!(
+            m.codes[0].trade_baseline,
+            TradeBaseline::default(),
+            "单票默认基线"
+        );
     }
 }
