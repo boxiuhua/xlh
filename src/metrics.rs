@@ -93,7 +93,7 @@ pub fn sharpe(curve: &[EquityPoint], rf_annual: f64) -> f64 {
     (mean * 252.0 - rf_annual) / (std * 252.0_f64.sqrt())
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Summary {
     pub total_contributed: f64,
     pub final_equity: f64,
