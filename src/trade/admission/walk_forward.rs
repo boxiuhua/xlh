@@ -208,7 +208,10 @@ pub struct PoolMetrics {
     /// 池内 K 线总跨度(年)中位数,数据年限准入按它判定(见 F1)。
     pub data_years: f64,
     pub buy_hold_return: f64,
-    /// 池内逐笔收益基线:avg/sd/win_rate 取各票中位数,max_consecutive_losses 取最大,count 求和。
+    /// 池内逐笔收益基线:合并口径为按笔数加权(总方差定律合并均值与标准差,
+    /// win_rate 同样按笔数加权,count 求和);`max_consecutive_losses` 是**单只**
+    /// 股票内的最长连亏(实盘是全池交错的,计划 3c 的 watchdog 必须逐只比较,
+    /// 不能直接拿全池连亏比)。
     pub trade_baseline: TradeBaseline,
     /// 股票池长度(F5):与 `codes.len()` 的比值低于 `min_evaluated_ratio` 时准入不通过。
     pub requested: usize,
@@ -219,6 +222,14 @@ pub struct PoolMetrics {
 /// 池内进度回调。`on_code(code, 已完成, 总数)` 返回 false 表示取消,剩余代码记为「已取消」。
 pub struct PoolProgress<'a> {
     pub on_code: &'a mut dyn FnMut(&str, usize, usize) -> bool,
+}
+
+/// 池内回测结果。`cancelled` 为 true 时 `metrics` 不完整,调用方不得据此判定准入
+/// (F2:不能把「用户取消」误判为「策略回测不达标」)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoolOutcome {
+    pub metrics: PoolMetrics,
+    pub cancelled: bool,
 }
 
 /// 训练窗选参依据必须是已知指标,否则静默回退到 sharpe 会让配置形同虚设。
@@ -437,16 +448,44 @@ pub fn aggregate(codes: Vec<CodeMetrics>) -> PoolMetrics {
     } else {
         positive as f64 / codes.len() as f64
     };
-    let trade_baseline = TradeBaseline {
-        avg_return: median(codes.iter().map(|c| c.trade_baseline.avg_return).collect()),
-        return_sd: median(codes.iter().map(|c| c.trade_baseline.return_sd).collect()),
-        win_rate: median(codes.iter().map(|c| c.trade_baseline.win_rate).collect()),
-        max_consecutive_losses: codes
+    // 逐笔基线按笔数加权合并(总方差定律),而不是对各股指标取中位数:
+    // 中位数会丢掉股票之间的离散度,且零成交的股票会把标准差压成 0,
+    // 使观察期的「回测均值 − 1σ」容差带消失。
+    let with_trades: Vec<&TradeBaseline> = codes
+        .iter()
+        .map(|c| &c.trade_baseline)
+        .filter(|b| b.count > 0)
+        .collect();
+    let total: usize = with_trades.iter().map(|b| b.count).sum();
+    let trade_baseline = if total == 0 {
+        TradeBaseline::default()
+    } else {
+        let n = total as f64;
+        let mean = with_trades
             .iter()
-            .map(|c| c.trade_baseline.max_consecutive_losses)
-            .max()
-            .unwrap_or(0),
-        count: codes.iter().map(|c| c.trade_baseline.count).sum(),
+            .map(|b| b.avg_return * b.count as f64)
+            .sum::<f64>()
+            / n;
+        let second = with_trades
+            .iter()
+            .map(|b| (b.return_sd * b.return_sd + b.avg_return * b.avg_return) * b.count as f64)
+            .sum::<f64>()
+            / n;
+        TradeBaseline {
+            avg_return: mean,
+            return_sd: (second - mean * mean).max(0.0).sqrt(),
+            win_rate: with_trades
+                .iter()
+                .map(|b| b.win_rate * b.count as f64)
+                .sum::<f64>()
+                / n,
+            max_consecutive_losses: codes
+                .iter()
+                .map(|c| c.trade_baseline.max_consecutive_losses)
+                .max()
+                .unwrap_or(0),
+            count: total,
+        }
     };
     PoolMetrics {
         oos_return: median(codes.iter().map(|c| c.oos_return).collect()),
@@ -481,10 +520,13 @@ pub fn run_pool<F>(
     cfg: &WalkForwardCfg,
     mut load: F,
     progress: Option<&mut PoolProgress>,
-) -> Result<PoolMetrics>
+) -> Result<PoolOutcome>
 where
     F: FnMut(&str) -> Result<Vec<StockBar>>,
 {
+    // F3:选参指标与网格一起,在跑池前一并校验——否则未知指标要等跑完整轮
+    // 才在 `run_code` 内部报错,且已跑掉的股票白白浪费。
+    validate_metric(&cfg.metric)?;
     let combos = expand_grid(grid)?;
     // F9:逐个校验网格里的每个参数组合,而不是只看第一个——训练窗按 `cfg.metric`
     // 选出的组合可能是网格里任意一个,只有第一个合法不能保证其余的都合法。
@@ -496,6 +538,7 @@ where
     let mut skipped = Vec::new();
     let total = pool.len();
     let mut progress = progress;
+    let mut cancelled = false;
     for (done, code) in pool.iter().enumerate() {
         match load(code) {
             Ok(bars) => match run_code(kind, code, &bars, grid, cfg) {
@@ -507,6 +550,7 @@ where
         }
         if let Some(p) = progress.as_deref_mut() {
             if !(p.on_code)(code, done + 1, total) {
+                cancelled = true;
                 for rest in pool.iter().skip(done + 1) {
                     skipped.push((rest.clone(), "已取消".to_string()));
                 }
@@ -517,7 +561,10 @@ where
     let mut m = aggregate(metrics);
     m.requested = pool.len();
     m.skipped = skipped;
-    Ok(m)
+    Ok(PoolOutcome {
+        metrics: m,
+        cancelled,
+    })
 }
 
 #[cfg(test)]
@@ -821,7 +868,7 @@ mod tests {
     fn run_pool_skips_unloadable_codes() {
         let prices: Vec<f64> = (0..190).map(|i| 10.0 + i as f64 * 0.05).collect();
         let good = bars(d(2024, 1, 1), &prices);
-        let metrics = run_pool(
+        let out = run_pool(
             "trend",
             &["600000".to_string(), "000001".to_string()],
             &grid(),
@@ -833,6 +880,8 @@ mod tests {
             None,
         )
         .unwrap();
+        assert!(!out.cancelled);
+        let metrics = out.metrics;
         assert_eq!(metrics.codes.len(), 1);
         assert_eq!(metrics.requested, 2, "F5:池长度");
         assert_eq!(metrics.skipped.len(), 1);
@@ -1040,7 +1089,7 @@ mod tests {
             done < 1 // 第一只之后取消
         };
         let mut p = PoolProgress { on_code: &mut cb };
-        let m = run_pool(
+        let out = run_pool(
             "trend",
             &["600000".into(), "000001".into()],
             &grid(),
@@ -1050,8 +1099,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(seen.len(), 1, "取消后不再继续");
-        assert_eq!(m.codes.len(), 1);
-        assert!(m
+        assert!(out.cancelled, "F2:取消要能与「跑完但不达标」区分开");
+        assert!(!out.metrics.codes.is_empty());
+        assert!(out
+            .metrics
             .skipped
             .iter()
             .any(|(c, r)| c == "000001" && r.contains("取消")));
@@ -1063,8 +1114,27 @@ mod tests {
         assert!(validate_metric("sharp").is_err());
     }
 
+    /// F3:选参指标校验要与 `expand_grid` / `build_strategy_from` 放在同一处
+    /// 上前置校验,而不是等跑到某只股票的 `run_code` 内部才报错。
     #[test]
-    fn pool_baseline_takes_medians_and_worst_streak() {
+    fn run_pool_rejects_unknown_metric() {
+        let bad_cfg = WalkForwardCfg {
+            metric: "sharp".into(),
+            ..cfg()
+        };
+        let result = run_pool(
+            "trend",
+            &["600000".to_string()],
+            &grid(),
+            &bad_cfg,
+            |_| Ok(Vec::new()),
+            None,
+        );
+        assert!(result.is_err(), "未知选参指标应在跑池前直接报错");
+    }
+
+    #[test]
+    fn pool_baseline_pools_by_trade_count() {
         let mk = |avg: f64, sd: f64, wr: f64, streak: usize, n: usize| TradeBaseline {
             avg_return: avg,
             return_sd: sd,
@@ -1072,13 +1142,90 @@ mod tests {
             max_consecutive_losses: streak,
             count: n,
         };
+        let (avg_a, sd_a, wr_a, streak_a, n_a) = (0.02, 0.01, 0.5, 2usize, 10usize);
+        let (avg_b, sd_b, wr_b, streak_b, n_b) = (0.04, 0.03, 0.7, 5usize, 20usize);
         let mut a = sample_code_metrics("a", 0.1);
-        a.trade_baseline = mk(0.02, 0.01, 0.5, 2, 10);
+        a.trade_baseline = mk(avg_a, sd_a, wr_a, streak_a, n_a);
         let mut b = sample_code_metrics("b", 0.2);
-        b.trade_baseline = mk(0.04, 0.03, 0.7, 5, 20);
+        b.trade_baseline = mk(avg_b, sd_b, wr_b, streak_b, n_b);
         let p = aggregate(vec![a, b]);
-        assert!((p.trade_baseline.avg_return - 0.03).abs() < 1e-9, "中位数");
-        assert_eq!(p.trade_baseline.max_consecutive_losses, 5, "取最差");
-        assert_eq!(p.trade_baseline.count, 30, "求和");
+
+        // 按笔数加权合并(总方差定律),而不是对各股指标取中位数。
+        let n = (n_a + n_b) as f64;
+        let expected_mean = (avg_a * n_a as f64 + avg_b * n_b as f64) / n;
+        let expected_second = ((sd_a * sd_a + avg_a * avg_a) * n_a as f64
+            + (sd_b * sd_b + avg_b * avg_b) * n_b as f64)
+            / n;
+        let expected_sd = (expected_second - expected_mean * expected_mean)
+            .max(0.0)
+            .sqrt();
+        let expected_wr = (wr_a * n_a as f64 + wr_b * n_b as f64) / n;
+
+        assert!(
+            (p.trade_baseline.avg_return - expected_mean).abs() < 1e-9,
+            "按笔数加权均值: {} vs {}",
+            p.trade_baseline.avg_return,
+            expected_mean
+        );
+        assert!(
+            (p.trade_baseline.return_sd - expected_sd).abs() < 1e-9,
+            "总体方差定律合并标准差: {} vs {}",
+            p.trade_baseline.return_sd,
+            expected_sd
+        );
+        assert!(
+            (p.trade_baseline.win_rate - expected_wr).abs() < 1e-9,
+            "按笔数加权胜率: {} vs {}",
+            p.trade_baseline.win_rate,
+            expected_wr
+        );
+        assert_eq!(
+            p.trade_baseline.max_consecutive_losses,
+            streak_b.max(streak_a),
+            "取最差"
+        );
+        assert_eq!(p.trade_baseline.count, n_a + n_b, "求和");
+    }
+
+    /// 零成交的股票(默认基线全为 0)不应把池的合并基线拉向 0——它们直接被排除在
+    /// 加权合并之外,而不是被当作「avg=0, sd=0」的一票参与中位数/加权。
+    #[test]
+    fn zero_trade_codes_do_not_dilute_the_baseline() {
+        let mut a = sample_code_metrics("a", 0.1);
+        a.trade_baseline = TradeBaseline {
+            avg_return: 0.05,
+            return_sd: 0.02,
+            win_rate: 0.6,
+            max_consecutive_losses: 3,
+            count: 10,
+        };
+        let mut z = sample_code_metrics("z", 0.0);
+        z.trade_baseline = TradeBaseline::default();
+
+        let p = aggregate(vec![a.clone(), z]);
+        // 浮点合并(总方差定律的减法抵消)不保证与原始输入位级相等,用 epsilon 比较。
+        assert!(
+            (p.trade_baseline.avg_return - a.trade_baseline.avg_return).abs() < 1e-9,
+            "{:?} vs {:?}",
+            p.trade_baseline,
+            a.trade_baseline
+        );
+        assert!(
+            (p.trade_baseline.return_sd - a.trade_baseline.return_sd).abs() < 1e-9,
+            "{:?} vs {:?}",
+            p.trade_baseline,
+            a.trade_baseline
+        );
+        assert!(
+            (p.trade_baseline.win_rate - a.trade_baseline.win_rate).abs() < 1e-9,
+            "{:?} vs {:?}",
+            p.trade_baseline,
+            a.trade_baseline
+        );
+        assert_eq!(
+            p.trade_baseline.max_consecutive_losses,
+            a.trade_baseline.max_consecutive_losses
+        );
+        assert_eq!(p.trade_baseline.count, a.trade_baseline.count);
     }
 }
