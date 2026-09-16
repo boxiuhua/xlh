@@ -1636,3 +1636,21 @@ git commit -m "feat(trade): 准入阈值配置、回测/观察期判定与策略
 - **计划 3b**:评估任务队列与 `trade-eval` 线程(前推回测在后台跑、进度可见)、观察期统计与 watchdog(滚动回撤 / 胜率 / 连亏,自动暂停、每月重跑)、成绩单(样本内 / 样本外 / 模拟盘 / 实盘 + 执行损耗)、日线策略信号(15:30 计算、次日 09:25 发出,`admission_for` 接入 `submit_signal`)、`stock/recommend.rs` 迁移到 A 股口径
 - **计划 4**:网页策略管理与成绩单展示、`/trade` 确认页、持仓校准、风控设置
 - 已知遗留(计划 2b 记录):交易日历节假日、推送串行、Markdown 转义、报价新鲜度绝对值等
+
+## 执行后遗留项(来自任务审查与最终审查,须被后续计划吸收)
+
+**计划 3b(评估线程与准入流水线):**
+- `run_pool` 无进度回调与取消:50 只 × 100 组合 × 6 窗 = 3 万次回测在一次同步调用里,线程无法上报进度 / 停止 / 写心跳(spec §11 要求「进度可见」)
+- 夏普衰减用两个独立中位数相除(`median(oos)/median(is)`),应改为逐只算衰减再取中位数
+- `metric_of` 对未知 metric 名静默回退到 sharpe;`WalkForwardCfg.metric` 应校验
+- `expand_grid` 每只股票重复展开;训练窗每个组合 clone 整段 K 线
+- `NewStrategy` 无校验:空股票池、重复代码、未知 kind、无法解析的 grid 都要等回测失败才暴露
+- `aggregate()` 默认把 `requested` 设为成功只数,绕过覆盖率闸门;非 `run_pool` 调用方需自行填写
+- 测试缺口:`metric_of` 真正影响选参、不同窗口选出不同参数、端到端(提交 → 回测 → 判定 → 状态)用例、`admission_for` 的 Backtesting/Failed 分支
+- 判定夹具里 `positive_ratio` 与 `codes` 不自洽(真实 `aggregate` 不会产生)
+
+**计划 4 之前必须完成(在 3b 内):**
+- `update_status` 没有合法转换表,可从 `Draft` 直跳 `Admitted`;网页一旦允许传入 from/to,就等于绕过回测直接开实盘
+- `oos_annualized` 计算但未参与判定(spec §10.4 文字为「年化收益」),口径需统一
+
+**已知口径说明(已写入本计划细化 6–8):** 资金口径按实际投入度量;`data_years` 与样本外 `years` 分离;池内覆盖率与每只中位交易笔数参与判定。
