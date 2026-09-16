@@ -152,6 +152,14 @@ fn main() -> Result<()> {
                 } else {
                     None
                 };
+                let cfg = xlh::trade::config::get().clone();
+                if cfg.eval.enabled {
+                    if let Err(e) =
+                        xlh::trade::admission::thread::spawn(auth_cfg.db_path.clone(), cfg)
+                    {
+                        eprintln!("[trade] 评估线程启动失败: {e:#}");
+                    }
+                }
                 xlh::push::run_multi_daemon(&conn, auth_cfg.warn_days, auth_cfg.grace_days, sink)
             }
         }

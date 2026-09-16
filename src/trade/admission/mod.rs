@@ -6,5 +6,6 @@ pub mod schedule;
 pub mod scorecard;
 pub mod state;
 pub mod stats;
+pub mod thread;
 pub mod walk_forward;
 pub mod worker;

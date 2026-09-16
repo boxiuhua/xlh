@@ -1092,6 +1092,18 @@ pub fn finish_job(
     Ok(())
 }
 
+/// 按 id 查单个任务,按 user_id 隔离(评估线程测试与手动排障用)。
+pub fn get_job(conn: &Connection, user_id: i64, job_id: i64) -> Result<Option<EvalJob>> {
+    conn.query_row(
+        &format!("SELECT {JOB_COLS} FROM trade_eval_jobs WHERE id = ?1 AND user_id = ?2"),
+        params![job_id, user_id],
+        read_job,
+    )
+    .optional()?
+    .map(to_job)
+    .transpose()
+}
+
 pub fn list_jobs(conn: &Connection, user_id: i64, limit: usize) -> Result<Vec<EvalJob>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {JOB_COLS} FROM trade_eval_jobs WHERE user_id = ?1 ORDER BY id DESC LIMIT ?2"
@@ -1707,6 +1719,22 @@ mod tests {
         let failed = jobs.iter().find(|j| j.id == again).unwrap();
         assert_eq!(failed.status, JobStatus::Failed);
         assert_eq!(failed.error.as_deref(), Some("加载失败"));
+    }
+
+    #[test]
+    fn get_job_reads_by_id_and_is_user_scoped() {
+        let c = db();
+        let id = create_strategy(&c, &new_strategy(), at(16, 9, 0)).unwrap();
+        let job = enqueue_eval(&c, 1, id, EvalKind::WalkForward, at(16, 9, 1))
+            .unwrap()
+            .unwrap();
+        let got = get_job(&c, 1, job).unwrap().unwrap();
+        assert_eq!(
+            (got.id, got.strategy_id, got.kind),
+            (job, id, EvalKind::WalkForward)
+        );
+        assert!(get_job(&c, 2, job).unwrap().is_none(), "用户隔离");
+        assert!(get_job(&c, 1, job + 1).unwrap().is_none(), "不存在的 id");
     }
 
     /// F4:进程重启后 `running` 任务没有租约,永远不会自然结束;不回收的话
