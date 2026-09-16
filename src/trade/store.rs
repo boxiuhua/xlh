@@ -150,6 +150,10 @@ CREATE TABLE IF NOT EXISTS trade_eval_jobs (
   finished_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trade_eval_jobs_status ON trade_eval_jobs(status, id);
+-- F5:去重是数据库不变量,而不只是 enqueue_eval 里的一次 SELECT——并发入队时
+-- SELECT 判重会有竞态,真正兜底的是这条唯一索引;上面的 SELECT 只是快路径。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_eval_jobs_pending
+  ON trade_eval_jobs(user_id, strategy_id, kind) WHERE status IN ('queued', 'running');
 "#;
 
 /// 表已存在但缺列时补建:`CREATE TABLE IF NOT EXISTS` 对已存在的旧表是空操作,
@@ -945,6 +949,11 @@ fn to_job(
 }
 
 /// 入队一个评估任务;同策略同类型已排队 / 运行中则返回 None(幂等)。
+///
+/// F5:真正的不变量是 `idx_trade_eval_jobs_pending` 唯一索引——这里的 SELECT
+/// 判重只是快路径(避免大多数重复请求触发一次注定失败的 INSERT),两次并发
+/// 入队之间仍可能都通过 SELECT 检查再同时 INSERT,此时唯一索引会让其中一次
+/// INSERT 失败,下面把这种违反约束映射成 `Ok(None)`,与快路径命中语义一致。
 pub fn enqueue_eval(
     conn: &Connection,
     user_id: i64,
@@ -961,12 +970,30 @@ pub fn enqueue_eval(
     if exists {
         return Ok(None);
     }
-    conn.execute(
+    match conn.execute(
         "INSERT INTO trade_eval_jobs (user_id, strategy_id, kind, status, created_at)
          VALUES (?1, ?2, ?3, 'queued', ?4)",
         params![user_id, strategy_id, kind.as_str(), fmt_ts(now)],
+    ) {
+        Ok(_) => Ok(Some(conn.last_insert_rowid())),
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// 进程重启时回收上次中断的任务:`running` 没有租约,不回收会让同策略同类型
+/// 永远无法再次入队(enqueue_eval 按 queued/running 去重)。
+pub fn reclaim_stale_jobs(conn: &Connection, now: NaiveDateTime) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE trade_eval_jobs SET status = 'failed', error = '进程重启,任务中断', finished_at = ?1
+         WHERE status = 'running'",
+        params![fmt_ts(now)],
     )?;
-    Ok(Some(conn.last_insert_rowid()))
+    Ok(n)
 }
 
 /// 领取最早的排队任务并置为运行中。无任务返回 None。
@@ -1571,5 +1598,39 @@ mod tests {
         let failed = jobs.iter().find(|j| j.id == again).unwrap();
         assert_eq!(failed.status, JobStatus::Failed);
         assert_eq!(failed.error.as_deref(), Some("加载失败"));
+    }
+
+    /// F4:进程重启后 `running` 任务没有租约,永远不会自然结束;不回收的话
+    /// `enqueue_eval` 会一直因为「同类型已在运行」而拒绝重新入队。
+    /// 这个测试顺带覆盖了此前未测过的「入队去重命中 running 状态」路径。
+    #[test]
+    fn reclaim_stale_jobs_unblocks_enqueue() {
+        let c = db();
+        let id = create_strategy(&c, &new_strategy(), at(16, 9, 0)).unwrap();
+        let job = enqueue_eval(&c, 1, id, EvalKind::WalkForward, at(16, 9, 1))
+            .unwrap()
+            .unwrap();
+        claim_next_job(&c, at(16, 9, 2)).unwrap().unwrap();
+        assert!(
+            enqueue_eval(&c, 1, id, EvalKind::WalkForward, at(16, 9, 3))
+                .unwrap()
+                .is_none(),
+            "同类型已在运行中,应去重"
+        );
+
+        let reclaimed = reclaim_stale_jobs(&c, at(16, 9, 4)).unwrap();
+        assert_eq!(reclaimed, 1);
+
+        let jobs = list_jobs(&c, 1, 10).unwrap();
+        let stale = jobs.iter().find(|j| j.id == job).unwrap();
+        assert_eq!(stale.status, JobStatus::Failed);
+        assert_eq!(stale.error.as_deref(), Some("进程重启,任务中断"));
+
+        assert!(
+            enqueue_eval(&c, 1, id, EvalKind::WalkForward, at(16, 9, 5))
+                .unwrap()
+                .is_some(),
+            "回收后应能重新入队"
+        );
     }
 }
