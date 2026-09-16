@@ -50,9 +50,15 @@ pub struct Window {
     pub test_to: NaiveDate,
 }
 
+/// 滚动切分训练/检验窗口。检验窗口不允许重叠:`step_days` 必须 >= `test_days`,
+/// 否则返回空——重叠会让相邻窗口的复利收益和年化天数被重复计算。
 pub fn windows(first: NaiveDate, last: NaiveDate, cfg: &WalkForwardCfg) -> Vec<Window> {
     let mut out = Vec::new();
-    if cfg.train_days <= 0 || cfg.test_days <= 0 || cfg.step_days <= 0 {
+    if cfg.train_days <= 0
+        || cfg.test_days <= 0
+        || cfg.step_days <= 0
+        || cfg.step_days < cfg.test_days
+    {
         return out;
     }
     let mut train_from = first;
@@ -305,26 +311,35 @@ pub fn aggregate(codes: Vec<CodeMetrics>) -> PoolMetrics {
 }
 
 /// 对整个股票池跑前推回测。K 线由调用方注入(测试用切片,生产用缓存加载)。
-/// 返回池内汇总与加载失败被跳过的代码。
+///
+/// 先校验网格与策略参数是否合法(配置错误直接 `Err`,不会被误判成某只股票的问题);
+/// 校验通过后逐只股票跑,单只股票的问题彼此隔离,记录到返回的跳过列表(代码、原因):
+/// - K 线加载失败:"加载失败: {原因}"
+/// - `run_code` 运行期出错:"回测失败: {原因}"
+/// - 未产出任何有效窗口(训练/检验数据不足):"数据不足,无有效窗口"
 pub fn run_pool<F>(
     kind: &str,
     pool: &[String],
     grid: &toml::Table,
     cfg: &WalkForwardCfg,
     mut load: F,
-) -> Result<(PoolMetrics, Vec<String>)>
+) -> Result<(PoolMetrics, Vec<(String, String)>)>
 where
     F: FnMut(&str) -> Result<Vec<StockBar>>,
 {
+    let combos = expand_grid(grid)?;
+    build_strategy_from(kind, &Some(combos[0].clone()), &[])?;
+
     let mut metrics = Vec::new();
     let mut skipped = Vec::new();
     for code in pool {
         match load(code) {
             Ok(bars) => match run_code(kind, code, &bars, grid, cfg) {
                 Ok(r) if !r.windows.is_empty() => metrics.push(r.metrics()),
-                _ => skipped.push(code.clone()),
+                Ok(_) => skipped.push((code.clone(), "数据不足,无有效窗口".to_string())),
+                Err(e) => skipped.push((code.clone(), format!("回测失败: {e:#}"))),
             },
-            Err(_) => skipped.push(code.clone()),
+            Err(e) => skipped.push((code.clone(), format!("加载失败: {e:#}"))),
         }
     }
     Ok((aggregate(metrics), skipped))
@@ -390,6 +405,20 @@ mod tests {
             windows(d(2024, 1, 1), d(2024, 2, 1), &cfg()).is_empty(),
             "数据不足一窗"
         );
+        assert!(
+            windows(
+                d(2024, 1, 1),
+                d(2024, 12, 31),
+                &WalkForwardCfg {
+                    train_days: 60,
+                    test_days: 30,
+                    step_days: 20,
+                    ..WalkForwardCfg::default()
+                }
+            )
+            .is_empty(),
+            "step_days < test_days 会导致检验窗重叠,必须拒绝"
+        );
     }
 
     #[test]
@@ -401,6 +430,101 @@ mod tests {
             buy_and_hold_return(&b, d(2030, 1, 1), d(2030, 2, 1)),
             0.0,
             "区间无数据"
+        );
+    }
+
+    /// 构造一个内部字段自洽的 `Summary`(仅测试用)。
+    fn summary(total_return: f64, sharpe: f64, max_drawdown: f64, trade_count: usize) -> Summary {
+        let total_contributed = 100_000.0;
+        Summary {
+            total_contributed,
+            final_equity: total_contributed * (1.0 + total_return),
+            total_return,
+            annualized: total_return,
+            max_drawdown,
+            sharpe,
+            trade_count,
+        }
+    }
+
+    #[test]
+    fn metrics_compound_returns_and_weight_by_days() {
+        let w = Window {
+            train_from: d(2024, 1, 1),
+            train_to: d(2024, 3, 1),
+            test_to: d(2024, 4, 1),
+        };
+        let out = CodeResult {
+            code: "600000".to_string(),
+            windows: vec![
+                WindowResult {
+                    window: w,
+                    params: toml::Value::Table(Default::default()),
+                    is_sharpe: 2.0,
+                    oos: summary(0.10, 1.0, 0.10, 5),
+                    oos_days: 100,
+                },
+                WindowResult {
+                    window: w,
+                    params: toml::Value::Table(Default::default()),
+                    is_sharpe: 3.0,
+                    oos: summary(0.20, 2.0, 0.30, 7),
+                    oos_days: 300,
+                },
+            ],
+            buy_hold_return: 0.05,
+        };
+        let m = out.metrics();
+        assert!((m.oos_return - 0.32).abs() < 1e-9, "复利: {}", m.oos_return);
+        assert!(
+            (m.oos_sharpe - 1.75).abs() < 1e-9,
+            "按天数加权: {}",
+            m.oos_sharpe
+        );
+        assert!(
+            (m.is_sharpe - 2.75).abs() < 1e-9,
+            "按天数加权: {}",
+            m.is_sharpe
+        );
+        assert!((m.oos_max_drawdown - 0.30).abs() < 1e-9, "取最大");
+        assert_eq!(m.oos_trades, 12, "求和");
+        assert_eq!(m.windows, 2);
+        assert!((m.years - 400.0 / 365.0).abs() < 1e-9);
+        let expected_annualized = 1.32_f64.powf(365.0 / 400.0) - 1.0;
+        assert!(
+            (m.oos_annualized - expected_annualized).abs() < 1e-9,
+            "{} vs {}",
+            m.oos_annualized,
+            expected_annualized
+        );
+    }
+
+    #[test]
+    fn training_window_never_sees_test_bars() {
+        let base: Vec<f64> = (0..190).map(|i| 10.0 + i as f64 * 0.05).collect();
+        let bars_a = bars(d(2024, 1, 1), &base);
+        let first = bars_a.first().unwrap().date;
+        let last = bars_a.last().unwrap().date;
+        let train_to = windows(first, last, &cfg())[0].train_to;
+        // 与 bars_a 在 train_to 之前完全相同,之后价格被放大 3 倍。
+        let diverged: Vec<f64> = base
+            .iter()
+            .zip(bars_a.iter())
+            .map(|(p, b)| if b.date >= train_to { p * 3.0 } else { *p })
+            .collect();
+        let bars_b = bars(d(2024, 1, 1), &diverged);
+
+        let out_a = run_code("trend", "600000", &bars_a, &grid(), &cfg()).unwrap();
+        let out_b = run_code("trend", "600000", &bars_b, &grid(), &cfg()).unwrap();
+        assert!(!out_a.windows.is_empty());
+        assert!(!out_b.windows.is_empty());
+        assert_eq!(
+            out_a.windows[0].params, out_b.windows[0].params,
+            "训练窗从未见过检验段数据,第一窗选参不应受后续分歧影响"
+        );
+        assert!(
+            (out_a.windows[0].is_sharpe - out_b.windows[0].is_sharpe).abs() < 1e-9,
+            "第一窗训练打分不应受检验段分歧影响"
         );
     }
 
@@ -467,6 +591,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(metrics.codes.len(), 1);
-        assert_eq!(skipped, vec!["000001".to_string()]);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].0, "000001");
+        assert!(skipped[0].1.contains("加载失败"), "{}", skipped[0].1);
+    }
+
+    #[test]
+    fn run_pool_rejects_invalid_grid() {
+        // 非数组的网格值应被视为配置错误,直接返回 Err,而不是把它算成某只股票被跳过。
+        let bad_grid = "short_window = 3".parse::<toml::Table>().unwrap();
+        let result = run_pool("trend", &["600000".to_string()], &bad_grid, &cfg(), |_| {
+            Ok(Vec::new())
+        });
+        assert!(result.is_err());
     }
 }
