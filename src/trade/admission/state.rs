@@ -167,6 +167,64 @@ pub fn apply_backtest_verdict(
     Ok(transition)
 }
 
+/// 月度重跑的结论:已准入 / 观察期策略没有 Backtesting 中间态,
+/// 通过则只落库评估、状态不变;不通过按 spec §10.5 降级。
+#[allow(clippy::too_many_arguments)]
+pub fn apply_monthly_verdict(
+    conn: &Connection,
+    user_id: i64,
+    id: i64,
+    metrics: &PoolMetrics,
+    verdict: &Verdict,
+    from: NaiveDate,
+    to: NaiveDate,
+    now: NaiveDateTime,
+) -> Result<Transition> {
+    let Some(s) = store::get_strategy(conn, user_id, id)? else {
+        return Ok(Transition::AlreadyHandled);
+    };
+    let tx = conn.unchecked_transaction()?;
+    store::save_eval(
+        &tx,
+        id,
+        user_id,
+        &s.version_hash,
+        "oos",
+        &serde_json::to_string(metrics)?,
+        from,
+        to,
+        now,
+    )?;
+    let transition = if verdict.passed {
+        Transition::AlreadyHandled
+    } else {
+        let reason = verdict.reasons.join(";");
+        match s.status {
+            StrategyStatus::Admitted => transition_status(
+                &tx,
+                user_id,
+                id,
+                StrategyStatus::Admitted,
+                StrategyStatus::Suspended,
+                &reason,
+                now,
+            )?,
+            StrategyStatus::Paper => transition_status(
+                &tx,
+                user_id,
+                id,
+                StrategyStatus::Paper,
+                StrategyStatus::Failed,
+                &reason,
+                now,
+            )?,
+            _ => Transition::AlreadyHandled,
+        }
+    };
+    tx.commit()?;
+    Ok(transition)
+}
+
 /// 策略状态 → 闸门准入。无策略(止盈止损 / 手动)为 NotRequired。
 pub fn admission_for(
     conn: &Connection,
@@ -430,6 +488,146 @@ mod tests {
 
     fn day(d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 9, d).unwrap()
+    }
+
+    #[test]
+    fn monthly_verdict_suspends_admitted_and_fails_paper() {
+        let c = db();
+        let admitted = strategy(&c, "rsi");
+        submit_for_backtest(&c, 1, admitted, at(16, 9, 1)).unwrap();
+        apply_backtest_verdict(
+            &c,
+            1,
+            admitted,
+            &empty_metrics(),
+            &Verdict {
+                passed: true,
+                reasons: Vec::new(),
+            },
+            day(15),
+            day(16),
+            at(16, 9, 2),
+        )
+        .unwrap();
+        update_status(
+            &c,
+            1,
+            admitted,
+            StrategyStatus::Paper,
+            StrategyStatus::Admitted,
+            "准入",
+            at(16, 9, 3),
+        )
+        .unwrap();
+
+        let bad = Verdict {
+            passed: false,
+            reasons: vec!["样本外夏普 0.30 < 0.80".into()],
+        };
+        assert_eq!(
+            apply_monthly_verdict(
+                &c,
+                1,
+                admitted,
+                &empty_metrics(),
+                &bad,
+                day(15),
+                day(16),
+                at(16, 9, 4)
+            )
+            .unwrap(),
+            Transition::Applied
+        );
+        let got = store::get_strategy(&c, 1, admitted).unwrap().unwrap();
+        assert_eq!(got.status, StrategyStatus::Suspended);
+        assert!(got.status_reason.unwrap().contains("夏普"));
+
+        let paper = strategy(&c, "rsi");
+        submit_for_backtest(&c, 1, paper, at(16, 9, 1)).unwrap();
+        apply_backtest_verdict(
+            &c,
+            1,
+            paper,
+            &empty_metrics(),
+            &Verdict {
+                passed: true,
+                reasons: Vec::new(),
+            },
+            day(15),
+            day(16),
+            at(16, 9, 2),
+        )
+        .unwrap();
+        apply_monthly_verdict(
+            &c,
+            1,
+            paper,
+            &empty_metrics(),
+            &bad,
+            day(15),
+            day(16),
+            at(16, 9, 5),
+        )
+        .unwrap();
+        assert_eq!(
+            store::get_strategy(&c, 1, paper).unwrap().unwrap().status,
+            StrategyStatus::Failed
+        );
+    }
+
+    #[test]
+    fn monthly_verdict_keeps_status_when_passing_but_records_eval() {
+        let c = db();
+        let id = strategy(&c, "rsi");
+        submit_for_backtest(&c, 1, id, at(16, 9, 1)).unwrap();
+        apply_backtest_verdict(
+            &c,
+            1,
+            id,
+            &empty_metrics(),
+            &Verdict {
+                passed: true,
+                reasons: Vec::new(),
+            },
+            day(15),
+            day(16),
+            at(16, 9, 2),
+        )
+        .unwrap();
+        update_status(
+            &c,
+            1,
+            id,
+            StrategyStatus::Paper,
+            StrategyStatus::Admitted,
+            "准入",
+            at(16, 9, 3),
+        )
+        .unwrap();
+        let ok = Verdict {
+            passed: true,
+            reasons: Vec::new(),
+        };
+        assert_eq!(
+            apply_monthly_verdict(
+                &c,
+                1,
+                id,
+                &empty_metrics(),
+                &ok,
+                day(15),
+                day(16),
+                at(16, 9, 6)
+            )
+            .unwrap(),
+            Transition::AlreadyHandled,
+            "通过则状态不变"
+        );
+        assert_eq!(
+            store::get_strategy(&c, 1, id).unwrap().unwrap().status,
+            StrategyStatus::Admitted
+        );
+        assert!(store::latest_eval(&c, id, 1, "oos").unwrap().is_some());
     }
 
     #[test]
