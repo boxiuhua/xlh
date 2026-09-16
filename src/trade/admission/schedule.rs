@@ -68,7 +68,10 @@ pub fn enqueue_monthly(conn: &Connection, now: NaiveDateTime) -> Result<Enqueued
 /// 按年月比较(不是按具体日期)则保证同一自然月只跑一次,即便触发点当天多次
 /// 重启也不会在当月内重复裁决。
 pub fn due_monthly(now: NaiveDateTime, day: u32, hour: u32, last_run: Option<NaiveDate>) -> bool {
-    let past_trigger = now.day() > day || (now.day() == day && now.hour() >= hour);
+    // 补跑也必须等到触发时刻:整池 12 年前推回测既吃 CPU 又要全池联网,
+    // 若只看日期,错过的那一轮会在重启后的第一轮立刻开跑——很可能正是盘中,
+    // 与 15 秒一轮的止盈止损监听抢资源。宁可当天晚些补,也不在开盘时段动手。
+    let past_trigger = now.day() >= day && now.hour() >= hour;
     past_trigger && last_run.is_none_or(|d| (d.year(), d.month()) != (now.year(), now.month()))
 }
 

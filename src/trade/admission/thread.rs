@@ -147,7 +147,9 @@ where
     // Backtesting(比如月度重跑失败,或另一次调用已经处理过)时是空操作。
     if let Some(msg) = &error {
         if job.kind == EvalKind::WalkForward {
-            let _ = state::update_status(
+            // 兜底转换本身失败(如写锁超时)不能静默:那正是「策略永远卡在
+            // Backtesting」重新出现的方式,必须留下痕迹。
+            if let Err(e) = state::update_status(
                 conn,
                 job.user_id,
                 job.strategy_id,
@@ -155,7 +157,10 @@ where
                 StrategyStatus::Failed,
                 msg,
                 now,
-            );
+            ) {
+                out.errors
+                    .push(format!("策略 {} 标记未通过失败: {e:#}", job.strategy_id));
+            }
         }
     }
     out.ran = Some((job.strategy_id, note));
@@ -168,14 +173,17 @@ where
 /// 再入队一遍;而这时早上的任务已经是 `done`,`enqueue_eval` 的 queued/running
 /// 去重完全不拦这种重复,于是同一策略当月被裁决两次、`oos` 多写一条重复记录。
 fn seed_tick_state(conn: &Connection) -> TickState {
-    let last_daily = store::last_beat(conn, DAILY_MARK)
-        .ok()
-        .flatten()
-        .map(|t| t.date());
-    let last_monthly = store::last_beat(conn, MONTHLY_MARK)
-        .ok()
-        .flatten()
-        .map(|t| t.date());
+    // 读失败只会多入队一轮(退回本分支之前的行为),不值得挡住线程启动;
+    // 但要留一行日志,否则「每次重启都重跑一遍」将无从诊断。
+    let read = |name: &str| match store::last_beat(conn, name) {
+        Ok(t) => t.map(|t| t.date()),
+        Err(e) => {
+            eprintln!("[trade] 读取调度标记 {name} 失败,本轮按未跑过处理: {e:#}");
+            None
+        }
+    };
+    let last_daily = read(DAILY_MARK);
+    let last_monthly = read(MONTHLY_MARK);
     TickState {
         last_daily,
         last_monthly,
@@ -228,7 +236,9 @@ fn run_loop(db_path: PathBuf, cfg: TradeCfg) {
             // 前推回测要尽可能长的历史(准入的数据年限关默认 3 年,训练窗还要再往前推),
             // 统一取 12 年。`end` 必须退一天:收盘前当天没有 K 线,非交易日(周末/
             // 节假日)更是永远没有,`end = now.date()` 会让 `cache::covers` 永远
-            // 判定「没覆盖到今天」,从而在每一个非交易日都对整池重新联网抓取。
+            // 判定「没覆盖到今天」,从而在每一次跑回测时都对整池重新联网抓取。
+            // 退一天只是把「永远不命中」改成「多数日子能命中」:周日(end 为周六)、
+            // 周一(end 为周日)与长假后的头几天仍会落空,代价是一次重抓,可接受。
             let end = now.date() - chrono::Duration::days(1);
             let start = end - chrono::Duration::days(365 * 12);
             let out = tick(&mut conn, &deps, &mut state, now, |code| {
