@@ -22,10 +22,10 @@ impl Verdict {
 /// 回测关(spec §10.4)。
 pub fn judge_backtest(m: &PoolMetrics, cfg: &AdmissionCfg) -> Verdict {
     let mut r = Vec::new();
-    if m.years < cfg.min_years {
+    if m.data_years < cfg.min_years {
         r.push(format!(
             "数据不足:{:.1} 年 < {:.1} 年",
-            m.years, cfg.min_years
+            m.data_years, cfg.min_years
         ));
     }
     if m.oos_return <= 0.0 {
@@ -160,6 +160,7 @@ mod tests {
                 oos_trades: trades,
                 is_sharpe,
                 years,
+                data_years: years,
                 buy_hold_return: 0.05,
             }],
             oos_return: ret,
@@ -169,6 +170,7 @@ mod tests {
             is_sharpe,
             positive_ratio: ratio,
             years,
+            data_years: years,
             buy_hold_return: 0.05,
         }
     }
@@ -195,6 +197,31 @@ mod tests {
         assert!(v.reasons.iter().any(|r| r.contains("夏普")));
         assert!(v.reasons.iter().any(|r| r.contains("买入持有")));
         assert!(v.reasons.iter().any(|r| r.contains("衰减")));
+    }
+
+    /// F1:数据年限关按 `data_years`(K 线总跨度)判定,与 `years`(样本外检验总跨度)无关。
+    #[test]
+    fn three_years_of_data_passes_the_data_gate() {
+        let mut passing = pool(1.0, 0.20, 40, 0.60, 1.0, 0.30, 1.4);
+        passing.data_years = 3.0;
+        for c in &mut passing.codes {
+            c.data_years = 3.0;
+        }
+        let v = judge_backtest(&passing, &AdmissionCfg::default());
+        assert!(
+            !v.reasons.iter().any(|r| r.contains("数据不足")),
+            "data_years=3.0、years=1.0 不应触发数据不足: {:?}",
+            v.reasons
+        );
+
+        let mut failing = passing.clone();
+        failing.data_years = 2.9;
+        for c in &mut failing.codes {
+            c.data_years = 2.9;
+        }
+        let v2 = judge_backtest(&failing, &AdmissionCfg::default());
+        assert_eq!(v2.reasons.len(), 1, "{:?}", v2.reasons);
+        assert!(v2.reasons[0].contains("数据不足"), "{:?}", v2.reasons);
     }
 
     #[test]

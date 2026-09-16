@@ -25,6 +25,8 @@ pub struct WalkForwardCfg {
     pub step_days: i64,
     /// 训练窗选参依据:sharpe | total_return | annualized | max_drawdown
     pub metric: String,
+    /// 初始现金。默认 0:组合按需注入资金(同 stock::recommend),于是收益与回撤都相对
+    /// 「实际投入的资金」度量,不被闲置现金稀释。
     pub initial_cash: f64,
     pub slippage: f64,
 }
@@ -36,7 +38,7 @@ impl Default for WalkForwardCfg {
             test_days: 182,
             step_days: 182,
             metric: "sharpe".into(),
-            initial_cash: 100_000.0,
+            initial_cash: 0.0,
             slippage: AShareExecution::DEFAULT_SLIPPAGE,
         }
     }
@@ -104,6 +106,9 @@ pub struct CodeResult {
     pub code: String,
     pub windows: Vec<WindowResult>,
     pub buy_hold_return: f64,
+    /// 整段 K 线的起止(不是检验窗跨度),用于数据年限准入判定(见 F1)。
+    pub data_from: NaiveDate,
+    pub data_to: NaiveDate,
 }
 
 /// 单只股票的样本外汇总。
@@ -120,7 +125,10 @@ pub struct CodeMetrics {
     pub oos_max_drawdown: f64,
     pub oos_trades: usize,
     pub is_sharpe: f64,
+    /// 样本外总跨度(年):各检验窗天数之和 / 365,仅用于年化,不用于数据年限准入。
     pub years: f64,
+    /// K 线总跨度(年):`data_to - data_from`,准入按它判定是否 ≥ `min_years`(见 F1)。
+    pub data_years: f64,
     pub buy_hold_return: f64,
 }
 
@@ -137,6 +145,8 @@ pub struct PoolMetrics {
     /// 样本外收益为正的股票占比
     pub positive_ratio: f64,
     pub years: f64,
+    /// 池内 K 线总跨度(年)中位数,数据年限准入按它判定(见 F1)。
+    pub data_years: f64,
     pub buy_hold_return: f64,
 }
 
@@ -245,6 +255,8 @@ pub fn run_code(
         code: code.to_string(),
         windows: out,
         buy_hold_return: buy_and_hold_return(bars, from, to),
+        data_from: first.date,
+        data_to: last.date,
     })
 }
 
@@ -285,6 +297,7 @@ impl CodeResult {
             oos_trades: self.windows.iter().map(|w| w.oos.trade_count).sum(),
             is_sharpe: weight(|w| w.is_sharpe),
             years: days as f64 / 365.0,
+            data_years: (self.data_to - self.data_from).num_days() as f64 / 365.0,
             buy_hold_return: self.buy_hold_return,
         }
     }
@@ -305,6 +318,7 @@ pub fn aggregate(codes: Vec<CodeMetrics>) -> PoolMetrics {
         is_sharpe: median(codes.iter().map(|c| c.is_sharpe).collect()),
         positive_ratio: ratio,
         years: median(codes.iter().map(|c| c.years).collect()),
+        data_years: median(codes.iter().map(|c| c.data_years).collect()),
         buy_hold_return: median(codes.iter().map(|c| c.buy_hold_return).collect()),
         codes,
     }
@@ -473,6 +487,8 @@ mod tests {
                 },
             ],
             buy_hold_return: 0.05,
+            data_from: d(2024, 1, 1),
+            data_to: d(2025, 4, 1),
         };
         let m = out.metrics();
         assert!((m.oos_return - 0.32).abs() < 1e-9, "复利: {}", m.oos_return);
@@ -490,6 +506,11 @@ mod tests {
         assert_eq!(m.oos_trades, 12, "求和");
         assert_eq!(m.windows, 2);
         assert!((m.years - 400.0 / 365.0).abs() < 1e-9);
+        assert!(
+            (m.data_years - 456.0 / 365.0).abs() < 1e-9,
+            "2024-01-01 到 2025-04-01 共 456 天(2024 闰年): {}",
+            m.data_years
+        );
         let expected_annualized = 1.32_f64.powf(365.0 / 400.0) - 1.0;
         assert!(
             (m.oos_annualized - expected_annualized).abs() < 1e-9,
@@ -558,6 +579,7 @@ mod tests {
             oos_trades: trades,
             is_sharpe: sharpe * 2.0,
             years: 1.0,
+            data_years: 3.0,
             buy_hold_return: 0.05,
         };
         let p = aggregate(vec![
@@ -572,7 +594,40 @@ mod tests {
         assert!((p.positive_ratio - 2.0 / 3.0).abs() < 1e-9);
         assert!((p.buy_hold_return - 0.05).abs() < 1e-9);
         assert!((p.is_sharpe - 2.0).abs() < 1e-9);
+        assert!((p.data_years - 3.0).abs() < 1e-9);
         assert_eq!(aggregate(Vec::new()).positive_ratio, 0.0);
+    }
+
+    /// F2:默认 `initial_cash = 0` 按需注入资金,收益/回撤不应随每笔金额大小而系统性偏移。
+    /// 手数取整与 5 元最低佣金会让结果有细微差异,因此只断言在 5 个百分点内接近,而非相等。
+    #[test]
+    fn metrics_do_not_depend_on_position_size() {
+        let prices: Vec<f64> = (0..190).map(|i| 10.0 + i as f64 * 0.05).collect();
+        let b = bars(d(2024, 1, 1), &prices);
+        let grid_small = "short_window = [3]\nlong_window = [10]\namount = [20000.0]"
+            .parse::<toml::Table>()
+            .unwrap();
+        let grid_large = "short_window = [3]\nlong_window = [10]\namount = [100000.0]"
+            .parse::<toml::Table>()
+            .unwrap();
+        let small = run_code("trend", "600000", &b, &grid_small, &cfg())
+            .unwrap()
+            .metrics();
+        let large = run_code("trend", "600000", &b, &grid_large, &cfg())
+            .unwrap()
+            .metrics();
+        assert!(
+            (small.oos_return - large.oos_return).abs() < 0.05,
+            "{} vs {}",
+            small.oos_return,
+            large.oos_return
+        );
+        assert!(
+            (small.oos_max_drawdown - large.oos_max_drawdown).abs() < 0.05,
+            "{} vs {}",
+            small.oos_max_drawdown,
+            large.oos_max_drawdown
+        );
     }
 
     #[test]
