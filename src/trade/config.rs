@@ -1,5 +1,6 @@
 //! `config.toml` 的 `[trade]` 段。段缺失 → 默认;段非法 → 报错(调用方决定禁用监听)。
 
+use crate::trade::admission::walk_forward::WalkForwardCfg;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -41,6 +42,46 @@ impl Default for AdmissionCfg {
     }
 }
 
+/// 前推回测的窗口切分与选参依据(见 F10)。转换成 `WalkForwardCfg` 时另外
+/// 传入 `[trade].slippage`——`walk_forward.rs` 不依赖 `config` 模块。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WalkForwardTuning {
+    pub train_days: i64,
+    pub test_days: i64,
+    pub step_days: i64,
+    /// 训练窗选参依据:sharpe | total_return | annualized | max_drawdown
+    pub metric: String,
+    /// 初始现金。默认 0(同 `WalkForwardCfg`):组合按需注入资金,收益与回撤
+    /// 都相对「实际投入的资金」度量。
+    pub initial_cash: f64,
+}
+
+impl Default for WalkForwardTuning {
+    fn default() -> Self {
+        Self {
+            train_days: 730,
+            test_days: 182,
+            step_days: 182,
+            metric: "sharpe".into(),
+            initial_cash: 0.0,
+        }
+    }
+}
+
+impl WalkForwardTuning {
+    pub fn to_cfg(&self, slippage: f64) -> WalkForwardCfg {
+        WalkForwardCfg {
+            train_days: self.train_days,
+            test_days: self.test_days,
+            step_days: self.step_days,
+            metric: self.metric.clone(),
+            initial_cash: self.initial_cash,
+            slippage,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TradeCfg {
@@ -53,6 +94,9 @@ pub struct TradeCfg {
     /// 是否把实时异动转为(观察期)交易信号
     pub mover_signals: bool,
     pub admission: AdmissionCfg,
+    /// 前推回测成交滑点(比例)
+    pub slippage: f64,
+    pub walk_forward: WalkForwardTuning,
 }
 
 impl Default for TradeCfg {
@@ -63,6 +107,8 @@ impl Default for TradeCfg {
             alert_after_secs: 180,
             mover_signals: true,
             admission: AdmissionCfg::default(),
+            slippage: 0.001,
+            walk_forward: WalkForwardTuning::default(),
         }
     }
 }
@@ -92,6 +138,50 @@ pub fn from_toml_str(text: &str) -> Result<TradeCfg> {
         return Err(anyhow!(
             "[trade] alert_after_secs 须 ≥ 60,当前 {}",
             cfg.alert_after_secs
+        ));
+    }
+    if !(0.0..=0.05).contains(&cfg.slippage) {
+        return Err(anyhow!(
+            "[trade] slippage 须在 [0,0.05],当前 {}",
+            cfg.slippage
+        ));
+    }
+    let wf = &cfg.walk_forward;
+    if wf.train_days <= 0 {
+        return Err(anyhow!(
+            "[trade.walk_forward] train_days 须 > 0,当前 {}",
+            wf.train_days
+        ));
+    }
+    if wf.test_days <= 0 {
+        return Err(anyhow!(
+            "[trade.walk_forward] test_days 须 > 0,当前 {}",
+            wf.test_days
+        ));
+    }
+    if wf.step_days <= 0 {
+        return Err(anyhow!(
+            "[trade.walk_forward] step_days 须 > 0,当前 {}",
+            wf.step_days
+        ));
+    }
+    if wf.step_days < wf.test_days {
+        return Err(anyhow!(
+            "[trade.walk_forward] step_days 须 >= test_days,当前 {} < {}",
+            wf.step_days,
+            wf.test_days
+        ));
+    }
+    if !["sharpe", "total_return", "annualized", "max_drawdown"].contains(&wf.metric.as_str()) {
+        return Err(anyhow!(
+            "[trade.walk_forward] metric 须是 sharpe|total_return|annualized|max_drawdown,当前 {}",
+            wf.metric
+        ));
+    }
+    if wf.initial_cash < 0.0 {
+        return Err(anyhow!(
+            "[trade.walk_forward] initial_cash 须 >= 0,当前 {}",
+            wf.initial_cash
         ));
     }
     let a = &cfg.admission;
@@ -301,6 +391,65 @@ mod tests {
         assert!(
             from_toml_str("[trade]\n[trade.admission]\nmover_paper_trades = 0\n").is_err(),
             "异动类观察期笔数下限须 >= 1"
+        );
+    }
+
+    /// F10:`[trade]` 段的 `slippage` / `[trade.walk_forward]` 默认值、覆盖与非法值。
+    #[test]
+    fn walk_forward_section_defaults_and_validation() {
+        let c = from_toml_str("[trade]\n").unwrap();
+        assert!((c.slippage - 0.001).abs() < 1e-9);
+        assert_eq!(c.walk_forward, WalkForwardTuning::default());
+        assert_eq!(c.walk_forward.train_days, 730);
+        assert_eq!(c.walk_forward.test_days, 182);
+        assert_eq!(c.walk_forward.step_days, 182);
+        assert_eq!(c.walk_forward.metric, "sharpe");
+        assert!((c.walk_forward.initial_cash - 0.0).abs() < 1e-9);
+
+        let c2 = from_toml_str("[trade]\n[trade.walk_forward]\ntrain_days = 365\n").unwrap();
+        assert_eq!(c2.walk_forward.train_days, 365, "覆盖项生效");
+        assert_eq!(c2.walk_forward.test_days, 182, "未覆盖项取默认");
+
+        let wf = c2.walk_forward.to_cfg(c2.slippage);
+        assert_eq!(wf.train_days, 365);
+        assert_eq!(wf.test_days, 182);
+        assert_eq!(wf.step_days, 182);
+        assert_eq!(wf.metric, "sharpe");
+        assert!((wf.initial_cash - 0.0).abs() < 1e-9);
+        assert!((wf.slippage - 0.001).abs() < 1e-9);
+
+        assert!(
+            from_toml_str("[trade]\nslippage = -0.001\n").is_err(),
+            "滑点须 >= 0"
+        );
+        assert!(
+            from_toml_str("[trade]\nslippage = 0.06\n").is_err(),
+            "滑点须 <= 0.05"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.walk_forward]\ntrain_days = 0\n").is_err(),
+            "train_days 须 > 0"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.walk_forward]\ntest_days = 0\n").is_err(),
+            "test_days 须 > 0"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.walk_forward]\nstep_days = 0\n").is_err(),
+            "step_days 须 > 0"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.walk_forward]\nstep_days = 10\ntest_days = 30\n")
+                .is_err(),
+            "step_days 须 >= test_days"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.walk_forward]\nmetric = \"foo\"\n").is_err(),
+            "metric 须是枚举值之一"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.walk_forward]\ninitial_cash = -1.0\n").is_err(),
+            "initial_cash 须 >= 0"
         );
     }
 }
