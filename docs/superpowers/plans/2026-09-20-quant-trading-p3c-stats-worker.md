@@ -351,7 +351,7 @@ mod tests {
     }
 ```
 
-> `log_status_event` 的参数顺序以当前代码为准(计划 3b 已改为按 `user_id` 隔离);若签名与此处不同,按实际签名调整调用。
+> 实际签名(已核对):`log_status_event(conn, strategy_id, user_id, from, to, reason, now)`、`get_strategy(conn, user_id, id)`、`latest_eval(conn, strategy_id, user_id, stage) -> Option<(String, NaiveDateTime)>`、`save_eval(conn, strategy_id, user_id, version_hash, stage, metrics_json, data_from, data_to, now)`。测试里的 `db()`、`at()`、`new_strategy()` 等辅助函数沿用 `store.rs` 内 `mod tests` 已有的同名写法。
 
 - [ ] **Step 2: 运行确认失败**
 
@@ -389,16 +389,16 @@ pub fn last_transition_at(
     let s: Option<String> = conn.query_row(
         &format!(
             "SELECT MAX(at) FROM trade_strategy_events
-             WHERE strategy_id = ?1 AND to_status = ?2 AND {OWNED_BY_USER}"
+             WHERE strategy_id = ?1 AND to_status = ?3 AND {OWNED_BY_USER}"
         ),
-        params![strategy_id, to.as_str(), user_id],
+        params![strategy_id, user_id, to.as_str()],
         |r| r.get(0),
     )?;
     s.as_deref().map(parse_ts).transpose()
 }
 ```
 
-> `OWNED_BY_USER` 是计划 3b 引入的归属子句常量;若其占位符编号与此处不符,按文件内既有用法调整参数顺序。
+> `OWNED_BY_USER` 占用 `?1`(strategy_id)与 `?2`(user_id),所以本查询自己的参数从 `?3` 起,与 `latest_eval` 同一写法。`MAX(at)` 在无行时返回一行 NULL,`query_row` 不会报 `QueryReturnedNoRows`。
 
 - [ ] **Step 4: 实现 judge.rs**
 
@@ -890,7 +890,7 @@ pub fn apply_monthly_verdict(
 }
 ```
 
-> `save_eval` / `transition_status` 的参数顺序与可见性以当前代码为准;`transition_status` 若是私有函数,本函数与它同文件,可直接调用。
+> `transition_status` 是同文件内的私有函数,可直接调用;它自身已做合法性检查,非法转换返回 `Transition::AlreadyHandled` 而不报错。`save_eval` 的实参顺序见 Task 1 的核对说明。
 
 `scorecard.rs` 实现:
 
@@ -1298,3 +1298,19 @@ git commit -m "feat(trade): 评估任务执行(前推回测、观察期检查、
 - **计划 3e**:日线策略信号(收盘后计算、次日 09:25 发出、`admission_for` 接入 `submit_signal`)、`stock/recommend.rs` 迁移到 A 股口径、交易日历
 - **计划 4**:网页策略管理与成绩单展示、`/trade` 确认页、持仓校准、风控设置
 - 计划 3b 遗留:`validate_new_strategy` 与 `config::build_strategy_from` 的 kind 列表各自维护;`Transition::AlreadyHandled` 未区分「已处理」与「非法转换」
+
+---
+
+## 执行后遗留项(来自全分支终审与修复轮 1,须被后续计划吸收)
+
+修复轮 1(`.superpowers/sdd/2026-09-20-quant-trading-p3c-stats-worker/fix-round-1-brief.md`)已处理回撤口径、
+watchdog 统计窗口、观察期基线缺失、端到端暂停用例与分批成交合并;下列各项明确**不在本轮范围**:
+
+- `worker.rs` 把 `WalkForward` 的 `data_from`/`data_to` 都写成 `ctx.now.date()`,不是真实 K 线跨度;目前无人读该列,计划 4 的成绩单 UI 需要 `CodeResult` 里已算出却被丢弃的真实区间
+- `run_job` 的 `on_code` 恒返 `true`,`PoolOutcome.cancelled` 在生产中无法为真,取消分支是死代码 —— 待计划 3d 的 `trade-eval` 线程接入取消信号
+- `apply_monthly_verdict` 无条件写 `oos` eval(`apply_backtest_verdict` 则只在 `Applied` 时写);`Draft`/`Failed` 状态的无意义重跑也会推进 `latest_eval("oos")`,而它是其余各关读取的基线
+- `max_streak_by_code` 对 `realized_pnl` 为 NULL 的成交按亏损计(`unwrap_or(0.0)`),而 `sell_pnls`/`trade_returns` 直接跳过;未来 qmt 导入的无盈亏成交会静默拉长连亏
+- 成绩单尚未满足 spec §10.6 的四栏(缺样本内列)与行(缺盈亏比、平均持仓天数、年化、超额);且 spec 写的执行损耗是**平均**偏离,实现用的是**中位数** —— 中位数更稳健,应改 spec 而非改代码,但需在计划 4 之前定案
+- `judge_watchdog` 命中首条规则即返回,`status_reason` 只记一条,用户看不到破得有多厉害
+- `workdays_between` 数的是日历工作日而非交易日,国庆/春节前后 20 个交易日的观察期会提前约 5 天满足;待 spec §12 的交易日历接入
+- watchdog 未按 `version_hash` 过滤成交:定义变更后旧版本的成交仍计入(本轮只按本次准入时刻过滤)

@@ -157,6 +157,64 @@ pub fn judge_paper(
     Verdict::from(r)
 }
 
+/// 实盘监控统计(spec §10.5)。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WatchdogStats {
+    /// 权益曲线(投入资金峰值 + 累计已实现盈亏)的最大回撤,与回测 `oos_max_drawdown` 同口径
+    pub drawdown: f64,
+    /// 最近窗口内的胜率
+    pub recent_win_rate: f64,
+    /// 最近窗口内的笔数
+    pub recent_trades: usize,
+    /// 按代码分组后的最长连亏(与回测基线同口径)
+    pub max_consecutive_losses: usize,
+}
+
+/// 实盘表现是否已偏离回测到需要暂停;返回原因。
+pub fn judge_watchdog(
+    s: &WatchdogStats,
+    baseline: &BacktestBaseline,
+    backtest_win_rate: f64,
+    backtest_max_streak: usize,
+    cfg: &AdmissionCfg,
+) -> Option<String> {
+    // 有意不加最小笔数守卫(与下面的胜率规则不同):分母修正为投入资金后,
+    // `drawdown` 是真实发生的资金损失比例,不是小样本里的统计噪声——两笔就亏掉
+    // 回测最大回撤 1.5 倍的资金,本来就该立刻停手。胜率则是频率估计,必须有样本量。
+    if baseline.max_drawdown > 0.0 && s.drawdown > baseline.max_drawdown * cfg.drawdown_multiple {
+        return Some(format!(
+            "实盘回撤 {:.1}% 超过回测 {:.1}% 的 {:.1} 倍",
+            s.drawdown * 100.0,
+            baseline.max_drawdown * 100.0,
+            cfg.drawdown_multiple
+        ));
+    }
+    if s.recent_trades >= cfg.watchdog_min_trades && backtest_win_rate > 0.0 {
+        let p = backtest_win_rate.clamp(0.0, 1.0);
+        let sigma = (p * (1.0 - p) / s.recent_trades as f64).sqrt();
+        let floor = p - cfg.win_rate_sigma * sigma;
+        if s.recent_win_rate < floor {
+            return Some(format!(
+                "近 {} 笔胜率 {:.0}% 低于回测 {:.0}% − {:.0}σ({:.0}%)",
+                s.recent_trades,
+                s.recent_win_rate * 100.0,
+                p * 100.0,
+                cfg.win_rate_sigma,
+                floor * 100.0
+            ));
+        }
+    }
+    if backtest_max_streak > 0
+        && (s.max_consecutive_losses as f64) > backtest_max_streak as f64 * cfg.streak_multiple
+    {
+        return Some(format!(
+            "连亏 {} 笔超过回测 {} 笔的 {:.1} 倍",
+            s.max_consecutive_losses, backtest_max_streak, cfg.streak_multiple
+        ));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,5 +499,56 @@ mod tests {
         assert!((b.avg_trade_return - 0.03).abs() < 1e-9);
         assert!((b.trade_return_sd - 0.01).abs() < 1e-9);
         assert!((b.max_drawdown - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn watchdog_flags_drawdown_winrate_and_streak() {
+        let cfg = AdmissionCfg::default();
+        let base = BacktestBaseline {
+            avg_trade_return: 0.02,
+            trade_return_sd: 0.01,
+            max_drawdown: 0.20,
+        };
+        let ok = WatchdogStats {
+            drawdown: 0.25,
+            recent_win_rate: 0.5,
+            recent_trades: 20,
+            max_consecutive_losses: 3,
+        };
+        assert!(judge_watchdog(&ok, &base, 0.55, 4, &cfg).is_none());
+
+        let deep = WatchdogStats {
+            drawdown: 0.31,
+            ..ok.clone()
+        };
+        assert!(judge_watchdog(&deep, &base, 0.55, 4, &cfg)
+            .unwrap()
+            .contains("回撤"));
+
+        // σ = sqrt(0.55×0.45/20) ≈ 0.1112;阈值 ≈ 0.55 − 2σ ≈ 0.3276
+        let cold = WatchdogStats {
+            recent_win_rate: 0.30,
+            ..ok.clone()
+        };
+        assert!(judge_watchdog(&cold, &base, 0.55, 4, &cfg)
+            .unwrap()
+            .contains("胜率"));
+        let few = WatchdogStats {
+            recent_trades: 4,
+            recent_win_rate: 0.0,
+            ..ok.clone()
+        };
+        assert!(
+            judge_watchdog(&few, &base, 0.55, 4, &cfg).is_none(),
+            "样本不足不判定"
+        );
+
+        let streak = WatchdogStats {
+            max_consecutive_losses: 7,
+            ..ok.clone()
+        };
+        assert!(judge_watchdog(&streak, &base, 0.55, 4, &cfg)
+            .unwrap()
+            .contains("连亏"));
     }
 }
