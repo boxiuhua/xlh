@@ -1082,9 +1082,14 @@ mod tests {
         assert!(list_strategies(&c, 2).unwrap().is_empty());
 
         // 未改定义 → 版本不变;改网格 → 版本变化且状态回到草稿
-        c.execute(
-            "UPDATE trade_strategies SET status='backtesting' WHERE id=?1",
-            [id],
+        crate::trade::admission::state::update_status(
+            &c,
+            1,
+            id,
+            StrategyStatus::Draft,
+            StrategyStatus::Backtesting,
+            "提交",
+            at(16, 9, 1),
         )
         .unwrap();
         assert!(

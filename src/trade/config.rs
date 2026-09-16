@@ -4,6 +4,40 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// 策略准入阈值(spec §10.4)。管理员可在 `[trade.admission]` 调整;用户侧只可调严。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdmissionCfg {
+    pub min_oos_sharpe: f64,
+    pub max_oos_drawdown: f64,
+    pub min_oos_trades: usize,
+    /// 1 − 样本外夏普 / 样本内夏普 的上限
+    pub max_sharpe_decay: f64,
+    pub min_positive_ratio: f64,
+    pub min_years: f64,
+    pub paper_days: i64,
+    pub paper_trades: usize,
+    pub mover_paper_days: i64,
+    pub mover_paper_trades: usize,
+}
+
+impl Default for AdmissionCfg {
+    fn default() -> Self {
+        Self {
+            min_oos_sharpe: 0.8,
+            max_oos_drawdown: 0.25,
+            min_oos_trades: 30,
+            max_sharpe_decay: 0.5,
+            min_positive_ratio: 0.55,
+            min_years: 3.0,
+            paper_days: 20,
+            paper_trades: 10,
+            mover_paper_days: 40,
+            mover_paper_trades: 30,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TradeCfg {
@@ -15,6 +49,7 @@ pub struct TradeCfg {
     pub alert_after_secs: i64,
     /// 是否把实时异动转为(观察期)交易信号
     pub mover_signals: bool,
+    pub admission: AdmissionCfg,
 }
 
 impl Default for TradeCfg {
@@ -24,6 +59,7 @@ impl Default for TradeCfg {
             monitor_interval_secs: 15,
             alert_after_secs: 180,
             mover_signals: true,
+            admission: AdmissionCfg::default(),
         }
     }
 }
@@ -96,5 +132,16 @@ mod tests {
         assert!(from_toml_str("[trade]\nmonitor_interval_secs = 3601\n").is_err());
         assert!(from_toml_str("[trade]\nalert_after_secs = 10\n").is_err());
         assert!(from_toml_str("[trade]\nenabled = \"yes\"\n").is_err());
+    }
+
+    #[test]
+    fn admission_section_defaults_and_overrides() {
+        let c = from_toml_str("[trade]\n[trade.admission]\nmin_oos_sharpe = 1.2\n").unwrap();
+        assert!((c.admission.min_oos_sharpe - 1.2).abs() < 1e-9);
+        assert_eq!(c.admission.min_oos_trades, 30, "未覆盖项取默认");
+        assert_eq!(
+            from_toml_str("[trade]\n").unwrap().admission,
+            AdmissionCfg::default()
+        );
     }
 }
