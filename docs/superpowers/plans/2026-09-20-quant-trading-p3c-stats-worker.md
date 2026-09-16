@@ -351,7 +351,7 @@ mod tests {
     }
 ```
 
-> `log_status_event` 的参数顺序以当前代码为准(计划 3b 已改为按 `user_id` 隔离);若签名与此处不同,按实际签名调整调用。
+> 实际签名(已核对):`log_status_event(conn, strategy_id, user_id, from, to, reason, now)`、`get_strategy(conn, user_id, id)`、`latest_eval(conn, strategy_id, user_id, stage) -> Option<(String, NaiveDateTime)>`、`save_eval(conn, strategy_id, user_id, version_hash, stage, metrics_json, data_from, data_to, now)`。测试里的 `db()`、`at()`、`new_strategy()` 等辅助函数沿用 `store.rs` 内 `mod tests` 已有的同名写法。
 
 - [ ] **Step 2: 运行确认失败**
 
@@ -389,16 +389,16 @@ pub fn last_transition_at(
     let s: Option<String> = conn.query_row(
         &format!(
             "SELECT MAX(at) FROM trade_strategy_events
-             WHERE strategy_id = ?1 AND to_status = ?2 AND {OWNED_BY_USER}"
+             WHERE strategy_id = ?1 AND to_status = ?3 AND {OWNED_BY_USER}"
         ),
-        params![strategy_id, to.as_str(), user_id],
+        params![strategy_id, user_id, to.as_str()],
         |r| r.get(0),
     )?;
     s.as_deref().map(parse_ts).transpose()
 }
 ```
 
-> `OWNED_BY_USER` 是计划 3b 引入的归属子句常量;若其占位符编号与此处不符,按文件内既有用法调整参数顺序。
+> `OWNED_BY_USER` 占用 `?1`(strategy_id)与 `?2`(user_id),所以本查询自己的参数从 `?3` 起,与 `latest_eval` 同一写法。`MAX(at)` 在无行时返回一行 NULL,`query_row` 不会报 `QueryReturnedNoRows`。
 
 - [ ] **Step 4: 实现 judge.rs**
 
@@ -890,7 +890,7 @@ pub fn apply_monthly_verdict(
 }
 ```
 
-> `save_eval` / `transition_status` 的参数顺序与可见性以当前代码为准;`transition_status` 若是私有函数,本函数与它同文件,可直接调用。
+> `transition_status` 是同文件内的私有函数,可直接调用;它自身已做合法性检查,非法转换返回 `Transition::AlreadyHandled` 而不报错。`save_eval` 的实参顺序见 Task 1 的核对说明。
 
 `scorecard.rs` 实现:
 
