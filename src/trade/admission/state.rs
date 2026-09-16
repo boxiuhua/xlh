@@ -72,6 +72,7 @@ pub fn submit_for_backtest(
 }
 
 /// 落库回测结论并推进状态:通过 → 观察期,不通过 → 未通过。
+/// 先转状态,只有真正生效(而非 `AlreadyHandled`)才落库评估,避免为无效转换写入脏数据。
 #[allow(clippy::too_many_arguments)]
 pub fn apply_backtest_verdict(
     conn: &Connection,
@@ -86,22 +87,12 @@ pub fn apply_backtest_verdict(
     let Some(s) = store::get_strategy(conn, user_id, id)? else {
         return Ok(Transition::AlreadyHandled);
     };
-    store::save_eval(
-        conn,
-        id,
-        &s.version_hash,
-        "oos",
-        &serde_json::to_string(metrics)?,
-        from,
-        to,
-        now,
-    )?;
     let (next, reason) = if verdict.passed {
         (StrategyStatus::Paper, "回测达标,进入观察期".to_string())
     } else {
         (StrategyStatus::Failed, verdict.reasons.join(";"))
     };
-    update_status(
+    let transition = update_status(
         conn,
         user_id,
         id,
@@ -109,7 +100,20 @@ pub fn apply_backtest_verdict(
         next,
         &reason,
         now,
-    )
+    )?;
+    if transition == Transition::Applied {
+        store::save_eval(
+            conn,
+            id,
+            &s.version_hash,
+            "oos",
+            &serde_json::to_string(metrics)?,
+            from,
+            to,
+            now,
+        )?;
+    }
+    Ok(transition)
 }
 
 /// 策略状态 → 闸门准入。无策略(止盈止损 / 手动)为 NotRequired。
@@ -296,6 +300,35 @@ mod tests {
         let got = store::get_strategy(&c, 1, id2).unwrap().unwrap();
         assert_eq!(got.status, StrategyStatus::Failed);
         assert!(got.status_reason.unwrap().contains("夏普"));
+    }
+
+    #[test]
+    fn verdict_on_wrong_status_writes_nothing() {
+        let c = db();
+        let id = strategy(&c, "rsi"); // 仍是 Draft,未提交评估
+        let ok = Verdict {
+            passed: true,
+            reasons: Vec::new(),
+        };
+        assert_eq!(
+            apply_backtest_verdict(
+                &c,
+                1,
+                id,
+                &empty_metrics(),
+                &ok,
+                day(15),
+                day(16),
+                at(16, 9, 2)
+            )
+            .unwrap(),
+            Transition::AlreadyHandled,
+            "策略不在回测中,转换不生效"
+        );
+        assert!(
+            store::latest_eval(&c, id, "oos").unwrap().is_none(),
+            "转换未生效不应落库评估"
+        );
     }
 
     #[test]

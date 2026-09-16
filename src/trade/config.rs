@@ -91,6 +91,37 @@ pub fn from_toml_str(text: &str) -> Result<TradeCfg> {
             cfg.alert_after_secs
         ));
     }
+    let a = &cfg.admission;
+    if !(a.max_oos_drawdown > 0.0 && a.max_oos_drawdown <= 1.0) {
+        return Err(anyhow!(
+            "[trade.admission] max_oos_drawdown 须在 (0,1],当前 {}",
+            a.max_oos_drawdown
+        ));
+    }
+    if !(0.0..=1.0).contains(&a.min_positive_ratio) {
+        return Err(anyhow!(
+            "[trade.admission] min_positive_ratio 须在 [0,1],当前 {}",
+            a.min_positive_ratio
+        ));
+    }
+    if a.min_years <= 0.0 {
+        return Err(anyhow!(
+            "[trade.admission] min_years 须 > 0,当前 {}",
+            a.min_years
+        ));
+    }
+    if a.paper_days <= 0 {
+        return Err(anyhow!(
+            "[trade.admission] paper_days 须 > 0,当前 {}",
+            a.paper_days
+        ));
+    }
+    if a.mover_paper_days <= 0 {
+        return Err(anyhow!(
+            "[trade.admission] mover_paper_days 须 > 0,当前 {}",
+            a.mover_paper_days
+        ));
+    }
     Ok(cfg)
 }
 
@@ -142,6 +173,38 @@ mod tests {
         assert_eq!(
             from_toml_str("[trade]\n").unwrap().admission,
             AdmissionCfg::default()
+        );
+    }
+
+    #[test]
+    fn admission_section_rejects_invalid_thresholds() {
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmax_oos_drawdown = 0.0\n").is_err(),
+            "回撤上限须 > 0"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmax_oos_drawdown = 1.5\n").is_err(),
+            "回撤上限须 ≤ 1"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmin_positive_ratio = -0.1\n").is_err(),
+            "正收益占比须 ≥ 0"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmin_positive_ratio = 1.1\n").is_err(),
+            "正收益占比须 ≤ 1"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmin_years = 0.0\n").is_err(),
+            "数据年限须 > 0"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\npaper_days = 0\n").is_err(),
+            "观察期天数须 > 0"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmover_paper_days = 0\n").is_err(),
+            "异动类观察期天数须 > 0"
         );
     }
 }

@@ -65,6 +65,8 @@ pub fn judge_backtest(m: &PoolMetrics, cfg: &AdmissionCfg) -> Verdict {
                 cfg.max_sharpe_decay * 100.0
             ));
         }
+    } else {
+        r.push(format!("样本内夏普 {:.2} ≤ 0,无法评估过拟合", m.is_sharpe));
     }
     if m.positive_ratio < cfg.min_positive_ratio {
         r.push(format!(
@@ -85,13 +87,19 @@ pub struct PaperStats {
     pub max_drawdown: f64,
 }
 
+/// 回测基线:观察期表现要与之比较。异动类策略无回测,传 None。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BacktestBaseline {
+    pub avg_trade_return: f64,
+    pub trade_return_sd: f64,
+    pub max_drawdown: f64,
+}
+
 /// 观察期关(spec §10.5):时长、笔数、平均每笔收益不低于回测均值 − 1σ、回撤不超过回测。
-#[allow(clippy::too_many_arguments)]
+/// 异动类策略无历史回测,`baseline` 传 `None` 时只检查时长与笔数。
 pub fn judge_paper(
     stats: &PaperStats,
-    backtest_avg_trade_return: f64,
-    backtest_trade_return_sd: f64,
-    backtest_max_drawdown: f64,
+    baseline: Option<&BacktestBaseline>,
     is_mover: bool,
     cfg: &AdmissionCfg,
 ) -> Verdict {
@@ -107,20 +115,22 @@ pub fn judge_paper(
     if stats.trades < min_trades {
         r.push(format!("观察期 {} 笔 < {} 笔", stats.trades, min_trades));
     }
-    let floor = backtest_avg_trade_return - backtest_trade_return_sd;
-    if stats.avg_trade_return < floor {
-        r.push(format!(
-            "模拟盘平均每笔收益 {:.2}% 低于回测均值 − 1σ({:.2}%)",
-            stats.avg_trade_return * 100.0,
-            floor * 100.0
-        ));
-    }
-    if stats.max_drawdown > backtest_max_drawdown {
-        r.push(format!(
-            "模拟盘最大回撤 {:.1}% 超过回测 {:.1}%",
-            stats.max_drawdown * 100.0,
-            backtest_max_drawdown * 100.0
-        ));
+    if let Some(baseline) = baseline {
+        let floor = baseline.avg_trade_return - baseline.trade_return_sd;
+        if stats.avg_trade_return < floor {
+            r.push(format!(
+                "模拟盘平均每笔收益 {:.2}% 低于回测均值 − 1σ({:.2}%)",
+                stats.avg_trade_return * 100.0,
+                floor * 100.0
+            ));
+        }
+        if stats.max_drawdown > baseline.max_drawdown {
+            r.push(format!(
+                "模拟盘最大回撤 {:.1}% 超过回测 {:.1}%",
+                stats.max_drawdown * 100.0,
+                baseline.max_drawdown * 100.0
+            ));
+        }
     }
     Verdict::from(r)
 }
@@ -202,6 +212,38 @@ mod tests {
     }
 
     #[test]
+    fn nonpositive_is_sharpe_is_flagged_not_waived() {
+        // is_sharpe = 0 不能豁免衰减检查,必须单独报出「无法评估过拟合」
+        let v = judge_backtest(
+            &pool(1.5, 0.10, 50, 0.80, 5.0, 0.30, 0.0),
+            &AdmissionCfg::default(),
+        );
+        assert!(!v.passed);
+        assert_eq!(v.reasons.len(), 1, "{:?}", v.reasons);
+        assert!(v.reasons[0].contains("样本内夏普"), "{:?}", v.reasons);
+    }
+
+    #[test]
+    fn thresholds_are_inclusive_at_the_boundary() {
+        // 每项都恰好卡在默认阈值上(衰减恰好 = 0.5):应视为通过。
+        let v = judge_backtest(
+            &pool(0.8, 0.25, 30, 0.55, 3.0, 0.10, 1.6),
+            &AdmissionCfg::default(),
+        );
+        assert!(v.passed, "{:?}", v.reasons);
+        assert!(v.reasons.is_empty());
+
+        // 样本外收益恰好等于买入持有:仍算未跑赢。
+        let v2 = judge_backtest(
+            &pool(0.8, 0.25, 30, 0.55, 3.0, 0.05, 1.6),
+            &AdmissionCfg::default(),
+        );
+        assert!(!v2.passed);
+        assert_eq!(v2.reasons.len(), 1, "{:?}", v2.reasons);
+        assert!(v2.reasons[0].contains("买入持有"), "{:?}", v2.reasons);
+    }
+
+    #[test]
     fn paper_stage_uses_stricter_bar_for_movers() {
         let cfg = AdmissionCfg::default();
         let stats = PaperStats {
@@ -210,8 +252,13 @@ mod tests {
             avg_trade_return: 0.02,
             max_drawdown: 0.15,
         };
-        assert!(judge_paper(&stats, 0.03, 0.02, 0.20, false, &cfg).passed);
-        let v = judge_paper(&stats, 0.03, 0.02, 0.20, true, &cfg);
+        let baseline = BacktestBaseline {
+            avg_trade_return: 0.03,
+            trade_return_sd: 0.02,
+            max_drawdown: 0.20,
+        };
+        assert!(judge_paper(&stats, Some(&baseline), false, &cfg).passed);
+        let v = judge_paper(&stats, Some(&baseline), true, &cfg);
         assert!(!v.passed, "异动类要求 40 日 / 30 笔");
         assert_eq!(v.reasons.len(), 2, "{:?}", v.reasons);
     }
@@ -225,7 +272,12 @@ mod tests {
             avg_trade_return: 0.001,
             max_drawdown: 0.35,
         };
-        let v = judge_paper(&stats, 0.03, 0.01, 0.20, false, &cfg);
+        let baseline = BacktestBaseline {
+            avg_trade_return: 0.03,
+            trade_return_sd: 0.01,
+            max_drawdown: 0.20,
+        };
+        let v = judge_paper(&stats, Some(&baseline), false, &cfg);
         assert!(!v.passed);
         assert!(
             v.reasons.iter().any(|r| r.contains("每笔收益")),
@@ -237,5 +289,43 @@ mod tests {
             "{:?}",
             v.reasons
         );
+    }
+
+    #[test]
+    fn paper_avg_trade_return_exactly_at_floor_passes() {
+        let cfg = AdmissionCfg::default();
+        let stats = PaperStats {
+            days: 30,
+            trades: 20,
+            avg_trade_return: 0.02, // == 0.03 - 0.01
+            max_drawdown: 0.20,
+        };
+        let baseline = BacktestBaseline {
+            avg_trade_return: 0.03,
+            trade_return_sd: 0.01,
+            max_drawdown: 0.20,
+        };
+        let v = judge_paper(&stats, Some(&baseline), false, &cfg);
+        assert!(v.passed, "{:?}", v.reasons);
+    }
+
+    #[test]
+    fn mover_without_baseline_only_checks_days_and_trades() {
+        let cfg = AdmissionCfg::default();
+        let stats = PaperStats {
+            days: 45,
+            trades: 35,
+            avg_trade_return: -0.05,
+            max_drawdown: 0.60,
+        };
+        assert!(
+            judge_paper(&stats, None, true, &cfg).passed,
+            "无回测基线,收益/回撤不参与判定"
+        );
+        let short = PaperStats { days: 30, ..stats };
+        let v = judge_paper(&short, None, true, &cfg);
+        assert!(!v.passed);
+        assert_eq!(v.reasons.len(), 1, "{:?}", v.reasons);
+        assert!(v.reasons[0].contains("交易日"), "{:?}", v.reasons);
     }
 }
