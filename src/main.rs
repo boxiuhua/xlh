@@ -156,7 +156,10 @@ fn main() -> Result<()> {
                     _ => None,
                 };
                 if let Some(c) = &trade_cfg {
-                    if c.eval.enabled {
+                    // `[trade.eval]` 嵌在 `[trade]` 之下:用户把 `[trade] enabled = false`
+                    // 理解为「两个交易相关线程都别跑」是合理预期,只看 `eval.enabled` 会让
+                    // 评估线程在总开关关闭时仍继续裁决策略的准入/暂停。
+                    if c.enabled && c.eval.enabled {
                         if let Err(e) = xlh::trade::admission::thread::spawn(
                             auth_cfg.db_path.clone(),
                             c.clone(),

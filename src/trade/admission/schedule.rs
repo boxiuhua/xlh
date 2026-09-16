@@ -59,9 +59,17 @@ pub fn enqueue_monthly(conn: &Connection, now: NaiveDateTime) -> Result<Enqueued
     })
 }
 
-/// 今天是否是每月重跑日且已到点;`last_run` 为当日则已跑过。
+/// 是否该跑本月的重跑:「已过触发点」且「本自然月还没跑过」。
+///
+/// 这是桌面进程而非常驻服务:原先按 `now.day() == day` 精确匹配,一旦触发日当天
+/// 进程没在跑(关机、待机、次日才启动),`day()` 再也不会等于配置的日子,
+/// 整月的前推回测重跑就被彻底跳过——已准入策略可能连续几个月得不到样本外复核。
+/// 改成「超过触发点」按月去重后,晚到的那一轮会在当月内补跑一次,而 `last_run`
+/// 按年月比较(不是按具体日期)则保证同一自然月只跑一次,即便触发点当天多次
+/// 重启也不会在当月内重复裁决。
 pub fn due_monthly(now: NaiveDateTime, day: u32, hour: u32, last_run: Option<NaiveDate>) -> bool {
-    now.day() == day && now.hour() >= hour && last_run != Some(now.date())
+    let past_trigger = now.day() > day || (now.day() == day && now.hour() >= hour);
+    past_trigger && last_run.is_none_or(|d| (d.year(), d.month()) != (now.year(), now.month()))
 }
 
 #[cfg(test)]
@@ -175,11 +183,30 @@ mod tests {
     }
 
     #[test]
-    fn due_monthly_fires_once_on_the_configured_day() {
+    fn due_monthly_fires_once_per_month_and_catches_up_after_a_missed_trigger_day() {
         let day = |d: u32| NaiveDate::from_ymd_opt(2026, 9, d).unwrap();
-        assert!(due_monthly(at(1, 17, 0), 1, 17, None));
+        assert!(due_monthly(at(1, 17, 0), 1, 17, None), "到点当天触发");
         assert!(!due_monthly(at(1, 16, 59), 1, 17, None), "未到点");
-        assert!(!due_monthly(at(2, 17, 0), 1, 17, None), "非重跑日");
-        assert!(!due_monthly(at(1, 18, 0), 1, 17, Some(day(1))), "当日已跑");
+        assert!(
+            due_monthly(at(2, 17, 0), 1, 17, None),
+            "F13:桌面进程触发日当天没跑,次日要补跑,不能整月错过"
+        );
+        assert!(
+            !due_monthly(at(1, 18, 0), 1, 17, Some(day(1))),
+            "本月已跑,不再重复"
+        );
+        assert!(
+            !due_monthly(at(5, 9, 0), 1, 17, Some(day(1))),
+            "F13:本月已跑,即便重启且日期已过触发点也不再重复"
+        );
+        assert!(
+            due_monthly(
+                at(1, 17, 0),
+                1,
+                17,
+                Some(NaiveDate::from_ymd_opt(2026, 8, 1).unwrap())
+            ),
+            "跨月后重新触发"
+        );
     }
 }

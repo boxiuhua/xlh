@@ -6,14 +6,20 @@
 
 use crate::stock::data::StockBar;
 use crate::trade::admission::schedule::{self, Enqueued};
+use crate::trade::admission::state;
 use crate::trade::admission::walk_forward::WalkForwardCfg;
 use crate::trade::admission::worker::{self, JobContext};
 use crate::trade::config::{AdmissionCfg, EvalCfg, TradeCfg};
+use crate::trade::model::{EvalKind, StrategyStatus};
 use crate::trade::store;
 use anyhow::Result;
 use chrono::{NaiveDate, NaiveDateTime};
 use rusqlite::Connection;
 use std::path::PathBuf;
+
+/// 心跳表复用为「每日 / 每月上次成功入队」的持久标记(见 `seed_tick_state`)。
+const DAILY_MARK: &str = "trade-eval-daily";
+const MONTHLY_MARK: &str = "trade-eval-monthly";
 
 pub struct EvalDeps<'a> {
     pub wf: &'a WalkForwardCfg,
@@ -64,8 +70,15 @@ where
         match schedule::enqueue_daily(conn, now) {
             Ok(r) => {
                 out.errors.extend(r.errors.iter().cloned());
-                out.enqueued = r;
+                out.enqueued.paper += r.paper;
+                out.enqueued.watchdog += r.watchdog;
+                out.enqueued.walk_forward += r.walk_forward;
                 state.last_daily = Some(now.date());
+                // 持久化「今天已入队」,重启后靠它复原,而不是永远从 None 起步
+                // (见 `seed_tick_state`)——否则重启越过 16:30 就会当天重复入队。
+                if let Err(err) = store::beat(conn, DAILY_MARK, now) {
+                    out.errors.push(format!("每日入队标记写入失败: {err:#}"));
+                }
             }
             Err(err) => out.errors.push(format!("每日入队失败: {err:#}")),
         }
@@ -74,8 +87,13 @@ where
         match schedule::enqueue_monthly(conn, now) {
             Ok(r) => {
                 out.errors.extend(r.errors.iter().cloned());
+                out.enqueued.paper += r.paper;
+                out.enqueued.watchdog += r.watchdog;
                 out.enqueued.walk_forward += r.walk_forward;
                 state.last_monthly = Some(now.date());
+                if let Err(err) = store::beat(conn, MONTHLY_MARK, now) {
+                    out.errors.push(format!("每月入队标记写入失败: {err:#}"));
+                }
             }
             Err(err) => out.errors.push(format!("每月入队失败: {err:#}")),
         }
@@ -120,8 +138,49 @@ where
         out.errors
             .push(format!("任务 {} 收尾失败: {err:#}", job.id));
     }
+    // spec §12:「eval 任务失败/数据不足 → 策略 FAILED 并写原因,不滞留
+    // BACKTESTING」。首次回测的 WalkForward 任务出错(网格非法、指标未知、
+    // panic……)时,`run_job` 在产出裁决前就已经 `?` 冒泡失败,策略行本身
+    // 从未被 `apply_backtest_verdict` 碰过,会永远停在 Backtesting——
+    // `enqueue_daily`/`enqueue_monthly` 都不会再管这个状态,没有重试也没有
+    // 超时。这里补上兜底转换;`update_status` 是条件 UPDATE,策略已不在
+    // Backtesting(比如月度重跑失败,或另一次调用已经处理过)时是空操作。
+    if let Some(msg) = &error {
+        if job.kind == EvalKind::WalkForward {
+            let _ = state::update_status(
+                conn,
+                job.user_id,
+                job.strategy_id,
+                StrategyStatus::Backtesting,
+                StrategyStatus::Failed,
+                msg,
+                now,
+            );
+        }
+    }
     out.ran = Some((job.strategy_id, note));
     out
+}
+
+/// 线程重启时用心跳表复原 `last_daily` / `last_monthly`,而不是永远从 `TickState::default()`
+/// 起步:内存态清零本身没问题,但配合 `due_daily`/`due_monthly` 的「今天 / 本月还没
+/// 跑过」判定,`None` 会被读成「从没跑过」——重启越过触发时刻,就会在当天/当月
+/// 再入队一遍;而这时早上的任务已经是 `done`,`enqueue_eval` 的 queued/running
+/// 去重完全不拦这种重复,于是同一策略当月被裁决两次、`oos` 多写一条重复记录。
+fn seed_tick_state(conn: &Connection) -> TickState {
+    let last_daily = store::last_beat(conn, DAILY_MARK)
+        .ok()
+        .flatten()
+        .map(|t| t.date());
+    let last_monthly = store::last_beat(conn, MONTHLY_MARK)
+        .ok()
+        .flatten()
+        .map(|t| t.date());
+    TickState {
+        last_daily,
+        last_monthly,
+        reclaimed: false,
+    }
 }
 
 /// 从 panic payload 里尽量取出可读文本;取不到就给个占位,不能让收尾逻辑崩掉。
@@ -153,7 +212,7 @@ fn run_loop(db_path: PathBuf, cfg: TradeCfg) {
         }
     };
     println!("策略评估线程已启动(轮询 {} 秒)", cfg.eval.poll_secs);
-    let mut state = TickState::default();
+    let mut state = seed_tick_state(&conn);
     loop {
         let now = chrono::Local::now().naive_local();
         // 单轮 panic 只记日志、照常进入下一轮;线程退出等于评估静默停摆。
@@ -167,8 +226,10 @@ fn run_loop(db_path: PathBuf, cfg: TradeCfg) {
                 eval: &cfg.eval,
             };
             // 前推回测要尽可能长的历史(准入的数据年限关默认 3 年,训练窗还要再往前推),
-            // 统一取 12 年;`load_or_fetch` 命中缓存就不会真的联网。
-            let end = now.date();
+            // 统一取 12 年。`end` 必须退一天:收盘前当天没有 K 线,非交易日(周末/
+            // 节假日)更是永远没有,`end = now.date()` 会让 `cache::covers` 永远
+            // 判定「没覆盖到今天」,从而在每一个非交易日都对整池重新联网抓取。
+            let end = now.date() - chrono::Duration::days(1);
             let start = end - chrono::Duration::days(365 * 12);
             let out = tick(&mut conn, &deps, &mut state, now, |code| {
                 crate::stock::data::cache::load_or_fetch(
@@ -252,7 +313,14 @@ mod tests {
             admission: &adm,
             eval: &ev,
         };
-        let mut st = TickState::default();
+        // 本测试只关心「每日」入队/执行这条线;月度默认在每月 1 日触发,
+        // F13 的「过了触发日就该补跑」语义会让 9 月 16 日的首轮 tick 也顺带
+        // 判定月度到期(`last_monthly` 还是 None),与这里要看的东西无关,
+        // 所以显式标记「本月已跑」把它关掉——月度自身的行为在别处单独测。
+        let mut st = TickState {
+            last_monthly: Some(at(16, 10, 0).date()),
+            ..Default::default()
+        };
 
         // 未到点:不入队也无任务可跑
         let r = tick(&mut c, &d, &mut st, at(16, 10, 0), |_| Ok(Vec::new()));
@@ -270,6 +338,47 @@ mod tests {
         let r = tick(&mut c, &d, &mut st, at(16, 16, 40), |_| Ok(Vec::new()));
         assert_eq!(r.enqueued.paper, 0);
         assert!(r.ran.is_none());
+    }
+
+    /// F13(修复轮 2 finding 2):`last_daily`/`last_monthly` 必须落库,重启后靠
+    /// `seed_tick_state` 复原,而不是每次进程重启都从 `None` 起步——否则任何一次
+    /// 重启只要越过当天/当月的触发时刻,就会把已经跑过的日/月任务重新入队一遍。
+    #[test]
+    fn tick_persists_daily_and_monthly_markers_for_seed_tick_state_to_use_after_restart() {
+        let mut c = db();
+        paper_strategy(&c); // mover → Paper:daily(PaperCheck)与 monthly(WalkForward)都会命中
+        let (wf, adm, ev) = deps();
+        let d = EvalDeps {
+            wf: &wf,
+            admission: &adm,
+            eval: &ev,
+        };
+        let mut st = TickState::default();
+        // 月度默认 day=1 hour=17,daily 默认 16:30——9 月 1 日 17:00 两者同时到点
+        let now = at(1, 17, 0);
+        let r = tick(&mut c, &d, &mut st, now, |_| Ok(Vec::new()));
+        assert_eq!(r.enqueued.paper, 1, "daily 命中,PaperCheck 入队");
+        assert_eq!(r.enqueued.walk_forward, 1, "monthly 命中,WalkForward 入队");
+
+        // 模拟重启:凭数据库心跳复原,而不是永远从 None 起步
+        let mut restarted = seed_tick_state(&c);
+        assert_eq!(restarted.last_daily, Some(now.date()), "daily 标记已落库");
+        assert_eq!(
+            restarted.last_monthly,
+            Some(now.date()),
+            "monthly 标记已落库"
+        );
+
+        // 用复原后的状态在同一天/同一月内再跑一轮,不应重复入队
+        let r2 = tick(
+            &mut c,
+            &d,
+            &mut restarted,
+            at(1, 17, 30),
+            |_| Ok(Vec::new()),
+        );
+        assert_eq!(r2.enqueued.paper, 0, "重启后同日不应重复入队");
+        assert_eq!(r2.enqueued.walk_forward, 0, "重启后同月不应重复入队");
     }
 
     #[test]
@@ -330,6 +439,23 @@ mod tests {
             j.error.as_deref().unwrap().contains("必须是数组"),
             "{:?}",
             j.error
+        );
+        // spec §12:任务失败必须把策略变成 FAILED、不能滞留 BACKTESTING——
+        // 否则这个策略此后永远不会再被 enqueue_daily/enqueue_monthly 碰到,
+        // 谁也无法让它重新进入回测或观察期。
+        let s = store::get_strategy(&c, 1, id).unwrap().unwrap();
+        assert_eq!(
+            s.status,
+            crate::trade::model::StrategyStatus::Failed,
+            "任务失败不得让策略滞留 Backtesting"
+        );
+        assert!(
+            s.status_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("必须是数组"),
+            "{:?}",
+            s.status_reason
         );
     }
 
