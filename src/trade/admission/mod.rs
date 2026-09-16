@@ -3,4 +3,5 @@
 
 pub mod judge;
 pub mod state;
+pub mod stats;
 pub mod walk_forward;

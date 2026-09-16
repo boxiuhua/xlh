@@ -22,6 +22,16 @@ pub struct AdmissionCfg {
     pub paper_trades: usize,
     pub mover_paper_days: i64,
     pub mover_paper_trades: usize,
+    /// 实盘回撤超过「回测最大回撤 × 该倍数」即暂停
+    pub drawdown_multiple: f64,
+    /// 胜率下限 = 回测胜率 − 该倍数 × σ
+    pub win_rate_sigma: f64,
+    /// 连亏超过「回测最长连亏 × 该倍数」即暂停
+    pub streak_multiple: f64,
+    /// 胜率判定的滚动窗口(笔)
+    pub watchdog_window: usize,
+    /// 少于该笔数不做胜率判定
+    pub watchdog_min_trades: usize,
 }
 
 impl Default for AdmissionCfg {
@@ -38,6 +48,11 @@ impl Default for AdmissionCfg {
             paper_trades: 10,
             mover_paper_days: 40,
             mover_paper_trades: 30,
+            drawdown_multiple: 1.5,
+            win_rate_sigma: 2.0,
+            streak_multiple: 1.5,
+            watchdog_window: 20,
+            watchdog_min_trades: 5,
         }
     }
 }
@@ -259,6 +274,32 @@ pub fn from_toml_str(text: &str) -> Result<TradeCfg> {
             a.mover_paper_trades
         ));
     }
+    for (name, v) in [
+        ("drawdown_multiple", a.drawdown_multiple),
+        ("streak_multiple", a.streak_multiple),
+    ] {
+        if !(v.is_finite() && v >= 1.0) {
+            return Err(anyhow!("[trade.admission] {name} 须 >= 1,当前 {v}"));
+        }
+    }
+    if !(a.win_rate_sigma.is_finite() && a.win_rate_sigma >= 0.0) {
+        return Err(anyhow!(
+            "[trade.admission] win_rate_sigma 须 >= 0,当前 {}",
+            a.win_rate_sigma
+        ));
+    }
+    if a.watchdog_window == 0 {
+        return Err(anyhow!(
+            "[trade.admission] watchdog_window 须 >= 1,当前 {}",
+            a.watchdog_window
+        ));
+    }
+    if a.watchdog_min_trades == 0 {
+        return Err(anyhow!(
+            "[trade.admission] watchdog_min_trades 须 >= 1,当前 {}",
+            a.watchdog_min_trades
+        ));
+    }
     Ok(cfg)
 }
 
@@ -447,5 +488,21 @@ mod tests {
             from_toml_str("[trade]\n[trade.walk_forward]\ninitial_cash = -1.0\n").is_err(),
             "initial_cash 须 >= 0"
         );
+    }
+
+    #[test]
+    fn watchdog_thresholds_default_and_validate() {
+        let c = from_toml_str("[trade]\n").unwrap().admission;
+        assert_eq!(
+            (c.drawdown_multiple, c.win_rate_sigma, c.streak_multiple),
+            (1.5, 2.0, 1.5)
+        );
+        assert_eq!((c.watchdog_window, c.watchdog_min_trades), (20, 5));
+        assert!(
+            from_toml_str("[trade.admission]\ndrawdown_multiple = 0.5\n").is_err(),
+            "须 ≥ 1"
+        );
+        assert!(from_toml_str("[trade.admission]\nwin_rate_sigma = -1.0\n").is_err());
+        assert!(from_toml_str("[trade.admission]\nwatchdog_window = 0\n").is_err());
     }
 }

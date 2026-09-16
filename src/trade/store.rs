@@ -863,6 +863,24 @@ pub fn log_status_event(
     Ok(())
 }
 
+/// 该策略最近一次「转入指定状态」的时间(观察期起点等用)。
+pub fn last_transition_at(
+    conn: &Connection,
+    strategy_id: i64,
+    user_id: i64,
+    to: StrategyStatus,
+) -> Result<Option<NaiveDateTime>> {
+    let s: Option<String> = conn.query_row(
+        &format!(
+            "SELECT MAX(at) FROM trade_strategy_events
+             WHERE strategy_id = ?1 AND to_status = ?3 AND {OWNED_BY_USER}"
+        ),
+        params![strategy_id, user_id, to.as_str()],
+        |r| r.get(0),
+    )?;
+    s.as_deref().map(parse_ts).transpose()
+}
+
 #[allow(clippy::type_complexity)]
 pub fn list_status_events(
     conn: &Connection,
@@ -1575,6 +1593,55 @@ mod tests {
             at(16, 9, 7),
         )
         .is_err());
+    }
+
+    #[test]
+    fn last_transition_at_finds_the_latest_entry_per_status() {
+        let c = db();
+        let id = create_strategy(&c, &new_strategy(), at(16, 9, 0)).unwrap();
+        assert!(last_transition_at(&c, id, 1, StrategyStatus::Paper)
+            .unwrap()
+            .is_none());
+        log_status_event(
+            &c,
+            id,
+            1,
+            StrategyStatus::Backtesting,
+            StrategyStatus::Paper,
+            "首次",
+            at(16, 9, 1),
+        )
+        .unwrap();
+        log_status_event(
+            &c,
+            id,
+            1,
+            StrategyStatus::Paper,
+            StrategyStatus::Suspended,
+            "暂停",
+            at(16, 9, 2),
+        )
+        .unwrap();
+        log_status_event(
+            &c,
+            id,
+            1,
+            StrategyStatus::Suspended,
+            StrategyStatus::Paper,
+            "再次",
+            at(16, 9, 3),
+        )
+        .unwrap();
+        assert_eq!(
+            last_transition_at(&c, id, 1, StrategyStatus::Paper).unwrap(),
+            Some(at(16, 9, 3))
+        );
+        assert!(
+            last_transition_at(&c, id, 2, StrategyStatus::Paper)
+                .unwrap()
+                .is_none(),
+            "用户隔离"
+        );
     }
 
     #[test]
