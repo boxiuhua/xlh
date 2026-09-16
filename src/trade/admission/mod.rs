@@ -6,3 +6,4 @@ pub mod scorecard;
 pub mod state;
 pub mod stats;
 pub mod walk_forward;
+pub mod worker;
