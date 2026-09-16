@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS trade_strategy_events (
   reason      TEXT NOT NULL,
   at          TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_trade_strategy_events ON trade_strategy_events(strategy_id, id);
 "#;
 
 /// 表已存在但缺列时补建:`CREATE TABLE IF NOT EXISTS` 对已存在的旧表是空操作,
@@ -667,20 +668,41 @@ pub fn list_strategies(conn: &Connection, user_id: i64) -> Result<Vec<StrategyDe
     raws.into_iter().map(to_strategy).collect()
 }
 
-/// 定义变更:版本哈希不同才写入,并把状态重置为草稿(spec §10.1)。返回是否发生变更。
+/// `update_definition` 的结果(spec §10.1 + F11):区分「无变化」「仅改名」
+/// 「换版本」「策略不存在 / 不属于该用户」,调用方据此决定是否需要重新提交回测。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefinitionUpdate {
+    NotFound,
+    Unchanged,
+    /// 仅名称变化:类型 / 网格 / 股票池未变,版本与状态都保留
+    Renamed,
+    /// 类型 / 网格 / 股票池发生变化:换版本哈希,状态重置为草稿
+    Reversioned,
+}
+
+/// 定义变更(spec §10.1)。版本哈希(类型 + 网格 + 股票池)不变时只是改名,
+/// 不影响已有的回测结论与当前状态;版本哈希改变才重置为草稿,因为旧的回测/
+/// 观察期结论不再适用于新定义。
 pub fn update_definition(
     conn: &Connection,
     user_id: i64,
     id: i64,
     s: &NewStrategy,
     now: NaiveDateTime,
-) -> Result<bool> {
+) -> Result<DefinitionUpdate> {
     let Some(cur) = get_strategy(conn, user_id, id)? else {
-        return Ok(false);
+        return Ok(DefinitionUpdate::NotFound);
     };
     let hash = strategy_version_hash(&s.kind, &s.grid_toml, &s.pool);
     if hash == cur.version_hash {
-        return Ok(false);
+        if s.name == cur.name {
+            return Ok(DefinitionUpdate::Unchanged);
+        }
+        conn.execute(
+            "UPDATE trade_strategies SET name = ?1, updated_at = ?2 WHERE id = ?3 AND user_id = ?4",
+            params![s.name, fmt_ts(now), id, user_id],
+        )?;
+        return Ok(DefinitionUpdate::Renamed);
     }
     conn.execute(
         "UPDATE trade_strategies SET name = ?1, kind = ?2, grid_toml = ?3, pool_json = ?4,
@@ -698,13 +720,19 @@ pub fn update_definition(
             user_id,
         ],
     )?;
-    Ok(true)
+    Ok(DefinitionUpdate::Reversioned)
 }
+
+/// 子表(评估 / 事件)按父行 `trade_strategies` 的 user_id 隔离的公共谓词:
+/// 策略必须存在且属于该用户,否则该 strategy_id 下所有子行都视为不可见。
+const OWNED_BY_USER: &str =
+    "EXISTS (SELECT 1 FROM trade_strategies s WHERE s.id = ?1 AND s.user_id = ?2)";
 
 #[allow(clippy::too_many_arguments)]
 pub fn save_eval(
     conn: &Connection,
     strategy_id: i64,
+    user_id: i64,
     version_hash: &str,
     stage: &str,
     metrics_json: &str,
@@ -712,11 +740,14 @@ pub fn save_eval(
     data_to: NaiveDate,
     now: NaiveDateTime,
 ) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO trade_strategy_evals (strategy_id, version_hash, stage, metrics_json, data_from, data_to, run_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    let n = conn.execute(
+        &format!(
+            "INSERT INTO trade_strategy_evals (strategy_id, version_hash, stage, metrics_json, data_from, data_to, run_at)
+             SELECT ?1, ?3, ?4, ?5, ?6, ?7, ?8 WHERE {OWNED_BY_USER}"
+        ),
         params![
             strategy_id,
+            user_id,
             version_hash,
             stage,
             metrics_json,
@@ -725,19 +756,25 @@ pub fn save_eval(
             fmt_ts(now),
         ],
     )?;
+    if n == 0 {
+        return Err(anyhow!("策略不存在或不属于该用户"));
+    }
     Ok(conn.last_insert_rowid())
 }
 
 pub fn latest_eval(
     conn: &Connection,
     strategy_id: i64,
+    user_id: i64,
     stage: &str,
 ) -> Result<Option<(String, NaiveDateTime)>> {
     let raw: Option<(String, String)> = conn
         .query_row(
-            "SELECT metrics_json, run_at FROM trade_strategy_evals
-             WHERE strategy_id = ?1 AND stage = ?2 ORDER BY id DESC LIMIT 1",
-            params![strategy_id, stage],
+            &format!(
+                "SELECT metrics_json, run_at FROM trade_strategy_evals
+                 WHERE strategy_id = ?1 AND stage = ?3 AND {OWNED_BY_USER} ORDER BY id DESC LIMIT 1"
+            ),
+            params![strategy_id, user_id, stage],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -747,16 +784,29 @@ pub fn latest_eval(
 pub fn log_status_event(
     conn: &Connection,
     strategy_id: i64,
+    user_id: i64,
     from: StrategyStatus,
     to: StrategyStatus,
     reason: &str,
     now: NaiveDateTime,
 ) -> Result<()> {
-    conn.execute(
-        "INSERT INTO trade_strategy_events (strategy_id, from_status, to_status, reason, at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![strategy_id, from.as_str(), to.as_str(), reason, fmt_ts(now)],
+    let n = conn.execute(
+        &format!(
+            "INSERT INTO trade_strategy_events (strategy_id, from_status, to_status, reason, at)
+             SELECT ?1, ?3, ?4, ?5, ?6 WHERE {OWNED_BY_USER}"
+        ),
+        params![
+            strategy_id,
+            user_id,
+            from.as_str(),
+            to.as_str(),
+            reason,
+            fmt_ts(now)
+        ],
     )?;
+    if n == 0 {
+        return Err(anyhow!("策略不存在或不属于该用户"));
+    }
     Ok(())
 }
 
@@ -764,13 +814,14 @@ pub fn log_status_event(
 pub fn list_status_events(
     conn: &Connection,
     strategy_id: i64,
+    user_id: i64,
 ) -> Result<Vec<(StrategyStatus, StrategyStatus, String, NaiveDateTime)>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT from_status, to_status, reason, at FROM trade_strategy_events
-         WHERE strategy_id = ?1 ORDER BY id",
-    )?;
+         WHERE strategy_id = ?1 AND {OWNED_BY_USER} ORDER BY id"
+    ))?;
     let rows = stmt
-        .query_map([strategy_id], |r| {
+        .query_map(params![strategy_id, user_id], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -1092,8 +1143,9 @@ mod tests {
             at(16, 9, 1),
         )
         .unwrap();
-        assert!(
-            !update_definition(&c, 1, id, &new_strategy(), at(16, 9, 2)).unwrap(),
+        assert_eq!(
+            update_definition(&c, 1, id, &new_strategy(), at(16, 9, 2)).unwrap(),
+            DefinitionUpdate::Unchanged,
             "同定义不产生新版本"
         );
         assert_eq!(
@@ -1104,13 +1156,43 @@ mod tests {
         changed.grid_toml =
             "rsi_window = [14, 20]\noversold = [30.0]\noverbought = [70.0]\namount = [10000.0]"
                 .into();
-        assert!(update_definition(&c, 1, id, &changed, at(16, 9, 3)).unwrap());
+        assert_eq!(
+            update_definition(&c, 1, id, &changed, at(16, 9, 3)).unwrap(),
+            DefinitionUpdate::Reversioned
+        );
         let got = get_strategy(&c, 1, id).unwrap().unwrap();
         assert_eq!(got.status, StrategyStatus::Draft);
         assert_ne!(got.version_hash, new_strategy_hash());
-        assert!(
-            !update_definition(&c, 2, id, &changed, at(16, 9, 4)).unwrap(),
+        assert_eq!(
+            update_definition(&c, 2, id, &changed, at(16, 9, 4)).unwrap(),
+            DefinitionUpdate::NotFound,
             "他人不可改"
+        );
+
+        // F11:仅改名不应影响版本或状态(即便策略已在回测中)
+        crate::trade::admission::state::update_status(
+            &c,
+            1,
+            id,
+            StrategyStatus::Draft,
+            StrategyStatus::Backtesting,
+            "重新提交",
+            at(16, 9, 5),
+        )
+        .unwrap();
+        let mut renamed = changed.clone();
+        renamed.name = "RSI 低吸 v2".into();
+        assert_eq!(
+            update_definition(&c, 1, id, &renamed, at(16, 9, 6)).unwrap(),
+            DefinitionUpdate::Renamed
+        );
+        let got = get_strategy(&c, 1, id).unwrap().unwrap();
+        assert_eq!(got.name, "RSI 低吸 v2");
+        assert_eq!(got.status, StrategyStatus::Backtesting, "改名不应重置状态");
+        assert_eq!(
+            got.version_hash,
+            strategy_version_hash(&changed.kind, &changed.grid_toml, &changed.pool),
+            "改名不应换版本"
         );
     }
 
@@ -1127,6 +1209,7 @@ mod tests {
         save_eval(
             &c,
             id,
+            1,
             &v,
             "oos",
             r#"{"sharpe":1.2}"#,
@@ -1138,6 +1221,7 @@ mod tests {
         save_eval(
             &c,
             id,
+            1,
             &v,
             "oos",
             r#"{"sharpe":1.3}"#,
@@ -1146,25 +1230,92 @@ mod tests {
             at(16, 9, 6),
         )
         .unwrap();
-        let (json, run_at) = latest_eval(&c, id, "oos").unwrap().unwrap();
+        let (json, run_at) = latest_eval(&c, id, 1, "oos").unwrap().unwrap();
         assert!(json.contains("1.3"), "取最新一条");
         assert_eq!(run_at, at(16, 9, 6));
-        assert!(latest_eval(&c, id, "paper").unwrap().is_none());
+        assert!(latest_eval(&c, id, 1, "paper").unwrap().is_none());
 
         log_status_event(
             &c,
             id,
+            1,
             StrategyStatus::Draft,
             StrategyStatus::Backtesting,
             "提交",
             at(16, 9, 7),
         )
         .unwrap();
-        let events = list_status_events(&c, id).unwrap();
+        let events = list_status_events(&c, id, 1).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(
             (events[0].0, events[0].1, events[0].2.as_str()),
             (StrategyStatus::Draft, StrategyStatus::Backtesting, "提交")
         );
+    }
+
+    /// F3:评估 / 事件子表按父行 `trade_strategies.user_id` 隔离,不能靠 strategy_id 越权读取。
+    #[test]
+    fn child_rows_are_user_scoped() {
+        let c = db();
+        let id = create_strategy(&c, &new_strategy(), at(16, 9, 0)).unwrap();
+        let v = new_strategy_hash();
+        save_eval(
+            &c,
+            id,
+            1,
+            &v,
+            "oos",
+            r#"{"sharpe":1.2}"#,
+            day(15),
+            day(16),
+            at(16, 9, 5),
+        )
+        .unwrap();
+        log_status_event(
+            &c,
+            id,
+            1,
+            StrategyStatus::Draft,
+            StrategyStatus::Backtesting,
+            "提交",
+            at(16, 9, 6),
+        )
+        .unwrap();
+
+        assert!(
+            latest_eval(&c, id, 2, "oos").unwrap().is_none(),
+            "他人不可读评估"
+        );
+        assert!(
+            list_status_events(&c, id, 2).unwrap().is_empty(),
+            "他人不可读事件"
+        );
+        // 拥有者本人仍可读
+        assert!(latest_eval(&c, id, 1, "oos").unwrap().is_some());
+        assert_eq!(list_status_events(&c, id, 1).unwrap().len(), 1);
+
+        // 写入侧同样按 user_id 拒绝越权
+        assert!(save_eval(
+            &c,
+            id,
+            2,
+            &v,
+            "oos",
+            r#"{"sharpe":0.1}"#,
+            day(15),
+            day(16),
+            at(16, 9, 7),
+        )
+        .is_err());
+        assert!(log_status_event(
+            &c,
+            id,
+            2,
+            StrategyStatus::Draft,
+            StrategyStatus::Backtesting,
+            "越权",
+            at(16, 9, 7),
+        )
+        .is_err());
     }
 }

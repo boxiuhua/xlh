@@ -14,6 +14,8 @@ pub struct AdmissionCfg {
     /// 1 − 样本外夏普 / 样本内夏普 的上限
     pub max_sharpe_decay: f64,
     pub min_positive_ratio: f64,
+    /// 池内可评估股票占比下限(见 F5):`requested` 为 0 时不检查。
+    pub min_evaluated_ratio: f64,
     pub min_years: f64,
     pub paper_days: i64,
     pub paper_trades: usize,
@@ -29,6 +31,7 @@ impl Default for AdmissionCfg {
             min_oos_trades: 30,
             max_sharpe_decay: 0.5,
             min_positive_ratio: 0.55,
+            min_evaluated_ratio: 0.6,
             min_years: 3.0,
             paper_days: 20,
             paper_trades: 10,
@@ -92,6 +95,18 @@ pub fn from_toml_str(text: &str) -> Result<TradeCfg> {
         ));
     }
     let a = &cfg.admission;
+    for (name, v) in [
+        ("min_oos_sharpe", a.min_oos_sharpe),
+        ("max_sharpe_decay", a.max_sharpe_decay),
+        ("min_positive_ratio", a.min_positive_ratio),
+        ("min_evaluated_ratio", a.min_evaluated_ratio),
+        ("min_years", a.min_years),
+        ("max_oos_drawdown", a.max_oos_drawdown),
+    ] {
+        if !v.is_finite() {
+            return Err(anyhow!("[trade.admission] {name} 必须是有限数,当前 {v}"));
+        }
+    }
     if !(a.max_oos_drawdown > 0.0 && a.max_oos_drawdown <= 1.0) {
         return Err(anyhow!(
             "[trade.admission] max_oos_drawdown 须在 (0,1],当前 {}",
@@ -104,10 +119,34 @@ pub fn from_toml_str(text: &str) -> Result<TradeCfg> {
             a.min_positive_ratio
         ));
     }
+    if !(0.0..=1.0).contains(&a.min_evaluated_ratio) {
+        return Err(anyhow!(
+            "[trade.admission] min_evaluated_ratio 须在 [0,1],当前 {}",
+            a.min_evaluated_ratio
+        ));
+    }
+    if !(0.0..=1.0).contains(&a.max_sharpe_decay) {
+        return Err(anyhow!(
+            "[trade.admission] max_sharpe_decay 须在 [0,1],当前 {}",
+            a.max_sharpe_decay
+        ));
+    }
+    if a.min_oos_sharpe < 0.0 {
+        return Err(anyhow!(
+            "[trade.admission] min_oos_sharpe 须 >= 0,当前 {}",
+            a.min_oos_sharpe
+        ));
+    }
     if a.min_years <= 0.0 {
         return Err(anyhow!(
             "[trade.admission] min_years 须 > 0,当前 {}",
             a.min_years
+        ));
+    }
+    if a.min_oos_trades == 0 {
+        return Err(anyhow!(
+            "[trade.admission] min_oos_trades 须 >= 1,当前 {}",
+            a.min_oos_trades
         ));
     }
     if a.paper_days <= 0 {
@@ -116,10 +155,22 @@ pub fn from_toml_str(text: &str) -> Result<TradeCfg> {
             a.paper_days
         ));
     }
+    if a.paper_trades == 0 {
+        return Err(anyhow!(
+            "[trade.admission] paper_trades 须 >= 1,当前 {}",
+            a.paper_trades
+        ));
+    }
     if a.mover_paper_days <= 0 {
         return Err(anyhow!(
             "[trade.admission] mover_paper_days 须 > 0,当前 {}",
             a.mover_paper_days
+        ));
+    }
+    if a.mover_paper_trades == 0 {
+        return Err(anyhow!(
+            "[trade.admission] mover_paper_trades 须 >= 1,当前 {}",
+            a.mover_paper_trades
         ));
     }
     Ok(cfg)
@@ -205,6 +256,51 @@ mod tests {
         assert!(
             from_toml_str("[trade]\n[trade.admission]\nmover_paper_days = 0\n").is_err(),
             "异动类观察期天数须 > 0"
+        );
+        // F12:补齐剩余字段的校验
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmin_oos_sharpe = nan\n").is_err(),
+            "夏普阈值须是有限数"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmin_oos_sharpe = -0.1\n").is_err(),
+            "夏普阈值须 >= 0"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmax_sharpe_decay = -0.1\n").is_err(),
+            "夏普衰减上限须 >= 0"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmax_sharpe_decay = 1.1\n").is_err(),
+            "夏普衰减上限须 <= 1"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmin_evaluated_ratio = -0.1\n").is_err(),
+            "可评估占比须 >= 0"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmin_evaluated_ratio = 1.1\n").is_err(),
+            "可评估占比须 <= 1"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmin_years = inf\n").is_err(),
+            "数据年限须是有限数"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmax_oos_drawdown = nan\n").is_err(),
+            "回撤上限须是有限数"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmin_oos_trades = 0\n").is_err(),
+            "样本外交易笔数下限须 >= 1"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\npaper_trades = 0\n").is_err(),
+            "观察期笔数下限须 >= 1"
+        );
+        assert!(
+            from_toml_str("[trade]\n[trade.admission]\nmover_paper_trades = 0\n").is_err(),
+            "异动类观察期笔数下限须 >= 1"
         );
     }
 }

@@ -10,8 +10,10 @@ use anyhow::Result;
 use chrono::{NaiveDate, NaiveDateTime};
 use rusqlite::{params, Connection};
 
-/// 条件转换:状态必须等于 `expect`,且策略属于该用户。成功则写事件。
-pub fn update_status(
+/// `update_status` 的核心逻辑,接受任意 `&Connection`(含事务句柄的 `Deref`),
+/// 供调用方决定事务边界——`update_status` 自己开关事务,`apply_backtest_verdict`
+/// 则把它并入自己的事务,与落库评估一起提交(见 F8)。
+fn transition_status(
     conn: &Connection,
     user_id: i64,
     id: i64,
@@ -35,8 +37,26 @@ pub fn update_status(
     if n == 0 {
         return Ok(Transition::AlreadyHandled);
     }
-    store::log_status_event(conn, id, expect, to, reason, now)?;
+    store::log_status_event(conn, id, user_id, expect, to, reason, now)?;
     Ok(Transition::Applied)
+}
+
+/// 条件转换:状态必须等于 `expect`,且策略属于该用户。成功则写事件。
+/// UPDATE 与事件写入包在一个事务里提交(F8):要么都生效,要么都不生效,
+/// 不会出现「状态已改但事件未记」的中间态。
+pub fn update_status(
+    conn: &Connection,
+    user_id: i64,
+    id: i64,
+    expect: StrategyStatus,
+    to: StrategyStatus,
+    reason: &str,
+    now: NaiveDateTime,
+) -> Result<Transition> {
+    let tx = conn.unchecked_transaction()?;
+    let transition = transition_status(&tx, user_id, id, expect, to, reason, now)?;
+    tx.commit()?;
+    Ok(transition)
 }
 
 /// 提交评估:草稿 / 未通过 / 已暂停 → 回测中;异动类没有历史分时,直接进观察期。
@@ -73,6 +93,8 @@ pub fn submit_for_backtest(
 
 /// 落库回测结论并推进状态:通过 → 观察期,不通过 → 未通过。
 /// 先转状态,只有真正生效(而非 `AlreadyHandled`)才落库评估,避免为无效转换写入脏数据。
+/// 状态转换与评估落库包在一个事务里提交(F8):要么都生效,要么都不生效,
+/// 不会出现「策略已进入观察期但没有对应评估记录」的中间态。
 #[allow(clippy::too_many_arguments)]
 pub fn apply_backtest_verdict(
     conn: &Connection,
@@ -92,8 +114,9 @@ pub fn apply_backtest_verdict(
     } else {
         (StrategyStatus::Failed, verdict.reasons.join(";"))
     };
-    let transition = update_status(
-        conn,
+    let tx = conn.unchecked_transaction()?;
+    let transition = transition_status(
+        &tx,
         user_id,
         id,
         StrategyStatus::Backtesting,
@@ -103,8 +126,9 @@ pub fn apply_backtest_verdict(
     )?;
     if transition == Transition::Applied {
         store::save_eval(
-            conn,
+            &tx,
             id,
+            user_id,
             &s.version_hash,
             "oos",
             &serde_json::to_string(metrics)?,
@@ -113,6 +137,7 @@ pub fn apply_backtest_verdict(
             now,
         )?;
     }
+    tx.commit()?;
     Ok(transition)
 }
 
@@ -224,7 +249,7 @@ mod tests {
             (got.status, got.status_reason.as_deref()),
             (StrategyStatus::Backtesting, Some("提交评估"))
         );
-        assert_eq!(store::list_status_events(&c, id).unwrap().len(), 1);
+        assert_eq!(store::list_status_events(&c, id, 1).unwrap().len(), 1);
     }
 
     #[test]
@@ -278,7 +303,7 @@ mod tests {
             store::get_strategy(&c, 1, id).unwrap().unwrap().status,
             StrategyStatus::Paper
         );
-        assert!(store::latest_eval(&c, id, "oos").unwrap().is_some());
+        assert!(store::latest_eval(&c, id, 1, "oos").unwrap().is_some());
 
         let id2 = strategy(&c, "rsi");
         submit_for_backtest(&c, 1, id2, at(16, 9, 1)).unwrap();
@@ -326,7 +351,7 @@ mod tests {
             "策略不在回测中,转换不生效"
         );
         assert!(
-            store::latest_eval(&c, id, "oos").unwrap().is_none(),
+            store::latest_eval(&c, id, 1, "oos").unwrap().is_none(),
             "转换未生效不应落库评估"
         );
     }
