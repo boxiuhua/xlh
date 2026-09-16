@@ -310,6 +310,89 @@ pub struct Ticket {
     pub ignore_reason: Option<String>,
 }
 
+/// 策略生命周期(spec §10.2)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StrategyStatus {
+    /// 草稿:定义已保存,未提交评估
+    Draft,
+    /// 回测中:前推回测排队 / 运行中
+    Backtesting,
+    /// 未通过:回测或观察期不达标
+    Failed,
+    /// 观察期:仅模拟盘
+    Paper,
+    /// 已准入:实盘 + 模拟盘
+    Admitted,
+    /// 已暂停:实盘表现异常,退回观察期前需重新提交
+    Suspended,
+}
+
+impl StrategyStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StrategyStatus::Draft => "draft",
+            StrategyStatus::Backtesting => "backtesting",
+            StrategyStatus::Failed => "failed",
+            StrategyStatus::Paper => "paper",
+            StrategyStatus::Admitted => "admitted",
+            StrategyStatus::Suspended => "suspended",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "draft" => StrategyStatus::Draft,
+            "backtesting" => StrategyStatus::Backtesting,
+            "failed" => StrategyStatus::Failed,
+            "paper" => StrategyStatus::Paper,
+            "admitted" => StrategyStatus::Admitted,
+            "suspended" => StrategyStatus::Suspended,
+            _ => return Err(anyhow!("未知策略状态: {s}")),
+        })
+    }
+}
+
+/// 待创建 / 待更新的策略定义。策略 = 类型 + 参数网格 + 股票池。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewStrategy {
+    pub user_id: i64,
+    pub name: String,
+    /// 策略类型,见 `crate::config::build_strategy_from`
+    pub kind: String,
+    /// 参数网格(TOML 表文本),每个训练窗在其中选参
+    pub grid_toml: String,
+    pub pool: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StrategyDef {
+    pub id: i64,
+    pub user_id: i64,
+    pub name: String,
+    pub kind: String,
+    pub grid_toml: String,
+    pub pool: Vec<String>,
+    pub version_hash: String,
+    pub status: StrategyStatus,
+    pub status_reason: Option<String>,
+    pub updated_at: NaiveDateTime,
+}
+
+/// 定义指纹:类型 + 网格 + 排序后的股票池。定义一变即换版本,状态回到草稿。
+pub fn strategy_version_hash(kind: &str, grid_toml: &str, pool: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<&str> = pool.iter().map(|s| s.as_str()).collect();
+    sorted.sort_unstable();
+    let mut h = Sha256::new();
+    h.update(kind.as_bytes());
+    h.update(b"\n");
+    h.update(grid_toml.as_bytes());
+    h.update(b"\n");
+    h.update(sorted.join(",").as_bytes());
+    format!("{:x}", h.finalize())[..16].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +465,45 @@ mod tests {
         assert_eq!(r.cooldown_min, 30);
         assert!((r.max_order_amount - 50_000.0).abs() < 1e-9);
         assert!(r.enabled);
+    }
+
+    #[test]
+    fn strategy_status_round_trip_and_hash_is_order_insensitive() {
+        for s in [
+            StrategyStatus::Draft,
+            StrategyStatus::Backtesting,
+            StrategyStatus::Failed,
+            StrategyStatus::Paper,
+            StrategyStatus::Admitted,
+            StrategyStatus::Suspended,
+        ] {
+            assert_eq!(StrategyStatus::parse(s.as_str()).unwrap(), s);
+        }
+        assert!(StrategyStatus::parse("x").is_err());
+
+        let a = strategy_version_hash(
+            "rsi",
+            "rsi_window = [14]",
+            &["600000".into(), "000001".into()],
+        );
+        let b = strategy_version_hash(
+            "rsi",
+            "rsi_window = [14]",
+            &["000001".into(), "600000".into()],
+        );
+        assert_eq!(a, b, "池内顺序不影响版本");
+        assert_eq!(a.len(), 16);
+        assert_ne!(
+            a,
+            strategy_version_hash("rsi", "rsi_window = [20]", &["600000".into()])
+        );
+        assert_ne!(
+            a,
+            strategy_version_hash(
+                "trend",
+                "rsi_window = [14]",
+                &["600000".into(), "000001".into()]
+            )
+        );
     }
 }

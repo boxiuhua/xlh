@@ -1,7 +1,8 @@
 //! 交易表结构与账户 / 风控 / 持仓读写。所有查询按 user_id 隔离。
 
 use crate::trade::model::{
-    fmt_ts, parse_ts, Account, AccountState, Position, Quote, RiskRules, DATE_FMT,
+    fmt_ts, parse_ts, strategy_version_hash, Account, AccountState, NewStrategy, Position, Quote,
+    RiskRules, StrategyDef, StrategyStatus, DATE_FMT,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{NaiveDate, NaiveDateTime};
@@ -101,6 +102,39 @@ CREATE TABLE IF NOT EXISTS trade_quotes (
 CREATE TABLE IF NOT EXISTS trade_heartbeat (
   name    TEXT PRIMARY KEY,
   beat_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS trade_strategies (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id       INTEGER NOT NULL,
+  name          TEXT NOT NULL,
+  kind          TEXT NOT NULL,
+  grid_toml     TEXT NOT NULL,
+  pool_json     TEXT NOT NULL,
+  version_hash  TEXT NOT NULL,
+  status        TEXT NOT NULL,
+  status_reason TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trade_strategies_user ON trade_strategies(user_id, status);
+CREATE TABLE IF NOT EXISTS trade_strategy_evals (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  strategy_id  INTEGER NOT NULL,
+  version_hash TEXT NOT NULL,
+  stage        TEXT NOT NULL,
+  metrics_json TEXT NOT NULL,
+  data_from    TEXT NOT NULL,
+  data_to      TEXT NOT NULL,
+  run_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trade_strategy_evals ON trade_strategy_evals(strategy_id, stage, id);
+CREATE TABLE IF NOT EXISTS trade_strategy_events (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  strategy_id INTEGER NOT NULL,
+  from_status TEXT NOT NULL,
+  to_status   TEXT NOT NULL,
+  reason      TEXT NOT NULL,
+  at          TEXT NOT NULL
 );
 "#;
 
@@ -519,6 +553,244 @@ pub fn last_beat(conn: &Connection, name: &str) -> Result<Option<NaiveDateTime>>
     s.as_deref().map(parse_ts).transpose()
 }
 
+#[allow(clippy::type_complexity)]
+fn read_strategy(
+    r: &Row,
+) -> rusqlite::Result<(
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+)> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+    ))
+}
+
+const STRATEGY_COLS: &str =
+    "id, user_id, name, kind, grid_toml, pool_json, version_hash, status, status_reason, updated_at";
+
+#[allow(clippy::type_complexity)]
+fn to_strategy(
+    raw: (
+        i64,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+    ),
+) -> Result<StrategyDef> {
+    let (
+        id,
+        user_id,
+        name,
+        kind,
+        grid_toml,
+        pool_json,
+        version_hash,
+        status,
+        status_reason,
+        updated_at,
+    ) = raw;
+    Ok(StrategyDef {
+        id,
+        user_id,
+        name,
+        kind,
+        grid_toml,
+        pool: serde_json::from_str(&pool_json).context("策略股票池格式错误")?,
+        version_hash,
+        status: StrategyStatus::parse(&status)?,
+        status_reason,
+        updated_at: parse_ts(&updated_at)?,
+    })
+}
+
+pub fn create_strategy(conn: &Connection, s: &NewStrategy, now: NaiveDateTime) -> Result<i64> {
+    let hash = strategy_version_hash(&s.kind, &s.grid_toml, &s.pool);
+    conn.execute(
+        "INSERT INTO trade_strategies (user_id, name, kind, grid_toml, pool_json, version_hash,
+           status, status_reason, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8)",
+        params![
+            s.user_id,
+            s.name,
+            s.kind,
+            s.grid_toml,
+            serde_json::to_string(&s.pool)?,
+            hash,
+            StrategyStatus::Draft.as_str(),
+            fmt_ts(now),
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn get_strategy(conn: &Connection, user_id: i64, id: i64) -> Result<Option<StrategyDef>> {
+    conn.query_row(
+        &format!("SELECT {STRATEGY_COLS} FROM trade_strategies WHERE id = ?1 AND user_id = ?2"),
+        params![id, user_id],
+        read_strategy,
+    )
+    .optional()?
+    .map(to_strategy)
+    .transpose()
+}
+
+pub fn list_strategies(conn: &Connection, user_id: i64) -> Result<Vec<StrategyDef>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {STRATEGY_COLS} FROM trade_strategies WHERE user_id = ?1 ORDER BY id"
+    ))?;
+    let raws = stmt
+        .query_map([user_id], read_strategy)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    raws.into_iter().map(to_strategy).collect()
+}
+
+/// 定义变更:版本哈希不同才写入,并把状态重置为草稿(spec §10.1)。返回是否发生变更。
+pub fn update_definition(
+    conn: &Connection,
+    user_id: i64,
+    id: i64,
+    s: &NewStrategy,
+    now: NaiveDateTime,
+) -> Result<bool> {
+    let Some(cur) = get_strategy(conn, user_id, id)? else {
+        return Ok(false);
+    };
+    let hash = strategy_version_hash(&s.kind, &s.grid_toml, &s.pool);
+    if hash == cur.version_hash {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE trade_strategies SET name = ?1, kind = ?2, grid_toml = ?3, pool_json = ?4,
+           version_hash = ?5, status = ?6, status_reason = NULL, updated_at = ?7
+         WHERE id = ?8 AND user_id = ?9",
+        params![
+            s.name,
+            s.kind,
+            s.grid_toml,
+            serde_json::to_string(&s.pool)?,
+            hash,
+            StrategyStatus::Draft.as_str(),
+            fmt_ts(now),
+            id,
+            user_id,
+        ],
+    )?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn save_eval(
+    conn: &Connection,
+    strategy_id: i64,
+    version_hash: &str,
+    stage: &str,
+    metrics_json: &str,
+    data_from: NaiveDate,
+    data_to: NaiveDate,
+    now: NaiveDateTime,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO trade_strategy_evals (strategy_id, version_hash, stage, metrics_json, data_from, data_to, run_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            strategy_id,
+            version_hash,
+            stage,
+            metrics_json,
+            data_from.format(DATE_FMT).to_string(),
+            data_to.format(DATE_FMT).to_string(),
+            fmt_ts(now),
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn latest_eval(
+    conn: &Connection,
+    strategy_id: i64,
+    stage: &str,
+) -> Result<Option<(String, NaiveDateTime)>> {
+    let raw: Option<(String, String)> = conn
+        .query_row(
+            "SELECT metrics_json, run_at FROM trade_strategy_evals
+             WHERE strategy_id = ?1 AND stage = ?2 ORDER BY id DESC LIMIT 1",
+            params![strategy_id, stage],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    raw.map(|(j, at)| Ok((j, parse_ts(&at)?))).transpose()
+}
+
+pub fn log_status_event(
+    conn: &Connection,
+    strategy_id: i64,
+    from: StrategyStatus,
+    to: StrategyStatus,
+    reason: &str,
+    now: NaiveDateTime,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO trade_strategy_events (strategy_id, from_status, to_status, reason, at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![strategy_id, from.as_str(), to.as_str(), reason, fmt_ts(now)],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::type_complexity)]
+pub fn list_status_events(
+    conn: &Connection,
+    strategy_id: i64,
+) -> Result<Vec<(StrategyStatus, StrategyStatus, String, NaiveDateTime)>> {
+    let mut stmt = conn.prepare(
+        "SELECT from_status, to_status, reason, at FROM trade_strategy_events
+         WHERE strategy_id = ?1 ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map([strategy_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(f, t, reason, at)| {
+            Ok((
+                StrategyStatus::parse(&f)?,
+                StrategyStatus::parse(&t)?,
+                reason,
+                parse_ts(&at)?,
+            ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,6 +808,10 @@ mod tests {
             .unwrap()
             .and_hms_opt(h, m, 0)
             .unwrap()
+    }
+
+    fn day(d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 9, d).unwrap()
     }
 
     #[test]
@@ -681,7 +957,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 8);
+        assert_eq!(n, 11);
     }
 
     #[test]
@@ -778,5 +1054,112 @@ mod tests {
         assert_eq!(ins(1), 1);
         assert_eq!(ins(1), 0, "同用户同 key 被忽略");
         assert_eq!(ins(2), 1, "不同用户可用相同 key");
+    }
+
+    fn new_strategy() -> NewStrategy {
+        NewStrategy {
+            user_id: 1,
+            name: "RSI 低吸".into(),
+            kind: "rsi".into(),
+            grid_toml:
+                "rsi_window = [14]\noversold = [30.0]\noverbought = [70.0]\namount = [10000.0]"
+                    .into(),
+            pool: vec!["600000".into(), "000001".into()],
+        }
+    }
+
+    #[test]
+    fn strategy_crud_versioning_and_user_isolation() {
+        let c = db();
+        let id = create_strategy(&c, &new_strategy(), at(16, 9, 0)).unwrap();
+        let got = get_strategy(&c, 1, id).unwrap().unwrap();
+        assert_eq!(
+            (got.status, got.kind.as_str(), got.pool.len()),
+            (StrategyStatus::Draft, "rsi", 2)
+        );
+        assert!(get_strategy(&c, 2, id).unwrap().is_none(), "用户隔离");
+        assert_eq!(list_strategies(&c, 1).unwrap().len(), 1);
+        assert!(list_strategies(&c, 2).unwrap().is_empty());
+
+        // 未改定义 → 版本不变;改网格 → 版本变化且状态回到草稿
+        c.execute(
+            "UPDATE trade_strategies SET status='backtesting' WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+        assert!(
+            !update_definition(&c, 1, id, &new_strategy(), at(16, 9, 2)).unwrap(),
+            "同定义不产生新版本"
+        );
+        assert_eq!(
+            get_strategy(&c, 1, id).unwrap().unwrap().status,
+            StrategyStatus::Backtesting
+        );
+        let mut changed = new_strategy();
+        changed.grid_toml =
+            "rsi_window = [14, 20]\noversold = [30.0]\noverbought = [70.0]\namount = [10000.0]"
+                .into();
+        assert!(update_definition(&c, 1, id, &changed, at(16, 9, 3)).unwrap());
+        let got = get_strategy(&c, 1, id).unwrap().unwrap();
+        assert_eq!(got.status, StrategyStatus::Draft);
+        assert_ne!(got.version_hash, new_strategy_hash());
+        assert!(
+            !update_definition(&c, 2, id, &changed, at(16, 9, 4)).unwrap(),
+            "他人不可改"
+        );
+    }
+
+    fn new_strategy_hash() -> String {
+        let s = new_strategy();
+        strategy_version_hash(&s.kind, &s.grid_toml, &s.pool)
+    }
+
+    #[test]
+    fn evals_and_status_events_are_recorded() {
+        let c = db();
+        let id = create_strategy(&c, &new_strategy(), at(16, 9, 0)).unwrap();
+        let v = new_strategy_hash();
+        save_eval(
+            &c,
+            id,
+            &v,
+            "oos",
+            r#"{"sharpe":1.2}"#,
+            day(15),
+            day(16),
+            at(16, 9, 5),
+        )
+        .unwrap();
+        save_eval(
+            &c,
+            id,
+            &v,
+            "oos",
+            r#"{"sharpe":1.3}"#,
+            day(15),
+            day(16),
+            at(16, 9, 6),
+        )
+        .unwrap();
+        let (json, run_at) = latest_eval(&c, id, "oos").unwrap().unwrap();
+        assert!(json.contains("1.3"), "取最新一条");
+        assert_eq!(run_at, at(16, 9, 6));
+        assert!(latest_eval(&c, id, "paper").unwrap().is_none());
+
+        log_status_event(
+            &c,
+            id,
+            StrategyStatus::Draft,
+            StrategyStatus::Backtesting,
+            "提交",
+            at(16, 9, 7),
+        )
+        .unwrap();
+        let events = list_status_events(&c, id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            (events[0].0, events[0].1, events[0].2.as_str()),
+            (StrategyStatus::Draft, StrategyStatus::Backtesting, "提交")
+        );
     }
 }
