@@ -478,6 +478,14 @@ pub fn users_with_real_positions(conn: &Connection) -> Result<Vec<i64>> {
     )
 }
 
+/// 有策略定义的用户 id,升序。
+pub fn users_with_strategies(conn: &Connection) -> Result<Vec<i64>> {
+    user_ids(
+        conn,
+        "SELECT DISTINCT user_id FROM trade_strategies ORDER BY user_id",
+    )
+}
+
 pub fn users_with_real_account(conn: &Connection) -> Result<Vec<i64>> {
     user_ids(
         conn,
