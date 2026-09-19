@@ -1,9 +1,10 @@
 //! 评估任务的自动入队。只负责写队列,执行在 `thread.rs`:
 //! 入队与执行分离,重启、崩溃与手动触发三条路径才能共用同一套执行逻辑。
 
+use crate::trade::admission::walk_forward::PoolMetrics;
 use crate::trade::model::{EvalKind, StrategyDef, StrategyStatus};
 use crate::trade::store;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use rusqlite::Connection;
 
@@ -21,12 +22,20 @@ pub struct Enqueued {
 fn enqueue_by_status(
     conn: &Connection,
     now: NaiveDateTime,
-    pick: impl Fn(&StrategyDef) -> Option<EvalKind>,
+    pick: impl Fn(&StrategyDef) -> Result<Option<EvalKind>>,
 ) -> Result<Enqueued> {
     let mut out = Enqueued::default();
     for user_id in store::users_with_strategies(conn)? {
         for s in store::list_strategies(conn, user_id)? {
-            let Some(kind) = pick(&s) else { continue };
+            let kind = match pick(&s) {
+                Ok(Some(k)) => k,
+                Ok(None) => continue,
+                Err(e) => {
+                    out.errors
+                        .push(format!("策略 {} 入队判定失败: {e:#}", s.id));
+                    continue;
+                }
+            };
             match store::enqueue_eval(conn, user_id, s.id, kind, now) {
                 Ok(Some(_)) => match kind {
                     EvalKind::PaperCheck => out.paper += 1,
@@ -44,10 +53,12 @@ fn enqueue_by_status(
 
 /// 每日:观察期策略查是否达标,已准入策略查实盘是否失控。
 pub fn enqueue_daily(conn: &Connection, now: NaiveDateTime) -> Result<Enqueued> {
-    enqueue_by_status(conn, now, |s| match s.status {
-        StrategyStatus::Paper => Some(EvalKind::PaperCheck),
-        StrategyStatus::Admitted => Some(EvalKind::Watchdog),
-        _ => None,
+    enqueue_by_status(conn, now, |s| {
+        Ok(match s.status {
+            StrategyStatus::Paper => Some(EvalKind::PaperCheck),
+            StrategyStatus::Admitted => Some(EvalKind::Watchdog),
+            _ => None,
+        })
     })
 }
 
@@ -55,8 +66,34 @@ pub fn enqueue_daily(conn: &Connection, now: NaiveDateTime) -> Result<Enqueued> 
 /// 异动类没有历史分时、不可回测(spec §10.2),跳过——否则每月都会失败一次并留下噪音。
 pub fn enqueue_monthly(conn: &Connection, now: NaiveDateTime) -> Result<Enqueued> {
     enqueue_by_status(conn, now, |s| {
-        (s.kind != "mover" && matches!(s.status, StrategyStatus::Paper | StrategyStatus::Admitted))
-            .then_some(EvalKind::WalkForward)
+        Ok(daily_strategy_running(s).then_some(EvalKind::WalkForward))
+    })
+}
+
+/// 观察期 / 已准入的非异动策略:走前推回测与日线信号的那一类。
+fn daily_strategy_running(s: &StrategyDef) -> bool {
+    s.kind != "mover" && matches!(s.status, StrategyStatus::Paper | StrategyStatus::Admitted)
+}
+
+/// 进程启动时补跑一次:观察期 / 已准入的日线策略,若最近一次样本外评估里没有任何
+/// 股票带实盘参数(计划 3e 之前的评估记录没有这一项),日线信号计算只能逐只记
+/// 「无实盘参数」,要等下一次月度重跑才恢复——最长近一个月没有信号。这里补排一次
+/// 前推回测;已排队 / 运行中的由 `enqueue_eval` 去重。评估记录读不出来(库错误或
+/// JSON 损坏)只记错误、不入队,不猜。
+pub fn enqueue_missing_live_params(conn: &Connection, now: NaiveDateTime) -> Result<Enqueued> {
+    enqueue_by_status(conn, now, |s| {
+        if !daily_strategy_running(s) {
+            return Ok(None);
+        }
+        let has_live = match store::latest_eval(conn, s.id, s.user_id, "oos")? {
+            Some((json, _)) => serde_json::from_str::<PoolMetrics>(&json)
+                .with_context(|| format!("策略 {} 的 oos 评估无法反序列化", s.id))?
+                .codes
+                .iter()
+                .any(|c| c.live_params.is_some()),
+            None => false,
+        };
+        Ok((!has_live).then_some(EvalKind::WalkForward))
     })
 }
 
@@ -246,6 +283,101 @@ mod tests {
 
         let r = enqueue_monthly(&c, at(16, 17, 0)).unwrap();
         assert_eq!(r.walk_forward, 1, "异动策略跳过,只有 trend 入队");
+    }
+
+    /// 观察期 trend 策略,样本外评估里 600000 一只股票,`live` 决定它带不带实盘参数。
+    fn trend_paper_with_live_params(c: &Connection, live: bool) -> i64 {
+        use crate::trade::admission::walk_forward::{aggregate, CodeMetrics};
+        let id = store::create_strategy(
+            c,
+            &NewStrategy {
+                user_id: 1,
+                name: "T".into(),
+                kind: "trend".into(),
+                grid_toml: "x = [1]".into(),
+                pool: vec!["600000".into()],
+            },
+            at(16, 9, 0),
+        )
+        .unwrap();
+        state::submit_for_backtest(c, 1, id, at(16, 9, 1)).unwrap();
+        let code = CodeMetrics {
+            code: "600000".into(),
+            windows: 1,
+            oos_return: 0.1,
+            oos_annualized: 0.1,
+            oos_sharpe: 1.0,
+            oos_max_drawdown: 0.1,
+            oos_trades: 10,
+            is_sharpe: 1.0,
+            years: 1.0,
+            data_years: 4.0,
+            buy_hold_return: 0.0,
+            trade_baseline: Default::default(),
+            window_details: Vec::new(),
+            data_from: None,
+            data_to: None,
+            live_params: live.then(|| toml::Value::Table("x = 1".parse().unwrap())),
+        };
+        state::apply_backtest_verdict(
+            c,
+            1,
+            id,
+            &aggregate(vec![code]),
+            &crate::trade::admission::judge::Verdict {
+                passed: true,
+                reasons: vec![],
+            },
+            NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
+            at(16, 9, 1),
+        )
+        .unwrap();
+        id
+    }
+
+    /// 计划 3e 上线前就在观察期 / 已准入的策略,样本外评估里没有实盘参数:
+    /// 不补跑的话要等下一次月度重跑(最长近一个月)才会有日线信号。
+    #[test]
+    fn startup_enqueues_walk_forward_for_running_strategies_without_live_params() {
+        let c = db();
+        let stale_paper = trend_paper_with_live_params(&c, false);
+        let stale_admitted = trend_strategy_at(&c, 1, StrategyStatus::Admitted); // 空评估
+        trend_paper_with_live_params(&c, true); // 已有实盘参数:不动
+        strategy_at(&c, 1, StrategyStatus::Paper); // 异动策略不可回测
+        trend_strategy_at(&c, 1, StrategyStatus::Draft);
+
+        let r = enqueue_missing_live_params(&c, at(16, 9, 30)).unwrap();
+        assert_eq!(r.walk_forward, 2);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let mut got = queued_kinds(&c);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (stale_paper, EvalKind::WalkForward),
+                (stale_admitted, EvalKind::WalkForward)
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_live_params_backfill_does_not_double_enqueue() {
+        let c = db();
+        trend_paper_with_live_params(&c, false);
+        assert_eq!(
+            enqueue_missing_live_params(&c, at(16, 9, 30))
+                .unwrap()
+                .walk_forward,
+            1
+        );
+        assert_eq!(
+            enqueue_missing_live_params(&c, at(16, 9, 31))
+                .unwrap()
+                .walk_forward,
+            0,
+            "已排队的不重复入队"
+        );
     }
 
     #[test]

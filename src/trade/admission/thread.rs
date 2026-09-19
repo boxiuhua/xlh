@@ -27,18 +27,22 @@ pub struct EvalDeps<'a> {
     pub eval: &'a EvalCfg,
 }
 
-/// 跨轮次保留的状态:当日 / 当月是否已入队,以及本进程是否已回收过僵死任务。
+/// 跨轮次保留的状态:当日 / 当月是否已入队,以及本进程是否已回收过僵死任务、
+/// 是否已为缺实盘参数的策略补排过前推回测。
 #[derive(Debug, Default)]
 pub struct TickState {
     pub last_daily: Option<NaiveDate>,
     pub last_monthly: Option<NaiveDate>,
     pub reclaimed: bool,
+    pub live_params_backfilled: bool,
 }
 
 #[derive(Debug, Default, PartialEq)]
 pub struct TickOutcome {
     pub reclaimed: usize,
     pub enqueued: Enqueued,
+    /// 本轮为缺实盘参数的策略补排的前推回测数(见 `schedule::enqueue_missing_live_params`)
+    pub backfilled: usize,
     /// 本轮执行的任务:(策略 id, 结论)
     pub ran: Option<(i64, String)>,
     pub errors: Vec<String>,
@@ -96,6 +100,21 @@ where
                 }
             }
             Err(err) => out.errors.push(format!("每月入队失败: {err:#}")),
+        }
+    }
+    // 缺实盘参数的日线策略每个进程补排一次前推回测(计划 3e 上线前进入观察期的策略,
+    // 否则要等下次月度重跑才有日线信号)。与月度重跑一样等到每日入队时刻再动手,
+    // 不在盘中跑整池回测;放在月度之后,月度当天由月度那一次覆盖、这里去重为 0。
+    if !state.live_params_backfilled
+        && crate::trade::daemon::due_daily(now, e.daily_hour, e.daily_minute, None)
+    {
+        match schedule::enqueue_missing_live_params(conn, now) {
+            Ok(r) => {
+                out.errors.extend(r.errors.iter().cloned());
+                out.backfilled = r.walk_forward;
+                state.live_params_backfilled = true;
+            }
+            Err(err) => out.errors.push(format!("补排前推回测失败: {err:#}")),
         }
     }
     // 每轮只领一个:评估重 CPU 且占写锁,排队比并发更可预期。
@@ -188,6 +207,7 @@ fn seed_tick_state(conn: &Connection) -> TickState {
         last_daily,
         last_monthly,
         reclaimed: false,
+        live_params_backfilled: false,
     }
 }
 
@@ -285,6 +305,9 @@ fn run_loop(db_path: PathBuf, cfg: TradeCfg) {
             });
             for e in &out.errors {
                 eprintln!("[trade] {e}");
+            }
+            if out.backfilled > 0 {
+                println!("[trade] {} 个策略缺实盘参数,已补排前推回测", out.backfilled);
             }
             if let Some((sid, note)) = &out.ran {
                 println!("[trade] 策略 {sid} 评估:{note}");
@@ -456,6 +479,38 @@ mod tests {
         );
         assert_eq!(r2.enqueued.paper, 0, "重启后同日不应重复入队");
         assert_eq!(r2.enqueued.walk_forward, 0, "重启后同月不应重复入队");
+    }
+
+    /// F5:上线前就在观察期的日线策略没有实盘参数,本进程第一次到每日入队时刻时
+    /// 补排一次前推回测(盘中不动手,理由同 `due_monthly`),之后不再重复。
+    #[test]
+    fn tick_backfills_missing_live_params_once_per_process_after_the_daily_hour() {
+        let mut c = db();
+        let id = trend_paper_strategy(&c); // oos 评估为空:没有实盘参数
+        let (wf, adm, ev) = deps();
+        let d = EvalDeps {
+            wf: &wf,
+            admission: &adm,
+            eval: &ev,
+        };
+        // 当日 / 当月入队都已跑过,只看补跑
+        let mut st = TickState {
+            last_daily: Some(at(16, 0, 0).date()),
+            last_monthly: Some(at(16, 0, 0).date()),
+            reclaimed: true,
+            ..Default::default()
+        };
+        let r = tick(&mut c, &d, &mut st, at(16, 10, 0), |_| Ok(Vec::new()));
+        assert_eq!(r.backfilled, 0, "盘中不补跑");
+        assert!(r.ran.is_none());
+
+        let r = tick(&mut c, &d, &mut st, at(16, 16, 30), |_| Ok(Vec::new()));
+        assert_eq!(r.backfilled, 1);
+        assert_eq!(r.ran.map(|(sid, _)| sid), Some(id), "同一轮领走执行");
+
+        let r = tick(&mut c, &d, &mut st, at(16, 16, 40), |_| Ok(Vec::new()));
+        assert_eq!(r.backfilled, 0, "本进程只补一次");
+        assert!(r.ran.is_none());
     }
 
     #[test]
