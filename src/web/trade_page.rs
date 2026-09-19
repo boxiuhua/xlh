@@ -335,8 +335,33 @@ function hintCard(msg){
   return `<div class="card"><div class="hint">${esc(msg)}</div></div>`;
 }
 
+// 授权中间件的 403 错误码(`{error: "expired" | "license_required"}`)→ 中文提示
+const LICENSE_ERR = {
+  expired: '授权已过期,请在主页续期',
+  license_required: '未激活授权,请在主页输入授权码',
+};
+
+// 接口失败时给用户看的文字:授权 403 映射成中文,否则取服务端 error,再退到「前缀(状态码)」
+function errText(r, prefix){
+  const e = r.data && r.data.error;
+  if (r.status === 403 && LICENSE_ERR[e]) return LICENSE_ERR[e];
+  return e || `${prefix}(${r.status})`;
+}
+
 function loadFailedMsg(r){
-  return (r.data && r.data.error) || `加载失败(${r.status})`;
+  return errText(r, '加载失败');
+}
+
+// 加载失败:host 已经渲染成功过(data-loaded)时保留原内容、只弹提示,
+// 避免 15 秒轮询偶发失败把列表清空;从未渲染成功过才在 host 里显示失败信息。
+function failInto(host, r){
+  if (host.getAttribute('data-loaded') === '1') { toast(loadFailedMsg(r), 'err'); return; }
+  host.innerHTML = hintCard(loadFailedMsg(r));
+}
+
+// 成功渲染后调用,标记 host 已有可保留的内容
+function markLoaded(host){
+  host.setAttribute('data-loaded', '1');
 }
 
 // ----- 待确认 -----
@@ -349,24 +374,37 @@ function confirmState(ticket) {
     : { text: '确认', disabled: false, ack: false };
 }
 
-async function onConfirm(ticket, btn, ack) {
+// 带 ack 时同时带上按钮上显示的偏离(ack_max_deviation):服务端只在现价偏离不超过
+// 用户看到的值(+0.5 个百分点容差)时放行,否则再返回 409 deviation,按新值重新确认(4b 终审 I1)。
+function confirmBody(ack, shownDev){
+  const body = { ack_deviation: ack };
+  if (ack && typeof shownDev === 'number' && isFinite(shownDev) && shownDev >= 0) body.ack_max_deviation = shownDev;
+  return body;
+}
+
+async function onConfirm(ticket, btn, ack, shownDev) {
   btn.disabled = true;
-  const r = await api(`/api/trade/tickets/${ticket.id}/confirm`, 'POST', { ack_deviation: ack });
-  if (r.ok) { toast('已确认,请在券商 App 下单后回来回填成交', 'ok'); return LOADERS.pending(); }
+  const r = await api(`/api/trade/tickets/${ticket.id}/confirm`, 'POST', confirmBody(ack, shownDev));
+  if (r.ok) {
+    toast('已确认,请在券商 App 下单后回来回填成交', 'ok');
+    loadOverview();
+    return LOADERS.pending();
+  }
   const code = r.data && r.data.code;
   if (code === 'deviation') {
-    // 服务端判出偏离而页面未预判:改为二次确认
-    btn.textContent = `价格已偏离 ${fmtPct(r.data.deviation)},仍要确认`;
+    // 服务端判出偏离(页面未预判,或比页面显示的更大):按服务端返回的偏离二次确认
+    const dev = r.data.deviation;
+    btn.textContent = `价格已偏离 ${fmtPct(dev)},仍要确认`;
     btn.classList.add('warn');
     btn.disabled = false;
-    btn.onclick = () => onConfirm(ticket, btn, true);
+    btn.onclick = () => onConfirm(ticket, btn, true, dev);
     return;
   }
   const msg = {
     already_handled: '该工单已处理或已过期',
     stale_quote: '行情延迟,暂不能确认',
     kill_switch: '管理员已暂停交易',
-  }[code] || (r.data && r.data.error) || `确认失败(${r.status})`;
+  }[code] || errText(r, '确认失败');
   toast(msg, 'err');
   LOADERS.pending();
 }
@@ -384,7 +422,7 @@ async function onIgnore(ticket, btn){
     const code = r.data && r.data.code;
     toast(code === 'already_handled'
       ? '该工单已处理或已过期'
-      : ((r.data && r.data.error) || `忽略失败(${r.status})`), 'err');
+      : errText(r, '忽略失败'), 'err');
   }
   LOADERS.pending();
 }
@@ -459,7 +497,8 @@ async function loadPending(){
   const panel = document.getElementById('panel-pending');
   const r = await api('/api/trade/tickets?view=pending');
   if (seq !== pendingSeq) return; // 已有更新的请求，丢弃过时结果
-  if (!r.ok || !Array.isArray(r.data)) { panel.innerHTML = hintCard(loadFailedMsg(r)); return; }
+  if (!r.ok || !Array.isArray(r.data)) { failInto(panel, r); return; }
+  markLoaded(panel);
   const list = r.data;
   if (!list.length) { panel.innerHTML = hintCard('没有待确认的工单'); return; }
   // 15 秒重绘时保留已展开的「AI 说明」
@@ -475,7 +514,7 @@ async function loadPending(){
     if (!t) return;
     const confirmBtn = card.querySelector('.js-confirm');
     const ack = confirmState(t).ack;
-    confirmBtn.onclick = () => onConfirm(t, confirmBtn, ack);
+    confirmBtn.onclick = () => onConfirm(t, confirmBtn, ack, t.deviation);
     const ignoreBtn = card.querySelector('.js-ignore');
     ignoreBtn.onclick = () => onIgnore(t, ignoreBtn);
     const sBtn = card.querySelector('.js-strategy');
@@ -506,11 +545,12 @@ async function onFill(t, row){
     const code = r.data && r.data.code;
     toast(code === 'paper_ticket'
       ? '模拟盘工单由系统撮合，不可人工回填'
-      : ((r.data && r.data.error) || `回填失败(${r.status})`), 'err');
+      : errText(r, '回填失败'), 'err');
     btn.disabled = false;
     if (r.status !== 400) LOADERS.working();
     return;
   }
+  loadOverview();
   LOADERS.working();
 }
 
@@ -522,7 +562,8 @@ async function loadWorking(){
   const r = await api('/api/trade/tickets?view=working');
   if (seq !== workingSeq) return;
   const tip = '<div class="hint" style="margin-bottom:10px">当日未回填的工单将在次日 9:00 自动撤销；请在券商 App 成交后回填实际成交价与数量。</div>';
-  if (!r.ok || !Array.isArray(r.data)) { panel.innerHTML = hintCard(loadFailedMsg(r)); return; }
+  if (!r.ok || !Array.isArray(r.data)) { failInto(panel, r); return; }
+  markLoaded(panel);
   const list = r.data;
   if (!list.length) {
     panel.innerHTML = `<div class="card">${tip}<div class="hint">没有待成交的工单</div></div>`;
@@ -565,7 +606,8 @@ async function loadDone(){
   const panel = document.getElementById('panel-done');
   const r = await api('/api/trade/tickets?view=done');
   if (seq !== doneSeq) return;
-  if (!r.ok || !Array.isArray(r.data)) { panel.innerHTML = hintCard(loadFailedMsg(r)); return; }
+  if (!r.ok || !Array.isArray(r.data)) { failInto(panel, r); return; }
+  markLoaded(panel);
   const list = r.data;
   if (!list.length) { panel.innerHTML = hintCard('没有已完成的工单'); return; }
   const rows = list.map(t => `<tr>
@@ -592,7 +634,8 @@ async function loadRejected(){
   const panel = document.getElementById('panel-rejected');
   const r = await api('/api/trade/signals/rejected?limit=100');
   if (seq !== rejectedSeq) return;
-  if (!r.ok || !Array.isArray(r.data)) { panel.innerHTML = hintCard(loadFailedMsg(r)); return; }
+  if (!r.ok || !Array.isArray(r.data)) { failInto(panel, r); return; }
+  markLoaded(panel);
   const list = r.data;
   if (!list.length) { panel.innerHTML = hintCard('没有被拦截的信号'); return; }
   const rows = list.map(s => `<tr>
@@ -735,7 +778,7 @@ async function onSaveStrategy(ev){
     : await api(`/api/trade/strategies/${encodeURIComponent(id)}`, 'POST', body);
   btn.disabled = false;
   if (!r.ok) {
-    const msg = (r.data && r.data.error) || `保存失败(${r.status})`;
+    const msg = errText(r, '保存失败');
     if (r.status === 400) { errEl.textContent = msg; return; }
     toast(r.status === 404 ? '策略不存在' : msg, 'err');
     if (r.status === 404) { resetStrategyForm(); LOADERS.strategies(); }
@@ -766,7 +809,7 @@ async function onSubmitStrategy(s, btn){
   } else if (r.status === 409) {
     toast('当前状态不能提交', 'err');
   } else {
-    toast((r.data && r.data.error) || `提交失败(${r.status})`, 'err');
+    toast(errText(r, '提交失败'), 'err');
   }
   LOADERS.strategies();
 }
@@ -782,7 +825,7 @@ async function onCancelJob(job, btn){
   } else if (r.status === 404) {
     toast('任务不存在', 'err');
   } else {
-    toast((r.data && r.data.error) || `取消失败(${r.status})`, 'err');
+    toast(errText(r, '取消失败'), 'err');
   }
   LOADERS.strategies();
 }
@@ -903,16 +946,20 @@ async function loadStrategies(){
   loadScorecard(); // 与列表、任务并行拉取
   const [sr, jr] = await Promise.all([api('/api/trade/strategies'), api('/api/trade/jobs')]);
   if (seq !== strategiesSeq) return; // 已有更新的请求，丢弃过时结果
+  const listHost = document.getElementById('strategy-list');
   if (!sr.ok || !Array.isArray(sr.data)) {
-    document.getElementById('strategy-list').innerHTML = hintCard(loadFailedMsg(sr));
+    failInto(listHost, sr);
   } else {
     strategiesById = new Map(sr.data.map(s => [String(s.id), s]));
     renderStrategyList(sr.data);
+    markLoaded(listHost);
   }
+  const jobsHost = document.getElementById('jobs');
   if (!jr.ok || !Array.isArray(jr.data)) {
-    document.getElementById('jobs').innerHTML = hintCard(loadFailedMsg(jr));
+    failInto(jobsHost, jr);
   } else {
     renderJobs(jr.data);
+    markLoaded(jobsHost);
   }
 }
 LOADERS.strategies = loadStrategies;
@@ -929,9 +976,10 @@ strategyForm().querySelector('.js-cancel-edit').addEventListener('click', resetS
 
 // ===== Task 5: 风控设置、账户资金与持仓校准（追加区） =====
 
-// 四舍五入到 1 位小数（用于比例字段 ×100 后的展示，避免浮点噪声如 7.999999）
-function round1(x){
-  return Math.round(x * 10) / 10;
+// 比例(小数)→ 百分数输入框的值,保留 2 位小数(同时去掉 7.999999 这类浮点噪声)。
+// 2 位小数让 0.05% 这类滑点原样回显、原样保存,不被 1 位小数舍成 0.1%(4b 终审 M4)。
+function pct2(x){
+  return Math.round(x * 10000) / 100;
 }
 
 // ----- 风控设置 -----
@@ -951,13 +999,13 @@ function riskPanelHtml(){
       <div class="form-grid">
         <label><input type="checkbox" name="enabled"/> 允许生成工单</label>
         <label>单笔金额上限(元)<input type="number" step="0.01" min="0" name="max_order_amount" required/></label>
-        <label>单票仓位上限(%)<input type="number" step="0.1" min="0" max="100" name="max_position_pct" required/></label>
+        <label>单票仓位上限(%)<input type="number" step="0.01" min="0" max="100" name="max_position_pct" required/></label>
         <label>每日工单上限<input type="number" step="1" min="1" name="max_daily_tickets" required/></label>
-        <label>当日亏损停止买入(%)<input type="number" step="0.1" min="0" max="50" name="daily_loss_halt_pct" required/></label>
+        <label>当日亏损停止买入(%)<input type="number" step="0.01" min="0" max="50" name="daily_loss_halt_pct" required/></label>
         <label>同码冷却(分钟)<input type="number" step="1" min="0" name="cooldown_min" required/></label>
-        <label>偏离提醒阈值(%)<input type="number" step="0.1" min="0" max="10" name="deviation_th" required/></label>
-        <label>默认止损(%)<input type="number" step="0.1" min="0" max="50" name="default_stop_loss_pct" required/></label>
-        <label>默认止盈(%)<input type="number" step="0.1" min="0" max="500" name="default_take_profit_pct" required/></label>
+        <label>偏离提醒阈值(%)<input type="number" step="0.01" min="0" max="10" name="deviation_th" required/></label>
+        <label>默认止损(%)<input type="number" step="0.01" min="0" max="50" name="default_stop_loss_pct" required/></label>
+        <label>默认止盈(%)<input type="number" step="0.01" min="0" max="500" name="default_take_profit_pct" required/></label>
         <label>模拟盘滑点(%)<input type="number" step="0.01" min="0" name="slippage" required/></label>
       </div>
       <div id="risk-form-err" class="form-err"></div>
@@ -982,14 +1030,14 @@ function fillRiskForm(rules){
   const f = riskForm();
   f.elements.enabled.checked = !!rules.enabled;
   f.elements.max_order_amount.value = rules.max_order_amount;
-  f.elements.max_position_pct.value = round1(rules.max_position_pct * 100);
+  f.elements.max_position_pct.value = pct2(rules.max_position_pct * 100);
   f.elements.max_daily_tickets.value = rules.max_daily_tickets;
-  f.elements.daily_loss_halt_pct.value = round1(rules.daily_loss_halt_pct * 100);
+  f.elements.daily_loss_halt_pct.value = pct2(rules.daily_loss_halt_pct * 100);
   f.elements.cooldown_min.value = rules.cooldown_min;
-  f.elements.deviation_th.value = round1(rules.deviation_th * 100);
-  f.elements.default_stop_loss_pct.value = round1(rules.default_stop_loss_pct * 100);
-  f.elements.default_take_profit_pct.value = round1(rules.default_take_profit_pct * 100);
-  f.elements.slippage.value = round1(rules.slippage * 100);
+  f.elements.deviation_th.value = pct2(rules.deviation_th * 100);
+  f.elements.default_stop_loss_pct.value = pct2(rules.default_stop_loss_pct * 100);
+  f.elements.default_take_profit_pct.value = pct2(rules.default_take_profit_pct * 100);
+  f.elements.slippage.value = pct2(rules.slippage * 100);
 }
 
 async function onSaveRisk(ev){
@@ -1015,11 +1063,12 @@ async function onSaveRisk(ev){
   btn.disabled = false;
   if (!r.ok) {
     // 400 时保留表单已填的值，只显示错误（Task 3/4 的约定）
-    errEl.textContent = (r.data && r.data.error) || `保存失败(${r.status})`;
+    errEl.textContent = errText(r, '保存失败');
     return;
   }
   riskRaw = body;
   toast('已保存风控设置', 'ok');
+  loadOverview();
 }
 
 async function onSaveCapital(btn){
@@ -1033,7 +1082,7 @@ async function onSaveCapital(btn){
   const r = await api('/api/trade/capital', 'POST', { account, total });
   btn.disabled = false;
   if (!r.ok) {
-    errEl.textContent = (r.data && r.data.error) || `保存失败(${r.status})`;
+    errEl.textContent = errText(r, '保存失败');
     return;
   }
   toast('已保存账户资金', 'ok');
@@ -1047,8 +1096,9 @@ async function loadRisk(){
   const panel = document.getElementById('panel-risk');
   const [rr, ov] = await Promise.all([api('/api/trade/risk'), api('/api/trade/overview')]);
   if (seq !== riskSeq) return; // 已有更新的请求，丢弃过时结果
-  if (!rr.ok || !rr.data) { panel.innerHTML = hintCard(loadFailedMsg(rr)); return; }
+  if (!rr.ok || !rr.data) { failInto(panel, rr); return; }
   panel.innerHTML = riskPanelHtml();
+  markLoaded(panel);
   riskRaw = rr.data;
   fillRiskForm(rr.data);
   const acc = (ov.ok && ov.data && ov.data.accounts) || {};
@@ -1091,7 +1141,7 @@ function positionRowHtml(p){
   const priceHtml = q
     ? `<span class="${q.stale ? 'stale-q' : ''}">${esc(fmtMoney(q.price))}</span>${q.stale ? ' <span class="tag urgent">延迟</span>' : ''}`
     : '—';
-  const trailingDisplay = p.trailing_pct == null ? '' : round1(p.trailing_pct * 100);
+  const trailingDisplay = p.trailing_pct == null ? '' : pct2(p.trailing_pct * 100);
   return `<tr data-code="${esc(p.code)}">
     <td>${esc(p.code)}</td>
     <td>${esc(p.qty)}</td>
@@ -1103,7 +1153,7 @@ function positionRowHtml(p){
     <td><div class="fill-form">
       <input type="number" step="0.001" min="0" class="js-stop-loss" placeholder="止损" value="${esc(p.stop_loss == null ? '' : p.stop_loss)}"/>
       <input type="number" step="0.001" min="0" class="js-take-profit" placeholder="止盈" value="${esc(p.take_profit == null ? '' : p.take_profit)}"/>
-      <input type="number" step="0.1" min="0" max="50" class="js-trailing" placeholder="移动止盈%" value="${esc(trailingDisplay)}"/>
+      <input type="number" step="0.01" min="0" max="50" class="js-trailing" placeholder="移动止盈%" value="${esc(trailingDisplay)}"/>
       <button type="button" class="btn js-save-exit">保存</button>
     </div></td>
   </tr>`;
@@ -1129,7 +1179,7 @@ async function onSaveExitLevels(account, p, row){
   });
   btn.disabled = false;
   if (!r.ok) {
-    toast((r.data && r.data.error) || `保存失败(${r.status})`, 'err');
+    toast(errText(r, '保存失败'), 'err');
     return;
   }
   toast('已保存止盈止损', 'ok');
@@ -1180,7 +1230,7 @@ async function onCalibrate(ev){
   btn.disabled = false;
   if (!r.ok) {
     // 400 时保留表单已填的值，只显示错误
-    errEl.textContent = (r.data && r.data.error) || `提交失败(${r.status})`;
+    errEl.textContent = errText(r, '提交失败');
     return;
   }
   toast('已校准持仓', 'ok');
@@ -1198,8 +1248,9 @@ async function loadPositions(){
     api('/api/trade/positions/adjusts'),
   ]);
   if (seq !== positionsSeq) return; // 已有更新的请求，丢弃过时结果
-  if (!pr.ok || !pr.data) { panel.innerHTML = hintCard(loadFailedMsg(pr)); return; }
+  if (!pr.ok || !pr.data) { failInto(panel, pr); return; }
   panel.innerHTML = positionsPanelHtml();
+  markLoaded(panel);
   const realList = Array.isArray(pr.data.real) ? pr.data.real : [];
   const paperList = Array.isArray(pr.data.paper) ? pr.data.paper : [];
   const realHost = document.getElementById('positions-real');
@@ -1225,11 +1276,16 @@ showTab(initialTab());
 loadMe();
 loadOverview();
 
-setInterval(() => {
+function refreshVisible(){
   if (document.hidden) return;
   loadOverview();
   if (currentTab === 'pending' && typeof LOADERS.pending === 'function') LOADERS.pending();
-}, 15000);
+}
+
+setInterval(refreshVisible, 15000);
+
+// 页面从后台回到前台立即刷新:切走期间价格可能已大幅变化,不能让用户对着旧的偏离值确认(4b 终审 I1)
+document.addEventListener('visibilitychange', refreshVisible);
 </script>
 </body>
 </html>
@@ -1238,8 +1294,8 @@ setInterval(() => {
 /// `/trade/t/:id` 签名链接落地页（design decision 5）：挂在 `public` 组，无需登录；
 /// 页面本身不校验签名，只从 URL 取工单号与 `sig`，调用已统一处理 404 的签名 API
 /// （`GET /api/trade/t/:id?sig=`、`POST /api/trade/t/:id/confirm?sig=`）。
-/// 本页独立，不复用 `TRADE_HTML` 的脚本；`esc`、`confirmState` 在本页再写一份
-/// （两页互不依赖，允许这两个小函数重复；不得复制其它逻辑）。
+/// 本页独立，不复用 `TRADE_HTML` 的脚本；`esc`、`confirmState` 等几个纯工具函数在本页
+/// 再写一份（两页互不依赖；名单与字节级一致由 `shared_helpers_are_identical_in_both_pages` 守住）。
 pub const SIGNED_TICKET_HTML: &str = r##"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1267,16 +1323,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-s
 .dev-bad{color:#c0392b;font-weight:600}
 .ticket-reason{font-size:.9rem;margin:6px 0;white-space:pre-wrap;word-break:break-word}
 .err{color:#c0392b;font-size:.85rem;margin-top:10px;white-space:pre-wrap}
+.err:empty{display:none}
 a{color:#2563eb}
 </style>
 </head>
 <body>
 <div class="wrap">
   <div id="app"><div class="card"><div class="hint">加载中…</div></div></div>
+  <div id="load-err" class="err"></div>
 </div>
 <script>
-// esc / confirmState / fmtMoney / fmtPct / fmtCountdown / sideLabel / sourceLabel
-// 与 TRADE_HTML 保持一致，由测试 shared_helpers_are_identical_in_both_pages 校验
+// esc / confirmState / fmtMoney / fmtPct / fmtCountdown / sideLabel / sourceLabel /
+// statusLabel / parseLocalTs 与 TRADE_HTML 保持一致，由测试 shared_helpers_are_identical_in_both_pages 校验
 // （本页独立、不 import TRADE_HTML 的脚本，这几个小工具函数按 brief 允许重复实现，
 // 用单测保证两边字节级一致，不会悄悄走样；其余逻辑均为本页独有，不与 TRADE_HTML 共享）。
 
@@ -1308,6 +1366,18 @@ function sourceLabel(src){
   return { exit: '止盈止损', strategy: '策略信号', mover: '实时异动', manual: '手动/AI' }[src] || (src || '—');
 }
 
+function statusLabel(st){
+  return {
+    pending: '待确认',
+    confirmed: '待成交',
+    partial: '部分成交',
+    filled: '已成交',
+    expired: '已过期',
+    rejected: '已拒绝',
+    cancelled: '已取消',
+  }[st] || (st || '—');
+}
+
 // 与 Task 3 待确认卡片相同的规则（设计裁决 4）：无报价或行情延迟禁用；
 // 偏离超阈值时按钮初始就带二次确认文案，一次点击即带 ack。
 function confirmState(ticket) {
@@ -1331,6 +1401,11 @@ const apiBase = `/api/trade/t/${encodeURIComponent(ticketId)}`;
 
 let stopped = false;
 let expiresMs = NaN;
+// 最近一次确认失败的提示:loadTicket 重绘 #app 后重新贴回,不被立即抹掉(4b 终审 I2)。
+// 新的确认尝试,或工单状态与出错时不同(已有终态可看)时清空。
+let lastErr = '';
+let lastErrStatus = null;
+let current = null; // 最近一次渲染的工单
 let countdownTimer = null;
 let refreshTimer = null;
 
@@ -1353,19 +1428,36 @@ function showDone(){
     '<div class="card">已确认。请在券商 App 下单，完成后登录交易页回填成交<br/><a href="/trade">前往交易页</a></div>';
 }
 
+// 只有待确认且未到期的工单可以确认(4b 终审 M1);有效期未知时交给服务端判断
+function canConfirm(t){
+  if (!t || t.status !== 'pending') return false;
+  return !isFinite(expiresMs) || expiresMs > Date.now();
+}
+
 function updateCountdown(){
   const el = document.getElementById('countdown');
   if (!el) return;
   if (!isFinite(expiresMs)) { el.textContent = '有效期未知'; return; }
   const left = expiresMs - Date.now();
   el.textContent = left > 0 ? fmtCountdown(left) : '已过期';
+  const btn = document.getElementById('confirm-btn');
+  if (left <= 0 && btn && !btn.disabled && current && current.status === 'pending') {
+    btn.disabled = true;
+    btn.classList.remove('warn');
+    btn.textContent = '已过期';
+  }
 }
 countdownTimer = setInterval(updateCountdown, 1000);
 
 function render(t){
-  const cs = confirmState(t);
-  const devBad = t.deviation != null && t.deviation > t.deviation_th;
+  current = t;
   expiresMs = parseLocalTs(t.expires_at);
+  const cs = confirmState(t);
+  const ok = canConfirm(t);
+  const btnText = ok ? cs.text : (t.status === 'pending' ? '已过期' : `工单${statusLabel(t.status)}`);
+  const btnWarn = ok && cs.warn;
+  const btnDisabled = !ok || cs.disabled;
+  const devBad = t.deviation != null && t.deviation > t.deviation_th;
   const price = t.quote ? fmtMoney(t.quote.price) : '—';
   const note = t.ai_note
     ? `<div class="ticket-reason"><span class="k hint">AI 说明：</span>${esc(t.ai_note)}</div>`
@@ -1375,6 +1467,7 @@ function render(t){
     <div class="ticket-head">
       <span class="code">${esc(t.code)}</span><span class="${sideCls}">${esc(sideLabel(t.side))}</span>
       <span class="tag">${esc(sourceLabel(t.source))}</span>
+      <span class="tag" id="ticket-status">${esc(statusLabel(t.status))}</span>
       <span class="countdown" id="countdown"></span>
     </div>
     <div class="ticket-grid">
@@ -1388,25 +1481,43 @@ function render(t){
     </div>
     <div class="ticket-reason"><span class="k hint">理由：</span>${esc(t.reason || '—')}</div>
     ${note}
-    <button type="button" id="confirm-btn" class="btn${cs.warn ? ' warn' : ''}"${cs.disabled ? ' disabled' : ''}>${esc(cs.text)}</button>
+    <button type="button" id="confirm-btn" class="btn${btnWarn ? ' warn' : ''}"${btnDisabled ? ' disabled' : ''}>${esc(btnText)}</button>
     <div id="confirm-err" class="err"></div>
   </div>`;
-  document.getElementById('confirm-btn').onclick = () => onConfirm(confirmState(t).ack);
+  document.getElementById('confirm-btn').onclick = () => onConfirm(cs.ack, t.deviation);
+  document.getElementById('confirm-err').textContent = lastErr;
   updateCountdown();
 }
 
+// 轮询 / 刷新失败(非 404):保留当前视图,只显示一行临时错误,下一次轮询继续(4b 终审 M2)
+function showLoadErr(msg){
+  const el = document.getElementById('load-err');
+  if (el) el.textContent = msg;
+}
+
+// 每个 await 之后都重新检查 stopped:等待期间可能已确认成功或判定链接失效,
+// 过时的响应不得把终态页面重新画回工单卡片(4b 终审 M3)。
 async function loadTicket(){
   if (stopped) return;
   let resp;
   try {
     resp = await fetch(`${apiBase}?sig=${encodeURIComponent(sig)}`);
   } catch (e) {
-    return; // 网络错误：保留当前视图，等下一次轮询
+    if (stopped) return;
+    showLoadErr('网络错误，稍后自动重试');
+    return;
   }
+  if (stopped) return;
   if (resp.status === 404) { showInvalid(); return; }
   let data = null;
   try { data = await resp.json(); } catch (e) { data = null; }
-  if (!resp.ok || !data) { showInvalid(); return; }
+  if (stopped) return;
+  if (!resp.ok || !data) {
+    showLoadErr(`加载失败(${resp.status})，稍后自动重试`);
+    return;
+  }
+  showLoadErr('');
+  if (lastErr && data.status !== lastErrStatus) lastErr = '';
   render(data);
 }
 
@@ -1416,36 +1527,53 @@ const CONFIRM_ERR = {
   kill_switch: '管理员已暂停交易',
 };
 
-async function onConfirm(ack){
+// 与 TRADE_HTML 同一约定:带 ack 时附上按钮上显示的偏离(ack_max_deviation),
+// 服务端据此拒绝「用户没看到的更大偏离」(4b 终审 I1)。
+async function onConfirm(ack, shownDev){
   const btn = document.getElementById('confirm-btn');
   const errEl = document.getElementById('confirm-err');
+  lastErr = '';
   errEl.textContent = '';
   btn.disabled = true;
+  const body = { ack_deviation: ack };
+  if (ack && typeof shownDev === 'number' && isFinite(shownDev) && shownDev >= 0) body.ack_max_deviation = shownDev;
   let resp;
   try {
     resp = await fetch(`${apiBase}/confirm?sig=${encodeURIComponent(sig)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ack_deviation: ack }),
+      body: JSON.stringify(body),
     });
   } catch (e) {
+    if (stopped) return;
     btn.disabled = false;
-    errEl.textContent = '网络错误，请重试';
+    lastErr = '网络错误，请重试';
+    lastErrStatus = current ? current.status : null;
+    errEl.textContent = lastErr;
     return;
   }
+  if (stopped) return;
   if (resp.status === 404) { showInvalid(); return; }
   let data = null;
   try { data = await resp.json(); } catch (e) { data = null; }
+  if (stopped) return;
   if (resp.ok) { showDone(); return; }
+  // 等待期间 15 秒轮询可能已重绘 #app:按 id 重新取当前的按钮与错误行
+  const liveBtn = document.getElementById('confirm-btn') || btn;
+  const liveErr = document.getElementById('confirm-err') || errEl;
   const code = data && data.code;
   if (code === 'deviation') {
-    btn.textContent = `价格已偏离 ${fmtPct(data.deviation)},仍要确认`;
+    const dev = data.deviation;
+    const btn = liveBtn;
+    btn.textContent = `价格已偏离 ${fmtPct(dev)},仍要确认`;
     btn.classList.add('warn');
     btn.disabled = false;
-    btn.onclick = () => onConfirm(true);
+    btn.onclick = () => onConfirm(true, dev);
     return;
   }
-  errEl.textContent = CONFIRM_ERR[code] || (data && data.error) || '确认失败';
+  lastErr = CONFIRM_ERR[code] || (data && data.error) || '确认失败';
+  lastErrStatus = current ? current.status : null;
+  liveErr.textContent = lastErr;
   loadTicket();
 }
 
@@ -1454,6 +1582,10 @@ if (!ticketId) {
 } else {
   loadTicket();
   refreshTimer = setInterval(loadTicket, 15000);
+  // 回到前台立即刷新,不让用户对着切走前的旧偏离值确认(4b 终审 I1)
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) loadTicket();
+  });
 }
 </script>
 </body>
@@ -1666,6 +1798,44 @@ mod tests {
         assert!(!body.contains("http://") && !body.contains("https://"));
     }
 
+    /// 4b 终审 I1 / I2 / I4 / M1~M6 的页面行为标记:偏离确认带上显示的偏离值、
+    /// 页面回到前台即刷新、轮询失败不清空已渲染内容、授权 403 中文提示、
+    /// 签名页展示状态 / 保留错误 / 加载失败不判链接失效。
+    #[test]
+    fn pages_carry_final_review_behaviour_markers() {
+        let trade = crate::web::trade_page::TRADE_HTML;
+        let signed = crate::web::trade_page::SIGNED_TICKET_HTML;
+        for body in [trade, signed] {
+            for s in ["ack_max_deviation", "visibilitychange"] {
+                assert!(body.contains(s), "缺 {s}");
+            }
+        }
+        for s in [
+            "function failInto(",
+            "function errText(",
+            "授权已过期,请在主页续期",
+            "license_required",
+            "function pct2(",
+            "step=\"0.01\" min=\"0\" max=\"100\" name=\"max_position_pct\"",
+        ] {
+            assert!(trade.contains(s), "TRADE_HTML 缺 {s}");
+        }
+        assert!(
+            !trade.contains("function round1("),
+            "比例字段不得再按 1 位小数回显"
+        );
+        assert!(!trade.contains("step=\"0.1\""), "比例字段步长须为 0.01");
+        for s in [
+            "id=\"load-err\"",
+            "id=\"ticket-status\"",
+            "let lastErr",
+            "if (stopped) return;",
+            "function canConfirm(",
+        ] {
+            assert!(signed.contains(s), "SIGNED_TICKET_HTML 缺 {s}");
+        }
+    }
+
     /// 从 `src` 里抽出 `function NAME(...) { ... }` 的完整源文本（从 `function NAME(`
     /// 起，用花括号计数找到与函数体开括号匹配的闭括号，含头尾）。JS 里对象字面量、
     /// 模板字符串 `${...}` 内的花括号都天然成对，计数法足够定位到函数结尾。
@@ -1709,12 +1879,14 @@ mod tests {
             "fmtCountdown",
             "sideLabel",
             "sourceLabel",
+            "statusLabel",
+            "parseLocalTs",
         ] {
-            let Some(signed_fn) = extract_fn(signed, name) else {
-                continue; // 该函数没有在签名页出现，不参与比较
-            };
+            // 名单里的函数两页都必须有：缺了就失败，而不是跳过（4b 终审 M9）
+            let signed_fn = extract_fn(signed, name)
+                .unwrap_or_else(|| panic!("SIGNED_TICKET_HTML 里应该有 function {name}("));
             let trade_fn = extract_fn(trade, name)
-                .unwrap_or_else(|| panic!("TRADE_HTML 里也应该有 function {name}("));
+                .unwrap_or_else(|| panic!("TRADE_HTML 里应该有 function {name}("));
             assert_eq!(
                 signed_fn.trim(),
                 trade_fn.trim(),
