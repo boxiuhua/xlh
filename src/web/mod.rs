@@ -1531,6 +1531,23 @@ mod tests {
     }
 
     #[test]
+    fn index_has_manual_ticket_modal_and_entry_points() {
+        let p = crate::web::page::INDEX_HTML;
+        for s in [
+            "id=\"ticket-modal\"",
+            "/api/trade/manual",
+            "request_id",
+            "randomUUID",
+            "生成工单",
+            "按此分析生成工单",
+            "去交易页确认",
+            "/trade#pending",
+        ] {
+            assert!(p.contains(s), "缺 {s}");
+        }
+    }
+
+    #[test]
     fn index_has_adaptive_option() {
         let body = crate::web::page::INDEX_HTML;
         assert!(
