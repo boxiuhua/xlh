@@ -1235,6 +1235,227 @@ setInterval(() => {
 </html>
 "##;
 
+/// `/trade/t/:id` 签名链接落地页（design decision 5）：挂在 `public` 组，无需登录；
+/// 页面本身不校验签名，只从 URL 取工单号与 `sig`，调用已统一处理 404 的签名 API
+/// （`GET /api/trade/t/:id?sig=`、`POST /api/trade/t/:id/confirm?sig=`）。
+/// 本页独立，不复用 `TRADE_HTML` 的脚本；`esc`、`confirmState` 在本页再写一份
+/// （两页互不依赖，允许这两个小函数重复；不得复制其它逻辑）。
+pub const SIGNED_TICKET_HTML: &str = r##"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="referrer" content="no-referrer">
+<title>xlh 工单确认</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#f5f6fa;color:#2c3e50;padding:20px}
+.wrap{max-width:480px;margin:0 auto}
+.card{background:#fff;border:1px solid #e0e4ea;border-radius:10px;padding:18px;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+.hint{color:#7f8c8d;font-size:.9rem}
+.btn{padding:9px 16px;border:1px solid #c0392b;border-radius:6px;background:#c0392b;color:#fff;cursor:pointer;font-size:.95rem;width:100%;margin-top:12px}
+.btn.warn{background:#d35400;border-color:#d35400}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.side-buy{color:#c0392b;font-weight:600}
+.side-sell{color:#16a34a;font-weight:600}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;background:#eef1f4;color:#555;font-size:.8rem;margin-left:6px}
+.ticket-head{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-bottom:8px}
+.ticket-head .code{font-size:1.1rem;font-weight:700;margin-right:6px}
+.countdown{margin-left:auto;font-variant-numeric:tabular-nums;color:#7f8c8d;font-size:.9rem}
+.ticket-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:6px 16px;margin:8px 0;font-size:.9rem}
+.ticket-grid .k{color:#7f8c8d;margin-right:4px}
+.dev-bad{color:#c0392b;font-weight:600}
+.ticket-reason{font-size:.9rem;margin:6px 0;white-space:pre-wrap;word-break:break-word}
+.err{color:#c0392b;font-size:.85rem;margin-top:10px;white-space:pre-wrap}
+a{color:#2563eb}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="app"><div class="card"><div class="hint">加载中…</div></div></div>
+</div>
+<script>
+function esc(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+function fmtMoney(x){
+  if (x === null || x === undefined || typeof x !== 'number' || isNaN(x)) return '—';
+  return x.toFixed(2);
+}
+
+function fmtPct(x){
+  if (x === null || x === undefined || typeof x !== 'number' || isNaN(x)) return '—';
+  return (x * 100).toFixed(1) + '%';
+}
+
+function fmtCountdown(ms){
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const p = n => String(n).padStart(2, '0');
+  return `剩 ${p(Math.floor(s / 60))}:${p(s % 60)}`;
+}
+
+function sideLabel(side){
+  return { buy: '买入', sell: '卖出' }[side] || (side || '—');
+}
+
+function sourceLabel(src){
+  return { exit: '止盈止损', strategy: '策略信号', mover: '实时异动', manual: '手动/AI' }[src] || (src || '—');
+}
+
+// 与 Task 3 待确认卡片相同的规则（设计裁决 4）：无报价或行情延迟禁用；
+// 偏离超阈值时按钮初始就带二次确认文案，一次点击即带 ack。
+function confirmState(ticket) {
+  if (!ticket.quote || ticket.quote.stale) return { text: '行情延迟', disabled: true, ack: false };
+  const deviated = ticket.deviation != null && ticket.deviation > ticket.deviation_th;
+  return deviated
+    ? { text: `价格已偏离 ${fmtPct(ticket.deviation)},仍要确认`, disabled: false, ack: true, warn: true }
+    : { text: '确认', disabled: false, ack: false };
+}
+
+// 服务端时间是本地时区的 "YYYY-MM-DD HH:MM:SS"，按本地时间解析
+function parseLocalTs(ts){
+  if (!ts) return NaN;
+  return new Date(String(ts).replace(' ', 'T')).getTime();
+}
+
+const PATH_MATCH = location.pathname.match(/\/trade\/t\/([^/]+)/);
+const ticketId = PATH_MATCH ? PATH_MATCH[1] : '';
+const sig = new URLSearchParams(location.search).get('sig') || '';
+const apiBase = `/api/trade/t/${encodeURIComponent(ticketId)}`;
+
+let stopped = false;
+let expiresMs = NaN;
+
+function showInvalid(){
+  stopped = true;
+  document.getElementById('app').innerHTML = '<div class="card"><div class="hint">链接无效或已过期</div></div>';
+}
+
+function showDone(){
+  stopped = true;
+  document.getElementById('app').innerHTML =
+    '<div class="card">已确认。请在券商 App 下单，完成后登录交易页回填成交<br/><a href="/trade">前往交易页</a></div>';
+}
+
+function updateCountdown(){
+  const el = document.getElementById('countdown');
+  if (!el) return;
+  if (!isFinite(expiresMs)) { el.textContent = '有效期未知'; return; }
+  const left = expiresMs - Date.now();
+  el.textContent = left > 0 ? fmtCountdown(left) : '已过期';
+}
+setInterval(updateCountdown, 1000);
+
+function render(t){
+  const cs = confirmState(t);
+  const devBad = t.deviation != null && t.deviation > t.deviation_th;
+  expiresMs = parseLocalTs(t.expires_at);
+  const price = t.quote ? fmtMoney(t.quote.price) : '—';
+  const note = t.ai_note
+    ? `<div class="ticket-reason"><span class="k hint">AI 说明：</span>${esc(t.ai_note)}</div>`
+    : '';
+  const sideCls = t.side === 'buy' ? 'side-buy' : (t.side === 'sell' ? 'side-sell' : '');
+  document.getElementById('app').innerHTML = `<div class="card">
+    <div class="ticket-head">
+      <span class="code">${esc(t.code)}</span><span class="${sideCls}">${esc(sideLabel(t.side))}</span>
+      <span class="tag">${esc(sourceLabel(t.source))}</span>
+      <span class="countdown" id="countdown"></span>
+    </div>
+    <div class="ticket-grid">
+      <div><span class="k">建议价</span>${esc(fmtMoney(t.suggest_price))}</div>
+      <div><span class="k">现价</span>${esc(price)}</div>
+      <div><span class="k">偏离</span><span class="${devBad ? 'dev-bad' : ''}">${esc(fmtPct(t.deviation))}</span>
+        <span class="hint">(阈值 ${esc(fmtPct(t.deviation_th))})</span></div>
+      <div><span class="k">数量</span>${esc(t.qty)} 股</div>
+      <div><span class="k">预估金额</span>${esc(fmtMoney(t.est_amount))}</div>
+      <div><span class="k">预估费用</span>${esc(fmtMoney(t.est_fee))}</div>
+    </div>
+    <div class="ticket-reason"><span class="k hint">理由：</span>${esc(t.reason || '—')}</div>
+    ${note}
+    <button type="button" id="confirm-btn" class="btn${cs.warn ? ' warn' : ''}"${cs.disabled ? ' disabled' : ''}>${esc(cs.text)}</button>
+    <div id="confirm-err" class="err"></div>
+  </div>`;
+  document.getElementById('confirm-btn').onclick = () => onConfirm(confirmState(t).ack);
+  updateCountdown();
+}
+
+async function loadTicket(){
+  if (stopped) return;
+  let resp;
+  try {
+    resp = await fetch(`${apiBase}?sig=${encodeURIComponent(sig)}`);
+  } catch (e) {
+    return; // 网络错误：保留当前视图，等下一次轮询
+  }
+  if (resp.status === 404) { showInvalid(); return; }
+  let data = null;
+  try { data = await resp.json(); } catch (e) { data = null; }
+  if (!resp.ok || !data) { showInvalid(); return; }
+  render(data);
+}
+
+const CONFIRM_ERR = {
+  already_handled: '该工单已处理或已过期',
+  stale_quote: '行情延迟，暂不能确认',
+  kill_switch: '管理员已暂停交易',
+};
+
+async function onConfirm(ack){
+  const btn = document.getElementById('confirm-btn');
+  const errEl = document.getElementById('confirm-err');
+  errEl.textContent = '';
+  btn.disabled = true;
+  let resp;
+  try {
+    resp = await fetch(`${apiBase}/confirm?sig=${encodeURIComponent(sig)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ack_deviation: ack }),
+    });
+  } catch (e) {
+    btn.disabled = false;
+    errEl.textContent = '网络错误，请重试';
+    return;
+  }
+  if (resp.status === 404) { showInvalid(); return; }
+  let data = null;
+  try { data = await resp.json(); } catch (e) { data = null; }
+  if (resp.ok) { showDone(); return; }
+  const code = data && data.code;
+  if (code === 'deviation') {
+    btn.textContent = `价格已偏离 ${fmtPct(data.deviation)},仍要确认`;
+    btn.classList.add('warn');
+    btn.disabled = false;
+    btn.onclick = () => onConfirm(true);
+    return;
+  }
+  errEl.textContent = CONFIRM_ERR[code] || (data && data.error) || '确认失败';
+  loadTicket();
+}
+
+if (!ticketId) {
+  showInvalid();
+} else {
+  loadTicket();
+  setInterval(loadTicket, 15000);
+}
+</script>
+</body>
+</html>
+"##;
+
+/// 生产签名链接落地页：不查会话、不做任何鉴权（由 JS 调 API，API 已统一 404）。
+/// 响应头 `Referrer-Policy: no-referrer`、`Cache-Control: no-store`，
+/// 防止签名通过 Referer 外泄（4a 终审 M8）。
+pub async fn signed_ticket_page() -> Response {
+    let mut resp = Html(SIGNED_TICKET_HTML).into_response();
+    let headers = resp.headers_mut();
+    headers.insert("referrer-policy", "no-referrer".parse().unwrap());
+    headers.insert("cache-control", "no-store".parse().unwrap());
+    resp
+}
+
 /// 生产 `/trade` 入口：已登录返回交易页 HTML，未登录跳转 /login。
 /// 会话判断与 `index`（`src/web/mod.rs`）保持一致：读 cookie → 查会话。
 pub async fn trade_page(State(st): State<AuthState>, headers: HeaderMap) -> Response {
@@ -1414,5 +1635,19 @@ mod tests {
         ] {
             assert!(body.contains(s), "缺 {s}");
         }
+    }
+
+    #[tokio::test]
+    async fn signed_page_is_public_and_never_sends_referrer() {
+        let st = state();
+        let (s, body, h) = get(&st, "/trade/t/1?sig=abc", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(h.get("referrer-policy").unwrap(), "no-referrer");
+        assert_eq!(h.get("cache-control").unwrap(), "no-store");
+        assert!(body.contains("name=\"referrer\" content=\"no-referrer\""));
+        assert!(body.contains("/api/trade/t/"));
+        assert!(body.contains("链接无效或已过期"));
+        assert!(body.contains("function confirmState("));
+        assert!(!body.contains("http://") && !body.contains("https://"));
     }
 }
