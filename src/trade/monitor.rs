@@ -128,10 +128,11 @@ fn process_position(
             ..
         } => report.new_real_tickets.push(id),
         SubmitOutcome::Duplicate if p.account == Account::Real => {
-            // 过期重发同样受风控总开关与跌停约束:关闭交易时不该再挂新单;
+            // 过期重发同样受风控总开关、管理员总开关与跌停约束:关闭交易时不该再挂新单;
             // 跌停价挂卖单大概率无法成交,只会消耗当日工单额度并误导用户「已在处理」。
+            // (submit_signal 先查重再查总开关,Duplicate 分支必须自己再查一次。)
             let rules = store::get_risk_rules(conn, p.user_id)?;
-            if !rules.enabled {
+            if !rules.enabled || crate::trade::settings::kill_switch(conn)? {
                 return Ok(());
             }
             let eps = 0.5 * 10f64.powi(-crate::stock::ashare::price_decimals(&p.code));
@@ -266,6 +267,23 @@ mod tests {
         assert!(
             r2.new_real_tickets.is_empty(),
             "总开关关闭时不应重发,{:?}",
+            r2.new_real_tickets
+        );
+    }
+
+    #[test]
+    fn reissue_skipped_when_kill_switch_on() {
+        let mut c = db_with_position(|p| p.stop_loss = Some(9.2));
+        let r1 = run_tick(&mut c, &quote(9.1, at(16, 10, 0)), at(16, 10, 0)).unwrap();
+        assert_eq!(r1.new_real_tickets.len(), 1, "首次止损应出单");
+
+        crate::trade::settings::set_kill_switch(&c, true, at(16, 10, 5)).unwrap();
+
+        let r2 = run_tick(&mut c, &quote(9.0, at(16, 10, 31)), at(16, 10, 31)).unwrap();
+        assert_eq!(r2.expired, 1, "旧工单应正常到期");
+        assert!(
+            r2.new_real_tickets.is_empty(),
+            "管理员总开关打开时不应重发,{:?}",
             r2.new_real_tickets
         );
     }
