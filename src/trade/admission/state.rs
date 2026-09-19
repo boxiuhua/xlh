@@ -183,6 +183,11 @@ pub fn apply_monthly_verdict(
     let Some(s) = store::get_strategy(conn, user_id, id)? else {
         return Ok(Transition::AlreadyHandled);
     };
+    // 月度重跑只对在用的策略有意义。草稿 / 未通过 / 已暂停的重跑若也写 oos,
+    // 就会改写其余各关读取的基线(计划 3c 遗留项)。
+    if !matches!(s.status, StrategyStatus::Paper | StrategyStatus::Admitted) {
+        return Ok(Transition::AlreadyHandled);
+    }
     let tx = conn.unchecked_transaction()?;
     store::save_eval(
         &tx,
@@ -628,6 +633,32 @@ mod tests {
             StrategyStatus::Admitted
         );
         assert!(store::latest_eval(&c, id, 1, "oos").unwrap().is_some());
+    }
+
+    #[test]
+    fn monthly_verdict_on_a_non_running_strategy_writes_nothing() {
+        let c = db();
+        let id = strategy(&c, "rsi"); // Draft
+        let verdict = crate::trade::admission::judge::Verdict {
+            passed: true,
+            reasons: vec![],
+        };
+        let t = apply_monthly_verdict(
+            &c,
+            1,
+            id,
+            &empty_metrics(),
+            &verdict,
+            at(16, 9, 0).date(),
+            at(16, 9, 0).date(),
+            at(16, 9, 0),
+        )
+        .unwrap();
+        assert_eq!(t, Transition::AlreadyHandled);
+        assert!(
+            store::latest_eval(&c, id, 1, "oos").unwrap().is_none(),
+            "草稿不应写 oos 基线"
+        );
     }
 
     #[test]

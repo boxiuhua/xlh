@@ -163,6 +163,9 @@ pub struct CodeResult {
     /// 整段 K 线的起止(不是检验窗跨度),用于数据年限准入判定(见 F1)。
     pub data_from: NaiveDate,
     pub data_to: NaiveDate,
+    /// 实盘参数:以最后一根 K 线为终点往前 train_days 天上选出的参数;
+    /// 该训练窗数据不足(< `MIN_TRAIN_BARS`)时为 `None`(见计划 3e 设计裁决 1)。
+    pub live_params: Option<toml::Value>,
 }
 
 /// 单只股票的样本外汇总。
@@ -191,6 +194,15 @@ pub struct CodeMetrics {
     pub trade_baseline: TradeBaseline,
     /// 逐窗选中的参数与指标(F4),供成绩单展示。
     pub window_details: Vec<WindowSummary>,
+    /// K 线跨度起点(`#[serde(default)]`:兼容本分支之前落库、没有这个字段的旧记录)。
+    #[serde(default)]
+    pub data_from: Option<NaiveDate>,
+    /// K 线跨度终点,同上。
+    #[serde(default)]
+    pub data_to: Option<NaiveDate>,
+    /// 实盘参数(见 `CodeResult::live_params`),同上兼容旧记录。
+    #[serde(default)]
+    pub live_params: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -223,6 +235,23 @@ pub struct PoolMetrics {
     pub requested: usize,
     /// 未能评估的代码及原因(加载失败 / 回测失败 / 数据不足)。
     pub skipped: Vec<(String, String)>,
+    /// 池内 K 线跨度:各代码 `data_from` 的最小值(`#[serde(default)]` 兼容旧记录)。
+    #[serde(default)]
+    pub data_from: Option<NaiveDate>,
+    /// 池内 K 线跨度:各代码 `data_to` 的最大值,同上。
+    #[serde(default)]
+    pub data_to: Option<NaiveDate>,
+}
+
+impl PoolMetrics {
+    /// 某只股票的实盘参数;未评估或最近训练窗数据不足时为 None。
+    pub fn live_params_for(&self, code: &str) -> Option<&toml::Value> {
+        self.codes
+            .iter()
+            .find(|c| c.code == code)?
+            .live_params
+            .as_ref()
+    }
 }
 
 /// 池内进度回调。`on_code(code, 已完成, 总数)` 返回 false 表示取消,剩余代码记为「已取消」。
@@ -285,6 +314,25 @@ fn median_usize(mut xs: Vec<usize>) -> usize {
     }
 }
 
+/// 在训练数据上按 `cfg.metric` 选参;返回 (参数, 训练窗夏普)。
+fn select_params(
+    kind: &str,
+    code: &str,
+    train: &[StockBar],
+    combos: &[toml::Value],
+    cfg: &WalkForwardCfg,
+) -> Result<Option<(toml::Value, f64)>> {
+    let mut best: Option<(toml::Value, f64, f64)> = None;
+    for params in combos {
+        let run = run_once(kind, code, StockData::new(train.to_vec()), params, cfg)?;
+        let score = metric_of(&run.summary, &cfg.metric);
+        if best.as_ref().is_none_or(|(_, s, _)| score > *s) {
+            best = Some((params.clone(), score, run.summary.sharpe));
+        }
+    }
+    Ok(best.map(|(p, _, is_sharpe)| (p, is_sharpe)))
+}
+
 fn run_once(
     kind: &str,
     code: &str,
@@ -334,15 +382,7 @@ pub fn run_code(
         }
         let prev = bars.iter().copied().rfind(|b| b.date < w.train_to);
 
-        let mut best: Option<(toml::Value, f64, f64)> = None;
-        for params in &combos {
-            let run = run_once(kind, code, StockData::new(train.clone()), params, cfg)?;
-            let score = metric_of(&run.summary, &cfg.metric);
-            if best.as_ref().is_none_or(|(_, s, _)| score > *s) {
-                best = Some((params.clone(), score, run.summary.sharpe));
-            }
-        }
-        let Some((params, _, is_sharpe)) = best else {
+        let Some((params, is_sharpe)) = select_params(kind, code, &train, &combos, cfg)? else {
             continue;
         };
         let oos = run_once(
@@ -372,12 +412,26 @@ pub fn run_code(
     let buy_hold_return = out.iter().fold(1.0, |acc, w| {
         acc * (1.0 + buy_and_hold_return(bars, w.window.train_to, w.window.test_to))
     }) - 1.0;
+    // 实盘参数:「最新的训练窗」= 以最后一根 K 线为终点往前 train_days 天。
+    // 与各检验窗前的选参完全同口径,只是终点推到了今天(见计划 3e 设计裁决 1)。
+    let live_from = last.date - Duration::days(cfg.train_days);
+    let live_train: Vec<StockBar> = bars
+        .iter()
+        .copied()
+        .filter(|b| b.date > live_from)
+        .collect();
+    let live_params = if live_train.len() >= MIN_TRAIN_BARS {
+        select_params(kind, code, &live_train, &combos, cfg)?.map(|(p, _)| p)
+    } else {
+        None
+    };
     Ok(CodeResult {
         code: code.to_string(),
         windows: out,
         buy_hold_return,
         data_from: first.date,
         data_to: last.date,
+        live_params,
     })
 }
 
@@ -443,6 +497,9 @@ impl CodeResult {
                     oos_trades: w.oos.trade_count,
                 })
                 .collect(),
+            data_from: Some(self.data_from),
+            data_to: Some(self.data_to),
+            live_params: self.live_params.clone(),
         }
     }
 }
@@ -496,6 +553,8 @@ pub fn aggregate(codes: Vec<CodeMetrics>) -> PoolMetrics {
             count: total,
         }
     };
+    let data_from = codes.iter().filter_map(|c| c.data_from).min();
+    let data_to = codes.iter().filter_map(|c| c.data_to).max();
     PoolMetrics {
         oos_return: median(codes.iter().map(|c| c.oos_return).collect()),
         oos_sharpe: median(codes.iter().map(|c| c.oos_sharpe).collect()),
@@ -510,6 +569,8 @@ pub fn aggregate(codes: Vec<CodeMetrics>) -> PoolMetrics {
         trade_baseline,
         requested: codes.len(),
         skipped: Vec::new(),
+        data_from,
+        data_to,
         codes,
     }
 }
@@ -716,6 +777,7 @@ mod tests {
             buy_hold_return: 0.05,
             data_from: d(2024, 1, 1),
             data_to: d(2025, 4, 1),
+            live_params: None,
         };
         let m = out.metrics();
         assert!((m.oos_return - 0.32).abs() < 1e-9, "复利: {}", m.oos_return);
@@ -813,6 +875,9 @@ mod tests {
             buy_hold_return: 0.05,
             trade_baseline: TradeBaseline::default(),
             window_details: Vec::new(),
+            data_from: None,
+            data_to: None,
+            live_params: None,
         };
         let p = aggregate(vec![
             mk("a", 0.10, 1.0, 0.10, 20),
@@ -976,6 +1041,7 @@ mod tests {
             buy_hold_return: 0.05,
             data_from: d(2024, 1, 1),
             data_to: d(2025, 4, 1),
+            live_params: None,
         };
         let m = out.metrics();
         assert_eq!(m.window_details.len(), 2);
@@ -1049,6 +1115,9 @@ mod tests {
             buy_hold_return: 0.0,
             trade_baseline: TradeBaseline::default(),
             window_details: Vec::new(),
+            data_from: None,
+            data_to: None,
+            live_params: None,
         }
     }
 
@@ -1276,12 +1345,57 @@ mod tests {
                 count: 5,
             },
             window_details: vec![window],
+            data_from: None,
+            data_to: None,
+            live_params: None,
         };
         let pool = aggregate(vec![code]);
 
         let json = serde_json::to_string(&pool).unwrap();
         let back: PoolMetrics = serde_json::from_str(&json).unwrap();
         assert_eq!(pool, back);
+    }
+
+    #[test]
+    fn run_code_selects_live_params_on_the_trailing_train_window() {
+        // 4 年锯齿行情:足够产出若干检验窗,且最后 train_days 天内也有足够 K 线
+        let prices: Vec<f64> = (0..1040)
+            .map(|i| 10.0 + ((i % 40) as f64 - 20.0).abs() * 0.1)
+            .collect();
+        let b = bars(d(2021, 1, 4), &prices);
+        let grid: toml::Table = "short_window = [5, 10]\nlong_window = [20]\namount = [100000.0]"
+            .parse()
+            .unwrap();
+        let cfg = WalkForwardCfg::default();
+        let r = run_code("trend", "600000", &b, &grid, &cfg).unwrap();
+        let live = r.live_params.clone().expect("最近训练窗应选出参数");
+        assert!(live.get("short_window").is_some());
+        let m = r.metrics();
+        assert_eq!(m.live_params, Some(live));
+        assert_eq!(m.data_from, Some(b.first().unwrap().date));
+        assert_eq!(m.data_to, Some(b.last().unwrap().date));
+        let pool = aggregate(vec![m]);
+        assert_eq!(pool.data_from, Some(b.first().unwrap().date));
+        assert_eq!(pool.data_to, Some(b.last().unwrap().date));
+        assert!(pool.live_params_for("600000").is_some());
+        assert!(pool.live_params_for("000001").is_none());
+    }
+
+    #[test]
+    fn old_metrics_json_without_new_fields_still_deserializes() {
+        let m = aggregate(vec![sample_code_metrics("600000", 0.1)]);
+        let mut v = serde_json::to_value(&m).unwrap();
+        v.as_object_mut().unwrap().remove("data_from");
+        v.as_object_mut().unwrap().remove("data_to");
+        for c in v["codes"].as_array_mut().unwrap() {
+            let o = c.as_object_mut().unwrap();
+            o.remove("live_params");
+            o.remove("data_from");
+            o.remove("data_to");
+        }
+        let back: PoolMetrics = serde_json::from_value(v).unwrap();
+        assert_eq!(back.codes[0].live_params, None);
+        assert_eq!(back.data_from, None);
     }
 
     /// F6:本分支之前落库的 `metrics_json` 没有 `trade_baseline` 字段,
