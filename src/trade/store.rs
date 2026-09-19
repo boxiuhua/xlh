@@ -1,8 +1,10 @@
 //! 交易表结构与账户 / 风控 / 持仓读写。所有查询按 user_id 隔离。
 
+use crate::event::Direction;
 use crate::trade::model::{
-    fmt_ts, parse_ts, strategy_version_hash, Account, AccountState, EvalJob, EvalKind, JobStatus,
-    NewStrategy, Position, Quote, RiskRules, StrategyDef, StrategyStatus, DATE_FMT,
+    fmt_ts, parse_side, parse_ts, strategy_version_hash, Account, AccountState, EvalJob, EvalKind,
+    JobStatus, NewStrategy, Position, Quote, RiskRules, SignalSource, StrategyDef, StrategyStatus,
+    DATE_FMT,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{NaiveDate, NaiveDateTime};
@@ -719,6 +721,70 @@ pub fn last_beat(conn: &Connection, name: &str) -> Result<Option<NaiveDateTime>>
         )
         .optional()?;
     s.as_deref().map(parse_ts).transpose()
+}
+
+/// 信号来源(工单列表展示用);信号不存在返回 None。
+pub fn signal_source(conn: &Connection, signal_id: i64) -> Result<Option<SignalSource>> {
+    let s: Option<String> = conn
+        .query_row(
+            "SELECT source FROM trade_signals WHERE id = ?1",
+            [signal_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    s.as_deref().map(SignalSource::parse).transpose()
+}
+
+/// 被闸门拦下的信号(计划 4a:让用户看到「为什么没出工单」)。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RejectedSignal {
+    pub id: i64,
+    pub source: SignalSource,
+    pub code: String,
+    pub side: Direction,
+    pub reason: String,
+    pub reject_reason: Option<String>,
+    pub created_at: NaiveDateTime,
+}
+
+/// 该用户最近被拒的信号,按 id 倒序,最多 `limit` 条。
+pub fn list_rejected_signals(
+    conn: &Connection,
+    user_id: i64,
+    limit: usize,
+) -> Result<Vec<RejectedSignal>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, source, code, side, reason, reject_reason, created_at FROM trade_signals
+         WHERE user_id = ?1 AND status = 'rejected' ORDER BY id DESC LIMIT ?2",
+    )?;
+    let raws = stmt
+        .query_map(params![user_id, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    raws.into_iter()
+        .map(
+            |(id, source, code, side, reason, reject_reason, created_at)| {
+                Ok(RejectedSignal {
+                    id,
+                    source: SignalSource::parse(&source)?,
+                    code,
+                    side: parse_side(&side)?,
+                    reason,
+                    reject_reason,
+                    created_at: parse_ts(&created_at)?,
+                })
+            },
+        )
+        .collect()
 }
 
 #[allow(clippy::type_complexity)]

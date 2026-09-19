@@ -14,6 +14,16 @@ use rusqlite::{params, Connection};
 /// 行情缓存超过此秒数视为陈旧(design decision 2)。
 pub const QUOTE_MAX_AGE_SECS: i64 = 60;
 
+/// 现价相对建议价的偏离(绝对值,比例)。确认保护与工单列表展示共用同一口径。
+pub fn deviation(price: f64, suggest_price: f64) -> f64 {
+    (price / suggest_price - 1.0).abs()
+}
+
+/// 行情是否陈旧:时间戳距 `now` 超过 `QUOTE_MAX_AGE_SECS`(与 `store::fresh_quote` 同一口径)。
+pub fn quote_is_stale(quote_ts: NaiveDateTime, now: NaiveDateTime) -> bool {
+    (now - quote_ts).num_seconds() > QUOTE_MAX_AGE_SECS
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfirmError {
     /// 工单不存在,或不属于该用户(跨用户视为不存在)。
@@ -52,7 +62,7 @@ pub fn confirm_ticket(
     let Some(q) = store::fresh_quote(conn, &t.code, now, QUOTE_MAX_AGE_SECS)? else {
         return Ok(Err(ConfirmError::StaleQuote));
     };
-    let dev = (q.price / t.suggest_price - 1.0).abs();
+    let dev = deviation(q.price, t.suggest_price);
     if dev > t.deviation_th + 1e-12 && !ack_deviation {
         return Ok(Err(ConfirmError::Deviation {
             price: q.price,

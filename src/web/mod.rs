@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod page;
 pub mod stock;
+pub mod trade;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
@@ -407,6 +408,7 @@ pub fn router(state: AuthState) -> Router {
     let licensed = core_routes::<AuthState>()
         .merge(holdings_history_routes())
         .merge(push_user_routes())
+        .merge(trade::routes())
         .route_layer(from_fn_with_state(state.clone(), auth::require_license))
         .route_layer(from_fn_with_state(state.clone(), auth::require_login));
 
