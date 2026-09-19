@@ -225,13 +225,22 @@ pub fn emit_due(
     }
     let mut live = Vec::new();
     for p in plans::due_plans(conn, today)? {
-        let why = match store::get_strategy(conn, p.user_id, p.strategy_id)? {
-            None => Some("策略已删除"),
-            Some(s) if s.version_hash != p.version_hash => Some("策略定义已变更"),
-            Some(s) if !matches!(s.status, StrategyStatus::Paper | StrategyStatus::Admitted) => {
-                Some("策略已不在观察期 / 已准入状态")
+        // 计划只属于基准日之后的第一个交易日(spec §5:T-1 决策、T 开盘成交)。
+        // 那天程序没在跑就错过了,之后补发等于拿旧决策追新行情,spec §12 不补发。
+        // 被证实休市的日子 `next_trading_day` 会跳过,节假日顺延不受影响。
+        let why = if calendar::next_trading_day(conn, p.basis_date)? < today {
+            Some("错过发出日")
+        } else {
+            match store::get_strategy(conn, p.user_id, p.strategy_id)? {
+                None => Some("策略已删除"),
+                Some(s) if s.version_hash != p.version_hash => Some("策略定义已变更"),
+                Some(s)
+                    if !matches!(s.status, StrategyStatus::Paper | StrategyStatus::Admitted) =>
+                {
+                    Some("策略已不在观察期 / 已准入状态")
+                }
+                Some(_) => None,
             }
-            Some(_) => None,
         };
         match why {
             Some(note) => {
@@ -709,15 +718,86 @@ mod tests {
             at(9, 18, 16, 0),
         )
         .unwrap();
-        struct Boom;
-        impl QuoteSource for Boom {
-            fn fetch(&self, _: &[String]) -> Result<Vec<Quote>> {
-                panic!("无可发计划时不应拉报价")
-            }
-        }
         let r = emit_due(&mut c, &Boom, &SignalCfg::default(), at(9, 21, 9, 26)).unwrap();
         assert_eq!(r.dropped, 1);
         assert!(plans::due_plans(&c, d(9, 21)).unwrap().is_empty());
+    }
+
+    /// 不能拿报价时才发现的「全局」作废理由都不该去拉报价。
+    struct Boom;
+    impl QuoteSource for Boom {
+        fn fetch(&self, _: &[String]) -> Result<Vec<Quote>> {
+            panic!("无可发计划时不应拉报价")
+        }
+    }
+
+    /// 计划的结算备注,断言作废原因用。
+    fn plan_note(c: &Connection) -> Option<String> {
+        c.query_row("SELECT note FROM trade_strategy_plans", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn ticket_count(c: &Connection) -> i64 {
+        c.query_row("SELECT COUNT(*) FROM trade_tickets", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// spec §5/§12:周五的决策只能在下一个交易日(周一)开盘发出;周一程序没开,
+    /// 周二补发就是隔了一天的旧决策,必须作废、不补发。
+    #[test]
+    fn a_plan_whose_emit_day_was_missed_is_dropped_not_sent_late() {
+        let mut c = db();
+        planned_buy(&c); // 周五 9/18 的计划
+        let r = emit_due(&mut c, &Boom, &SignalCfg::default(), at(9, 22, 9, 26)).unwrap();
+        assert_eq!((r.submitted, r.dropped), (0, 1));
+        assert_eq!(ticket_count(&c), 0, "不生成工单");
+        assert_eq!(plan_note(&c).as_deref(), Some("错过发出日"));
+    }
+
+    /// 周一被证实休市时,下一个交易日顺延到周二:周二照常发出,不算错过。
+    #[test]
+    fn a_confirmed_holiday_carries_the_plan_to_the_next_trading_day() {
+        let mut c = db();
+        planned_buy(&c);
+        crate::trade::calendar::mark_day(&c, d(9, 21), false, at(9, 21, 9, 31)).unwrap();
+        let fresh = Stub(vec![q("600000", 25.0, at(9, 22, 9, 25))]);
+        let r = emit_due(&mut c, &fresh, &SignalCfg::default(), at(9, 22, 9, 26)).unwrap();
+        assert_eq!((r.submitted, r.dropped), (1, 0));
+    }
+
+    #[test]
+    fn a_redefined_strategy_drops_its_plan() {
+        let mut c = db();
+        let sid = planned_buy(&c);
+        let outcome = store::update_definition(
+            &c,
+            1,
+            sid,
+            &NewStrategy {
+                user_id: 1,
+                name: "趋势".into(),
+                kind: "trend".into(),
+                grid_toml: "short_window = [10]\nlong_window = [20]\namount = [100000.0]".into(),
+                pool: vec!["600000".into()],
+            },
+            at(9, 18, 16, 0),
+        )
+        .unwrap();
+        assert_eq!(outcome, store::DefinitionUpdate::Reversioned);
+        let r = emit_due(&mut c, &Boom, &SignalCfg::default(), at(9, 21, 9, 26)).unwrap();
+        assert_eq!(r.dropped, 1);
+        assert_eq!(plan_note(&c).as_deref(), Some("策略定义已变更"));
+    }
+
+    #[test]
+    fn a_deleted_strategy_drops_its_plan() {
+        let mut c = db();
+        let sid = planned_buy(&c);
+        c.execute("DELETE FROM trade_strategies WHERE id = ?1", [sid])
+            .unwrap();
+        let r = emit_due(&mut c, &Boom, &SignalCfg::default(), at(9, 21, 9, 26)).unwrap();
+        assert_eq!(r.dropped, 1);
+        assert_eq!(plan_note(&c).as_deref(), Some("策略已删除"));
     }
 
     #[test]
