@@ -20,6 +20,9 @@ use crate::trade::model::{
 };
 use crate::trade::ticket::{self as tk, Transition};
 use crate::trade::{notify, settings, store};
+use crate::web::auth::config::AuthCfg;
+use crate::web::auth::model::LicenseStatus;
+use crate::web::auth::store as auth_store;
 use crate::web::auth::{AuthState, CurrentUser};
 
 /// 心跳存活阈值(秒):监听线程每轮都打心跳;评估线程空闲轮询 30 秒,另留慢任务余量。
@@ -361,8 +364,11 @@ struct SigQuery {
 
 /// 取出签名合法的工单;工单不存在 / 签名缺失 / 错误 / 过期一律 404,不区分原因
 /// (design decision 3)。数据库等内部错误仍通过 `?` 转为 500,不吞掉真实故障。
+/// 链接绕过了登录,因此工单所属用户须仍满足登录 + 授权中间件的同一口径
+/// (未禁用、未注销、授权状态放行),否则同样 404。
 fn signed_ticket(
     conn: &Connection,
+    cfg: &AuthCfg,
     id: i64,
     sig: Option<&str>,
     now: NaiveDateTime,
@@ -370,11 +376,15 @@ fn signed_ticket(
     let sig = sig.ok_or_else(ApiError::not_found)?;
     let t = tk::get_ticket(conn, id)?.ok_or_else(ApiError::not_found)?;
     let secret = settings::link_secret(conn)?;
-    if crate::trade::link::verify(&secret, &t, sig, now) {
-        Ok(t)
-    } else {
-        Err(ApiError::not_found())
+    if !crate::trade::link::verify(&secret, &t, sig, now) {
+        return Err(ApiError::not_found());
     }
+    let owner = auth_store::find_user_by_id(conn, t.user_id)?.ok_or_else(ApiError::not_found)?;
+    let license = LicenseStatus::of(owner.expires_at, now.date(), cfg.warn_days, cfg.grace_days);
+    if owner.disabled || owner.cancelled || !license.allows_access() {
+        return Err(ApiError::not_found());
+    }
+    Ok(t)
 }
 
 async fn signed_view(
@@ -386,7 +396,7 @@ async fn signed_view(
     let Query(q) = q?;
     let now = now();
     let conn = st.db.lock().unwrap();
-    let t = signed_ticket(&conn, id, q.sig.as_deref(), now)?;
+    let t = signed_ticket(&conn, &st.cfg, id, q.sig.as_deref(), now)?;
     Ok(Json(ticket_view(&conn, t, now)?))
 }
 
@@ -403,7 +413,7 @@ async fn signed_confirm(
     let now = now();
     let res = {
         let conn = st.db.lock().unwrap();
-        let t = signed_ticket(&conn, id, q.sig.as_deref(), now)?;
+        let t = signed_ticket(&conn, &st.cfg, id, q.sig.as_deref(), now)?;
         actions::confirm_ticket(&conn, t.user_id, t.id, body.ack_deviation, now)?
     };
     confirm_response(res)
@@ -1521,6 +1531,55 @@ mod tests {
             (StatusCode::CONFLICT, Some("already_handled")),
             "链接重放"
         );
+    }
+
+    #[tokio::test]
+    async fn signed_link_is_404_when_owner_is_expired_or_disabled() {
+        let st = state();
+        let uid = seed_user(&st, "u", "t");
+        let id = pending_ticket(&st, uid, "600000", 10.0);
+        let sig = {
+            let c = st.db.lock().unwrap();
+            let secret = crate::trade::settings::link_secret(&c).unwrap();
+            let t = crate::trade::ticket::get_ticket(&c, id).unwrap().unwrap();
+            crate::trade::link::sign(&secret, &t)
+        };
+        let view = format!("/api/trade/t/{id}?sig={sig}");
+        let confirm = format!("/api/trade/t/{id}/confirm?sig={sig}");
+        let body = || Some(serde_json::json!({"ack_deviation": true}));
+        let (s, _) = call(&st, "GET", &view, "", None).await;
+        assert_eq!(s, StatusCode::OK, "授权有效时可查看");
+
+        // 授权过期(远超宽限期)→ 链接失效
+        {
+            let c = st.db.lock().unwrap();
+            let long_ago = chrono::Local::now().date_naive() - chrono::Duration::days(365);
+            crate::web::auth::store::set_expiry(&c, uid, long_ago).unwrap();
+        }
+        let (s, _) = call(&st, "GET", &view, "", None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "授权过期后签名链接不可查看");
+        let (s, _) = call(&st, "POST", &confirm, "", body()).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "授权过期后签名链接不可确认");
+
+        // 授权恢复但账号被禁用 → 同样失效
+        {
+            let c = st.db.lock().unwrap();
+            let later = chrono::Local::now().date_naive() + chrono::Duration::days(30);
+            crate::web::auth::store::set_expiry(&c, uid, later).unwrap();
+            crate::web::auth::store::set_disabled(&c, uid, true).unwrap();
+        }
+        let (s, _) = call(&st, "GET", &view, "", None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "禁用后签名链接不可查看");
+        let (s, _) = call(&st, "POST", &confirm, "", body()).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "禁用后签名链接不可确认");
+        let status = {
+            let c = st.db.lock().unwrap();
+            crate::trade::ticket::get_ticket(&c, id)
+                .unwrap()
+                .unwrap()
+                .status
+        };
+        assert_eq!(status, crate::trade::model::TicketStatus::Pending);
     }
 
     #[tokio::test]
