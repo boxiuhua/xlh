@@ -277,7 +277,7 @@ mod tests {
         let r1 = run_tick(&mut c, &quote(9.1, at(16, 10, 0)), at(16, 10, 0)).unwrap();
         assert_eq!(r1.new_real_tickets.len(), 1, "首次止损应出单");
 
-        crate::trade::settings::set_kill_switch(&c, true, at(16, 10, 5)).unwrap();
+        crate::trade::settings::set_kill_switch(&c, true, None, at(16, 10, 5)).unwrap();
 
         let r2 = run_tick(&mut c, &quote(9.0, at(16, 10, 31)), at(16, 10, 31)).unwrap();
         assert_eq!(r2.expired, 1, "旧工单应正常到期");

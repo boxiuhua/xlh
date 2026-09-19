@@ -1,13 +1,16 @@
 //! 交易全局设置(存于 `trade_settings`):管理员总开关、工单签名密钥。
 //! Web 进程与推送守护进程共用同一个库,因此两边读到的是同一份设置。
 
-use crate::trade::model::fmt_ts;
+use crate::trade::model::{fmt_ts, parse_ts};
 use anyhow::{anyhow, Result};
 use chrono::NaiveDateTime;
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 
 const KILL_SWITCH: &str = "kill_switch";
+/// 总开关最近一次操作人(用户 id 的字符串形式;未记录时写空串)。
+const KILL_SWITCH_BY: &str = "kill_switch_by";
 const LINK_SECRET: &str = "link_secret";
 /// 签名密钥字节数(design decision 3)。
 const SECRET_LEN: usize = 32;
@@ -20,6 +23,18 @@ fn get(conn: &Connection, key: &str) -> Result<Option<String>> {
             |r| r.get(0),
         )
         .optional()?)
+}
+
+/// 同 `get`,但一并取回该键的 `updated_at`(留痕读取用,一次查询取齐)。
+fn get_with_meta(conn: &Connection, key: &str) -> Result<Option<(String, NaiveDateTime)>> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT value, updated_at FROM trade_settings WHERE key = ?1",
+            [key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(v, t)| Ok((v, parse_ts(&t)?))).transpose()
 }
 
 fn put(conn: &Connection, key: &str, value: &str, now: NaiveDateTime) -> Result<()> {
@@ -36,8 +51,35 @@ pub fn kill_switch(conn: &Connection) -> Result<bool> {
     Ok(get(conn, KILL_SWITCH)?.as_deref() == Some("1"))
 }
 
-pub fn set_kill_switch(conn: &Connection, on: bool, now: NaiveDateTime) -> Result<()> {
-    put(conn, KILL_SWITCH, if on { "1" } else { "0" }, now)
+/// 总开关留痕:`by` 为操作的管理员 id(`None` 写空串,例如非管理员触发的内部调用)。
+pub fn set_kill_switch(
+    conn: &Connection,
+    on: bool,
+    by: Option<i64>,
+    now: NaiveDateTime,
+) -> Result<()> {
+    put(conn, KILL_SWITCH, if on { "1" } else { "0" }, now)?;
+    let by_str = by.map(|id| id.to_string()).unwrap_or_default();
+    put(conn, KILL_SWITCH_BY, &by_str, now)
+}
+
+/// 总开关状态:开关本身、最近一次操作人、该次操作的时间。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct KillSwitchState {
+    pub on: bool,
+    pub by: Option<i64>,
+    pub updated_at: Option<NaiveDateTime>,
+}
+
+pub fn kill_switch_state(conn: &Connection) -> Result<KillSwitchState> {
+    let on = kill_switch(conn)?;
+    let by_meta = get_with_meta(conn, KILL_SWITCH_BY)?;
+    let (by, updated_at) = match by_meta {
+        Some((v, t)) if !v.is_empty() => (Some(v.parse::<i64>()?), Some(t)),
+        Some((_, t)) => (None, Some(t)),
+        None => (None, None),
+    };
+    Ok(KillSwitchState { on, by, updated_at })
 }
 
 /// 工单签名密钥(32 字节)。首次调用生成;`INSERT OR IGNORE` 后再读,
@@ -104,10 +146,31 @@ mod tests {
     fn kill_switch_defaults_off_and_toggles() {
         let c = db();
         assert!(!kill_switch(&c).unwrap());
-        set_kill_switch(&c, true, now()).unwrap();
+        set_kill_switch(&c, true, None, now()).unwrap();
         assert!(kill_switch(&c).unwrap());
-        set_kill_switch(&c, false, now()).unwrap();
+        set_kill_switch(&c, false, None, now()).unwrap();
         assert!(!kill_switch(&c).unwrap());
+    }
+
+    #[test]
+    fn kill_switch_records_who_and_when() {
+        let c = db();
+        assert!(!kill_switch_state(&c).unwrap().on);
+        set_kill_switch(&c, true, Some(9), now()).unwrap();
+        let s = kill_switch_state(&c).unwrap();
+        assert_eq!((s.on, s.by, s.updated_at), (true, Some(9), Some(now())));
+    }
+
+    #[test]
+    fn kill_switch_state_defaults_and_clears_by_on_none() {
+        let c = db();
+        let s = kill_switch_state(&c).unwrap();
+        assert_eq!((s.on, s.by, s.updated_at), (false, None, None));
+        set_kill_switch(&c, true, Some(9), now()).unwrap();
+        let later = now() + chrono::Duration::minutes(1);
+        set_kill_switch(&c, false, None, later).unwrap();
+        let s = kill_switch_state(&c).unwrap();
+        assert_eq!((s.on, s.by, s.updated_at), (false, None, Some(later)));
     }
 
     #[test]

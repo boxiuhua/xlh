@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn kill_switch_rejects_every_source() {
         let mut c = db();
-        crate::trade::settings::set_kill_switch(&c, true, now()).unwrap();
+        crate::trade::settings::set_kill_switch(&c, true, None, now()).unwrap();
         let q = quote();
         let ctx = SubmitContext {
             quote: Some(&q),

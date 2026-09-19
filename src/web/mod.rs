@@ -2,6 +2,7 @@ pub mod auth;
 pub mod page;
 pub mod stock;
 pub mod trade;
+pub mod trade_page;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
@@ -390,6 +391,8 @@ pub fn router(state: AuthState) -> Router {
         .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/login", get(page::login_html_handler))
+        .route("/trade", get(trade_page::trade_page))
+        .route("/trade/t/:id", get(trade_page::signed_ticket_page))
         .route("/api/auth/register", post(auth::handlers::register))
         .route("/api/auth/login", post(auth::handlers::login))
         .merge(trade::public_routes());
@@ -484,7 +487,11 @@ async fn security_headers(
     let headers = response.headers_mut();
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     headers.insert("x-frame-options", "DENY".parse().unwrap());
-    headers.insert("referrer-policy", "same-origin".parse().unwrap());
+    // 签名链接落地页自己设了 `Referrer-Policy: no-referrer`（防止签名经 Referer 外泄，
+    // design decision 5）；这里只在 handler 未设置时才填默认值，不覆盖它。
+    if !headers.contains_key("referrer-policy") {
+        headers.insert("referrer-policy", "same-origin".parse().unwrap());
+    }
     headers.insert(
         "permissions-policy",
         "camera=(), microphone=(), geolocation=()".parse().unwrap(),

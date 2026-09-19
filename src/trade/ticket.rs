@@ -317,6 +317,20 @@ pub fn list_tickets(
         .collect())
 }
 
+/// 「已完成」视图:终态工单(`filled/expired/rejected/cancelled`),实盘与模拟盘都含,
+/// 按 id 倒序(新到旧)且 SQL 内直接限量,不再全表读进内存(4a 遗留)。
+pub fn list_done_tickets(conn: &Connection, user_id: i64, limit: usize) -> Result<Vec<Ticket>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {TICKET_COLS} FROM trade_tickets
+         WHERE user_id = ?1 AND status IN ('filled', 'expired', 'rejected', 'cancelled')
+         ORDER BY id DESC LIMIT ?2"
+    ))?;
+    let raws = stmt
+        .query_map(params![user_id, limit as i64], read_raw_ticket)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    raws.into_iter().map(RawTicket::into_ticket).collect()
+}
+
 pub fn list_open_paper(conn: &Connection) -> Result<Vec<Ticket>> {
     query_tickets(
         conn,
@@ -857,6 +871,61 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// 「已完成」只含终态工单(filled/expired/rejected/cancelled),按 id 倒序,受 limit 约束,
+    /// 且按用户隔离(4a 遗留:不再全表读进内存 + 内存截断)。
+    #[test]
+    fn done_list_is_terminal_only_newest_first_and_limited() {
+        let c = db();
+        ticket(
+            &c,
+            Direction::Buy,
+            100,
+            TicketStatus::Pending,
+            at(15, 10, 0),
+        );
+        ticket(
+            &c,
+            Direction::Buy,
+            100,
+            TicketStatus::Confirmed,
+            at(15, 10, 1),
+        );
+        let filled = ticket(&c, Direction::Buy, 100, TicketStatus::Filled, at(15, 10, 2));
+        let expired = ticket(
+            &c,
+            Direction::Buy,
+            100,
+            TicketStatus::Expired,
+            at(15, 10, 3),
+        );
+        let cancelled = ticket(
+            &c,
+            Direction::Buy,
+            100,
+            TicketStatus::Cancelled,
+            at(15, 10, 4),
+        );
+
+        let done = list_done_tickets(&c, 1, 10).unwrap();
+        assert_eq!(
+            done.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![cancelled, expired, filled],
+            "只含终态,按 id 倒序(新到旧)"
+        );
+
+        let limited = list_done_tickets(&c, 1, 2).unwrap();
+        assert_eq!(
+            limited.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![cancelled, expired],
+            "limit 生效"
+        );
+
+        assert!(
+            list_done_tickets(&c, 2, 10).unwrap().is_empty(),
+            "按用户隔离"
         );
     }
 
