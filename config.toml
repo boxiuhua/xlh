@@ -50,3 +50,33 @@ volume_surge_x = 3.0
 main_flow_pct = 0.05
 strong_signal_x = 1.5
 max_push_per_tick = 5
+
+# [trade]
+# enabled = true                # 推送守护内启动交易监听线程
+# monitor_interval_secs = 15    # 交易时段报价轮询间隔(秒)
+# alert_after_secs = 180        # 连续失败多久推送「止损监听中断」
+# mover_signals = true          # 实时异动转为观察期(仅模拟盘)交易信号
+# link_base_url = ""            # 推送工单链接的站点根地址(如 https://xlh.example.com),空则不带链接
+# daily_report = true           # 收盘后是否按交易日推送交易日报
+# daily_report_hour = 15        # 日报发出窗口起点(须在 [15,17],收盘后、窗口结束 18:00 前)
+# daily_report_minute = 35
+
+# [trade.eval]
+# enabled = true       # 是否启动策略评估线程
+# poll_secs = 30       # 空闲时轮询任务队列的间隔(秒)
+# daily_hour = 16      # 每日入队「观察期检查 / 实盘监控」的时刻
+# daily_minute = 30
+# monthly_day = 1      # 每月重跑前推回测的日与时
+# monthly_hour = 17
+
+# [trade.signals]
+# enabled = true        # 观察期 / 已准入的日线策略:收盘后计算、次日开盘发出工单
+# compute_hour = 15     # 收盘后开始计算(K 线未更新会每 retry_minutes 分钟重试)
+# compute_minute = 30
+# cutoff_hour = 21      # 当日计算截止
+# retry_minutes = 10
+# no_bar_idle_hour = 17 # 已证实开市的日子到点仍无当天 K 线:按停牌记无操作,不再重试
+# emit_hour = 9         # 次日发出窗口开始(集合竞价结束后)
+# emit_minute = 25
+# emit_end_hour = 10    # 窗口结束:已证实开市的日子仍未发出的计划作废
+# emit_end_minute = 30

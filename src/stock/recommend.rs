@@ -152,25 +152,58 @@ const CANDIDATES: &[(&str, &str)] = &[
 ];
 
 /// 用共用策略构造器建候选（固定稳健默认参数）。
-fn candidate(kind: &str) -> Box<dyn Strategy> {
+fn candidate(kind: &str, amount: f64) -> Box<dyn Strategy> {
     match kind {
-        "smart_dca" => Box::new(SmartDca::new(Period::Monthly, 1, 1000.0, 250, 1.0)),
-        "trend" => Box::new(Trend::new(20, 60, 1000.0)),
-        "rsi" => Box::new(Rsi::new(14, 30.0, 70.0, 1000.0)),
-        "adaptive" => Box::new(Adaptive::new(Period::Monthly, 1, 1000.0)),
-        _ => Box::new(Dca::new(Period::Monthly, 1, 1000.0)),
+        "smart_dca" => Box::new(SmartDca::new(Period::Monthly, 1, amount, 250, 1.0)),
+        "trend" => Box::new(Trend::new(20, 60, amount)),
+        "rsi" => Box::new(Rsi::new(14, 30.0, 70.0, amount)),
+        "adaptive" => Box::new(Adaptive::new(Period::Monthly, 1, amount)),
+        _ => Box::new(Dca::new(Period::Monthly, 1, amount)),
     }
 }
 
-fn run_metrics(kind: &str, bars: &[StockBar], fee: StockFee) -> Summary {
-    let strat = candidate(kind);
+fn is_a_share_code(code: &str) -> bool {
+    code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// 候选策略每次买入的金额:原先固定 1000 元,A 股整手规则下高价股一手都买不起,
+/// 回测会变成「从不交易」。改为至少够买区间最高价时的一手(留 10% 余量给滑点
+/// 与涨停价),取整到百元,且不低于 1000 元。推荐比的是收益率与回撤,与投入规模无关。
+fn lot_amount(code: &str, bars: &[StockBar]) -> f64 {
+    let max_close = bars.iter().map(|b| b.close).fold(0.0, f64::max);
+    let lot = crate::stock::ashare::buy_lot(code).min as f64;
+    let need = (max_close * lot * 1.1 / 100.0).ceil() * 100.0;
+    need.max(1000.0)
+}
+
+fn run_metrics(
+    kind: &str,
+    code: &str,
+    bars: &[StockBar],
+    prev: Option<StockBar>,
+    fee: StockFee,
+) -> Summary {
+    let (amount, exec): (f64, Box<dyn crate::execution::ExecutionModel>) = if is_a_share_code(code)
+    {
+        (
+            lot_amount(code, bars),
+            Box::new(crate::stock::ashare::AShareExecution::new(
+                code,
+                None,
+                crate::stock::ashare::AShareExecution::DEFAULT_SLIPPAGE,
+            )),
+        )
+    } else {
+        (1000.0, Box::new(crate::execution::CloseExecution))
+    };
     backtest::run_one(
         kind.to_string(),
-        String::new(),
-        bars.to_vec(),
-        strat,
+        code.to_string(),
+        crate::stock::data::StockData::with_prev_bar(bars.to_vec(), prev),
+        candidate(kind, amount),
         fee,
         0.0,
+        exec,
     )
     .summary
 }
@@ -212,8 +245,8 @@ pub fn evaluate_stock(
 
     let mut evals: Vec<StockStrategyEval> = Vec::with_capacity(CANDIDATES.len());
     for (kind, name_cn) in CANDIDATES {
-        let is_s = run_metrics(kind, train, p.fee);
-        let oos_s = run_metrics(kind, test, p.fee);
+        let is_s = run_metrics(kind, code, train, None, p.fee);
+        let oos_s = run_metrics(kind, code, test, train.last().copied(), p.fee);
         evals.push(StockStrategyEval {
             kind: (*kind).to_string(),
             name: (*name_cn).to_string(),
@@ -610,6 +643,39 @@ mod tests {
             GateStatus::NotApplicable { reason } => assert!(reason.contains("非A股")),
             GateStatus::Passed => panic!("应为 NotApplicable"),
         }
+    }
+
+    #[test]
+    fn a_share_candidates_use_ashare_execution_and_can_afford_a_lot() {
+        // 股价 300 元:一手 3 万,旧的固定 1000 元在 A 股口径下一股都买不到
+        let vals: Vec<f64> = (0..300).map(|i| 300.0 + i as f64 * 0.5).collect();
+        let bars = series(&vals);
+        let amount = lot_amount("600519", &bars);
+        assert!(
+            amount >= 100.0 * 450.0,
+            "至少够买最高价时的一手,当前 {amount}"
+        );
+        assert_eq!(amount % 100.0, 0.0, "取整到百元");
+        assert_eq!(
+            lot_amount("688981", &series(&[10.0; 10])),
+            2_200.0,
+            "科创板一手 200 股 × 10 元 × 1.1"
+        );
+        assert_eq!(
+            lot_amount("600000", &series(&[1.0; 10])),
+            1_000.0,
+            "低价股不低于原来的 1000 元"
+        );
+        let r = evaluate_stock("600519", "茅台", &bars, &RecommendParams::default()).unwrap();
+        let dca = r.all_strategies.iter().find(|e| e.kind == "dca").unwrap();
+        assert!(dca.is_return > 0.0, "上涨行情里定投必须真的买到了股票");
+    }
+
+    #[test]
+    fn non_a_share_keeps_close_execution() {
+        assert!(!is_a_share_code("AAPL"));
+        assert!(!is_a_share_code("00700"));
+        assert!(is_a_share_code("600519"));
     }
 
     #[test]

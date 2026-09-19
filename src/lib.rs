@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod event;
+pub mod execution;
 // 后续任务逐个取消注释：
 pub mod analyze;
 pub mod broker;
@@ -18,4 +19,5 @@ pub mod result;
 pub mod runner;
 pub mod stock;
 pub mod strategy;
+pub mod trade;
 pub mod web;

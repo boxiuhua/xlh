@@ -137,6 +137,28 @@ WITH_PUSH=1 scripts/deploy.sh user@host
 
 ---
 
+## 交易模块上线检查清单
+
+生产环境要让止盈止损监听、日线策略信号、交易日报正常工作，逐项确认：
+
+- **`xlh push` 必须常驻**：止损监听（`trade-monitor`）与策略评估（`trade-eval`）都挂在 `push`
+  守护进程里，不在 `serve` 里，同「推送守护」一节；`docker-compose.prod.yml` 要用
+  `--profile push` 起 `xlh-push`，漏了这个 profile 交易模块完全不跑，`xlh-web` 页面却照常打开、
+  从外面看不出问题。用 `docker logs xlh-push` 或 `/trade` 页顶部「监听 / 评估」心跳确认。
+- **`link_base_url` 设为对外可访问的 HTTPS 地址**（`config.toml` 的 `[trade]` 段）：不填的话推送里
+  的工单不带签名链接，用户只能登录网页确认，收不到能直接点开的链接。
+- **反向代理不要覆盖 `Referrer-Policy` 头**：工单签名链接落地页自己设了
+  `Referrer-Policy: no-referrer`，防止签名经 Referer 泄露给第三方；Nginx/Caddy 若统一加了这个
+  响应头，确认没有对 `/trade/t/*` 单独覆盖成更宽松的值（比如 `same-origin` 或不设置）。
+- **`data/xlh.db` 备份含交易表**：交易工单、持仓、策略定义、评估任务都存在同一个 `xlh.db` 里，
+  跟用户/授权表一起走上面「备份」一节的 `sqlite3 ... ".backup"` 流程即可，不需要单独处理，
+  但升级/迁移时同样不能漏了这个库（否则丢的不只是账号，连持仓与策略状态一并丢失）。
+- **时区必须是 `Asia/Shanghai`**（`.env` 的 `TZ`）：`trade-monitor`/`trade-eval` 按容器本地时间
+  判断交易时段、收盘计算、次日发出窗口、日报窗口等各类到点任务；时区配错不会报错，只会让这些
+  任务整体错开几小时，现象和「没生效」一样不好排查。
+
+---
+
 ## 从旧版本升级（数据在部署目录里的那种）
 
 旧版把数据放在部署目录内（`/opt/xlh/data`）。新版挪到了 `$XLH_STATE_DIR`（`/srv/xlh-state`）。

@@ -48,6 +48,7 @@ button.del{color:#c0392b;border-color:#e8b9b3}
   <span style="flex:1"></span>
   <input id="xlh-code" placeholder="授权码" style="padding:4px 8px;border-radius:6px;border:1px solid #374151;background:#0b1220;color:#e5e7eb">
   <button onclick="xlhActivate()" style="padding:4px 10px;border:0;border-radius:6px;background:#3b82f6;color:#fff;cursor:pointer">激活/续期</button>
+  <a href="/trade" style="color:#fca5a5">交易</a>
   <a id="xlh-admin" href="/admin" style="display:none;color:#93c5fd">管理后台</a>
   <button onclick="xlhPwOpen()" style="padding:4px 10px;border:0;border-radius:6px;background:#374151;color:#fff;cursor:pointer">修改密码</button>
   <button onclick="xlhLogout()" style="padding:4px 10px;border:0;border-radius:6px;background:#374151;color:#fff;cursor:pointer">退出</button>
@@ -513,10 +514,49 @@ xlhMe();
       </div>
       <div class="hint" style="margin-top:8px">分析会先由本地生成股票诊断或基金市场状态，再将该数据提交给你配置的模型；内容仅供研究，不构成投资建议。</div>
       <div id="ai-result" style="margin-top:14px;white-space:pre-wrap;line-height:1.65"></div>
+      <div style="margin-top:10px"><button class="small" id="ai-ticket-btn" style="display:none">按此分析生成工单</button></div>
     </div>
   </div>
 
   <iframe id="result" title="回测报告"></iframe>
+</div>
+
+<div id="ticket-modal" style="display:none;position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.5);align-items:center;justify-content:center">
+  <div class="card" style="width:420px;max-width:92vw;max-height:88vh;overflow:auto;margin-bottom:0">
+    <div style="font-size:1.1rem;font-weight:700;color:#1a252f;margin-bottom:12px">生成工单</div>
+    <div class="row">
+      <div class="field" style="flex:1"><label>代码</label><input id="tk-code" readonly style="background:#f5f6fa;color:#5a6a7a"/></div>
+      <div class="field" style="flex:1"><label>名称</label><input id="tk-name" readonly style="background:#f5f6fa;color:#5a6a7a"/></div>
+    </div>
+    <div class="field" style="margin-top:10px">
+      <label>方向</label>
+      <div>
+        <label style="margin-right:14px;font-weight:400"><input type="radio" name="tk-side" id="tk-side-buy" value="buy" checked/> 买入</label>
+        <label style="font-weight:400"><input type="radio" name="tk-side" id="tk-side-sell" value="sell"/> 卖出</label>
+      </div>
+    </div>
+    <div class="field" id="tk-amount-field" style="margin-top:10px">
+      <label>买入金额（元，留空 = 按风控单笔上限）</label>
+      <input id="tk-amount" type="number" min="0" step="0.01" placeholder="留空按风控单笔上限"/>
+    </div>
+    <div class="field" id="tk-qty-field" style="margin-top:10px;display:none">
+      <label>卖出股数（留空 = 全部可卖）</label>
+      <input id="tk-qty" type="number" min="1" step="1" placeholder="留空全部可卖"/>
+    </div>
+    <div class="field" style="margin-top:10px">
+      <label>理由（必填）</label>
+      <textarea id="tk-reason" rows="3" maxlength="500" placeholder="下单理由，最多 500 字"></textarea>
+    </div>
+    <div id="tk-ainote-wrap" style="margin-top:10px;display:none">
+      <div id="tk-ainote-toggle" style="cursor:pointer;color:#2980b9;font-size:.85rem">展开 AI 说明 ▾</div>
+      <pre id="tk-ainote" style="display:none;margin-top:6px;white-space:pre-wrap;background:#fafbfc;border:1px solid #eaecef;border-radius:8px;padding:10px;font-size:.85rem;max-height:200px;overflow:auto"></pre>
+    </div>
+    <div id="tk-msg" class="hint" style="margin-top:10px"></div>
+    <div style="text-align:right;margin-top:14px">
+      <button class="small" id="tk-cancel">取消</button>
+      <button class="run" id="tk-submit" style="margin-top:0;margin-left:8px">提交</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -1179,7 +1219,15 @@ function renderStockDiag(d){
     + forecastHtml(d.forecast)
     + trackingHtml(d.tracking, d.tracking_error)
     + sigEvidenceHtml(d.evidence)
-    + '<div style="margin-top:8px;padding:8px 10px;background:#f3f7ff;border-radius:6px;color:#34495e">'+esc(d.caveat)+'</div>';
+    + '<div style="margin-top:8px;padding:8px 10px;background:#f3f7ff;border-radius:6px;color:#34495e">'+esc(d.caveat)+'</div>'
+    + '<div style="margin-top:10px"><button class="small" id="sd-ticket-btn">生成工单</button></div>';
+  var tbtn = document.getElementById('sd-ticket-btn');
+  if (tbtn) tbtn.addEventListener('click', function(){
+    var side = d.action === 'sell' ? 'sell' : 'buy';
+    var prefix = d.action === 'hold' ? '诊断为观望。' : '';
+    var reason = clipChars(prefix + '个股诊断:' + (d.signal||'') + ',' + (d.rationale||''), 500);
+    openTicketModal({ code: d.code, name: d.name || '', side: side, reason: reason, aiNote: null });
+  });
   renderStockHistory(document.getElementById('stock-history-chart'), d);
 }
 
@@ -1331,11 +1379,22 @@ function renderStockRun(o){
   var box = document.getElementById('sb-result');
   if(!o || !o.summary){ box.innerHTML = '<span style="color:#c0392b">回测失败</span>'; return; }
   var s = o.summary, ts = o.trade_stats || {};
+  var rj = o.rejected || [];
+  var rjNames = {limit_up:'涨停买不进', limit_down:'跌停卖不出', no_prev_close:'首日无前收', below_one_lot:'资金不足一手', nothing_sellable:'T+1 不可卖', no_price:'无报价', unsupported_qty:'数量类型不支持'};
+  var rjCnt = {};
+  rj.forEach(function(r){ rjCnt[r.reason] = (rjCnt[r.reason]||0) + 1; });
+  var rjHtml = rj.length
+    ? '<div style="margin-top:6px;color:#b8860b">未成交订单 '+rj.length+' 笔：'+Object.keys(rjCnt).map(function(k){ return (rjNames[k]||k)+' '+rjCnt[k]; }).join(' · ')+'</div>'
+    : '';
+  var execHtml = o.execution === 'a_share'
+    ? '<div style="margin-top:6px;color:#7f8c8d;font-size:.9em">成交口径：A 股 · 当日开盘价 +0.1% 滑点 · 整手 · 开盘涨跌停不成交 · T+1</div>'
+    : '';
   box.innerHTML = '<div class="card" style="margin-top:0">'
     + '<div style="font-size:1.1rem;font-weight:600">'+esc(o.code)+' · '+esc(o.name)+'</div>'
     + '<div style="margin-top:8px;color:#34495e">总收益 '+pct(s.total_return)+' · 年化 '+pct(s.annualized)+' · 夏普 '+s.sharpe.toFixed(2)+' · 最大回撤 '+pct(s.max_drawdown)+'</div>'
     + '<div style="margin-top:6px;color:#34495e">投入 '+s.total_contributed.toFixed(0)+' · 期末 '+s.final_equity.toFixed(0)+' · 成交 '+s.trade_count+' 笔</div>'
     + '<div style="margin-top:6px;color:#5a6a7a">交易统计：卖出 '+(ts.round_trips||0)+' 次 · 胜率 '+pct(ts.win_rate||0)+' · 盈亏比 '+pf(ts.profit_factor)+' · 实现盈亏 '+(ts.realized_pnl||0).toFixed(0)+'</div>'
+    + rjHtml + execHtml
     + '</div>';
 }
 function sCard(r, rank){
@@ -1707,7 +1766,7 @@ function loadAiConfig(){
 }
 document.getElementById('ai-load').addEventListener('click',loadAiConfig);
 document.getElementById('ai-save').addEventListener('click',function(){var b=this,m=document.getElementById('ai-config-msg');b.disabled=true;m.textContent='保存中…';fetch('/api/ai/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(aiConfigValue())}).then(function(r){if(!r.ok)return r.text().then(function(x){throw new Error(aiErrorText(x))});return r.json();}).then(function(){m.textContent='模型配置已保存。';}).catch(function(e){m.textContent='保存失败：'+String(e.message||e);}).finally(function(){b.disabled=false;});});
-document.getElementById('ai-run').addEventListener('click',function(){var b=this,code=document.getElementById('ai-code').value.trim(),out=document.getElementById('ai-result');if(!code){out.textContent='请先输入代码。';return;}b.disabled=true;out.textContent='正在生成本地指标并请求模型…';fetch('/api/ai/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({asset_type:document.getElementById('ai-asset').value,code:code})}).then(function(r){if(!r.ok)return r.text().then(function(x){throw new Error(aiErrorText(x))});return r.json();}).then(function(d){out.textContent='模型：'+(d.model||'')+'\n\n'+(d.analysis||'');}).catch(function(e){out.textContent='分析失败：'+String(e.message||e);}).finally(function(){b.disabled=false;});});
+document.getElementById('ai-run').addEventListener('click',function(){var b=this,code=document.getElementById('ai-code').value.trim(),asset=document.getElementById('ai-asset').value,out=document.getElementById('ai-result'),tbtn=document.getElementById('ai-ticket-btn');tbtn.style.display='none';tbtn.onclick=null;if(!code){out.textContent='请先输入代码。';return;}b.disabled=true;out.textContent='正在生成本地指标并请求模型…';fetch('/api/ai/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({asset_type:asset,code:code})}).then(function(r){if(!r.ok)return r.text().then(function(x){throw new Error(aiErrorText(x))});return r.json();}).then(function(d){out.textContent='模型：'+(d.model||'')+'\n\n'+(d.analysis||'');if(asset==='stock' && /^\d{6}$/.test(code)){tbtn.style.display='';tbtn.onclick=function(){openTicketModal({code:code,name:'',side:'buy',reason:'AI 分析',aiNote:clipChars(d.analysis||'',8000)});};}}).catch(function(e){out.textContent='分析失败：'+String(e.message||e);}).finally(function(){b.disabled=false;});});
 document.getElementById('ai-optimize-prompt').addEventListener('click',function(){var b=this,d=document.getElementById('ai-prompt-draft').value.trim(),out=document.getElementById('ai-prompt-result');if(!d){out.style.display='block';out.textContent='请先填写提示词需求。';return;}b.disabled=true;out.style.display='block';out.textContent='正在用 DeepSeek 优化提示词…';fetch('/api/ai/optimize-prompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:d})}).then(function(r){if(!r.ok)return r.text().then(function(x){throw new Error(aiErrorText(x))});return r.json();}).then(function(x){out.textContent=x.prompt||'';document.getElementById('ai-use-prompt').disabled=!x.prompt;}).catch(function(e){out.textContent='优化失败：'+String(e.message||e);}).finally(function(){b.disabled=false;});});
 document.getElementById('ai-use-prompt').addEventListener('click',function(){var v=document.getElementById('ai-prompt-result').textContent;if(v){document.getElementById('ai-prompt').value=v;document.getElementById('ai-config-msg').textContent='已写入系统提示词，点击“保存配置”后生效。';}});
 loadAiConfig();
@@ -1876,6 +1935,148 @@ function loadPushStatus(){
 
 loadPushConfig();
 loadPushStatus();
+
+// ---- 手动工单弹窗（4c：股诊断 / AI 分析结果一键生成工单，同一闸门、幂等） ----
+var TICKET_REQUEST_ID = null;
+var TICKET_STATE = null;
+// 本框已生成工单(ticketed / duplicate):保持提交禁用、下单字段只读,重新打开弹窗才解除(终审 M6)
+var TICKET_DONE = false;
+
+// 按码点截断(服务端按字符数校验;String.prototype.slice 按 UTF-16 码元,会切开代理对)
+function clipChars(s, n){
+  return Array.from(String(s)).slice(0, n).join('');
+}
+
+function setTicketLocked(locked){
+  document.getElementById('tk-side-buy').disabled = locked;
+  document.getElementById('tk-side-sell').disabled = locked;
+  document.getElementById('tk-amount').readOnly = locked;
+  document.getElementById('tk-qty').readOnly = locked;
+  document.getElementById('tk-submit').disabled = locked;
+}
+
+function newRequestId(){
+  return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + '-' + Math.random().toString(36).slice(2));
+}
+
+function toggleTicketSideFields(){
+  var isSell = document.getElementById('tk-side-sell').checked;
+  document.getElementById('tk-amount-field').style.display = isSell ? 'none' : '';
+  document.getElementById('tk-qty-field').style.display = isSell ? '' : 'none';
+}
+
+function openTicketModal(opts){
+  opts = opts || {};
+  TICKET_REQUEST_ID = newRequestId();
+  TICKET_STATE = { code: opts.code || '', name: opts.name || '', aiNote: opts.aiNote ? clipChars(opts.aiNote, 8000) : null };
+  TICKET_DONE = false;
+  document.getElementById('tk-code').value = opts.code || '';
+  document.getElementById('tk-name').value = opts.name || '';
+  document.getElementById('tk-side-buy').checked = opts.side !== 'sell';
+  document.getElementById('tk-side-sell').checked = opts.side === 'sell';
+  document.getElementById('tk-amount').value = '';
+  document.getElementById('tk-qty').value = '';
+  document.getElementById('tk-reason').value = clipChars(opts.reason || '', 500);
+  var aiWrap = document.getElementById('tk-ainote-wrap');
+  var aiPre = document.getElementById('tk-ainote');
+  var aiToggle = document.getElementById('tk-ainote-toggle');
+  if (opts.aiNote) {
+    aiPre.textContent = TICKET_STATE.aiNote;
+    aiPre.style.display = 'none';
+    aiToggle.textContent = '展开 AI 说明 ▾';
+    aiWrap.style.display = '';
+  } else {
+    aiPre.textContent = '';
+    aiWrap.style.display = 'none';
+  }
+  document.getElementById('tk-msg').innerHTML = '';
+  setTicketLocked(false);
+  toggleTicketSideFields();
+  document.getElementById('ticket-modal').style.display = 'flex';
+}
+
+function closeTicketModal(){ document.getElementById('ticket-modal').style.display = 'none'; }
+
+// 授权中间件 403（`{error:"expired"|"license_required"}`）→ 中文提示
+var TICKET_LICENSE_ERR = { expired: '授权已过期，请在主页续期', license_required: '未激活授权，请在主页输入授权码' };
+
+function submitTicket(){
+  if (TICKET_DONE) return;
+  var rid = TICKET_REQUEST_ID;
+  var btn = document.getElementById('tk-submit');
+  var msg = document.getElementById('tk-msg');
+  var reason = document.getElementById('tk-reason').value.trim();
+  if (!reason) { msg.innerHTML = '<span style="color:#c0392b">请填写下单理由</span>'; return; }
+  var side = document.getElementById('tk-side-sell').checked ? 'sell' : 'buy';
+  var amount = null, qty = null;
+  if (side === 'buy') {
+    var av = document.getElementById('tk-amount').value.trim();
+    if (av !== '') {
+      amount = Number(av);
+      if (!(isFinite(amount) && amount > 0)) { msg.innerHTML = '<span style="color:#c0392b">买入金额须为正数</span>'; return; }
+    }
+  } else {
+    var qv = document.getElementById('tk-qty').value.trim();
+    if (qv !== '') {
+      qty = Number(qv);
+      if (!(Number.isInteger(qty) && qty > 0)) { msg.innerHTML = '<span style="color:#c0392b">卖出股数须为正整数</span>'; return; }
+    }
+  }
+  var body = {
+    request_id: TICKET_REQUEST_ID,
+    code: TICKET_STATE.code,
+    name: TICKET_STATE.name || null,
+    side: side,
+    amount: amount,
+    qty: qty,
+    reason: reason,
+    ai_note: TICKET_STATE.aiNote || null
+  };
+  btn.disabled = true;
+  msg.textContent = '提交中…';
+  fetch('/api/trade/manual', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })
+    .then(function(r){
+      return r.json().catch(function(){ return {}; }).then(function(j){ return { status: r.status, ok: r.ok, data: j }; });
+    })
+    .then(function(res){
+      if (rid !== TICKET_REQUEST_ID) return; // 弹窗已重新打开,旧响应作废
+      if (res.ok && res.data && (res.data.result === 'ticketed' || res.data.result === 'duplicate')) {
+        TICKET_DONE = true;
+        setTicketLocked(true);
+        var text = res.data.result === 'duplicate' ? '工单已生成（重复提交）' : '已生成工单';
+        msg.innerHTML = '<span style="color:#2c6e49">'+esc(text)+'</span> · <a href="/trade#pending">去交易页确认</a>';
+        return;
+      }
+      var text;
+      if (res.status === 409 && res.data && res.data.code === 'rejected') {
+        text = res.data.error || '被拦截';
+      } else if (res.status === 400) {
+        text = (res.data && res.data.error) || '请求有误';
+      } else if (res.status === 401 || res.status === 403) {
+        var e = res.data && res.data.error;
+        text = TICKET_LICENSE_ERR[e] || ('生成失败（'+res.status+'）');
+      } else {
+        text = '生成失败（'+res.status+'）';
+      }
+      msg.innerHTML = '<span style="color:#c0392b">'+esc(text)+'</span>';
+    })
+    .catch(function(e){
+      if (rid !== TICKET_REQUEST_ID) return;
+      msg.innerHTML = '<span style="color:#c0392b">'+esc('请求失败：'+String((e&&e.message)||e))+'</span>';
+    })
+    .finally(function(){ if (rid === TICKET_REQUEST_ID && !TICKET_DONE) btn.disabled = false; });
+}
+
+document.getElementById('tk-side-buy').addEventListener('change', toggleTicketSideFields);
+document.getElementById('tk-side-sell').addEventListener('change', toggleTicketSideFields);
+document.getElementById('tk-ainote-toggle').addEventListener('click', function(){
+  var pre = document.getElementById('tk-ainote');
+  var open = pre.style.display !== 'none';
+  pre.style.display = open ? 'none' : '';
+  this.textContent = open ? '展开 AI 说明 ▾' : '收起 AI 说明 ▴';
+});
+document.getElementById('tk-cancel').addEventListener('click', closeTicketModal);
+document.getElementById('tk-submit').addEventListener('click', submitTicket);
 </script>
 </body>
 </html>

@@ -52,6 +52,15 @@ impl Fee for StockFee {
             + v * self.stamp_tax_rate
             + v * self.transfer_rate
     }
+
+    /// 股票佣金按「每笔委托」计最低收费:多个 lot 合并为一单,只收一次最低佣金。
+    fn sell_fee_order(&self, legs: &[(f64, i64)], price: f64) -> f64 {
+        let shares: f64 = legs.iter().map(|(s, _)| s).sum();
+        if shares <= 0.0 {
+            return 0.0;
+        }
+        self.sell_fee(shares, price, 0)
+    }
 }
 
 #[cfg(test)]
@@ -91,5 +100,18 @@ mod tests {
         assert_eq!(StockFee::for_market(105), StockFee::us());
         assert_eq!(StockFee::for_market(106), StockFee::us());
         assert_eq!(StockFee::for_market(999), StockFee::a_share()); // 未知回退A股
+    }
+
+    #[test]
+    fn sell_fee_order_charges_min_commission_once() {
+        // 三个 lot 各 100 股 @10,合计 3000:佣金 0.75<5 取 5;印花 1.5;过户 0.03 → 6.53
+        let legs = [(100.0, 10), (100.0, 5), (100.0, 1)];
+        let fee = StockFee::a_share().sell_fee_order(&legs, 10.0);
+        assert!((fee - 6.53).abs() < 1e-9, "实际 {fee}");
+    }
+
+    #[test]
+    fn sell_fee_order_with_no_legs_is_zero() {
+        assert!(StockFee::a_share().sell_fee_order(&[], 10.0).abs() < 1e-12);
     }
 }

@@ -1,14 +1,14 @@
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
 
 use super::model::{renew_expiry, LicenseStatus};
 use super::store::{self, CodeFilter};
-use super::{json_error, AuthState};
+use super::{json_error, AuthState, CurrentUser};
 
 const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // 去掉易混 O0I1
 
@@ -302,6 +302,9 @@ const ADMIN_HTML: &str = r##"<!doctype html>
 <div><button onclick="loadCodes('unused')">未用</button><button onclick="loadCodes('used')">已用</button><button onclick="loadCodes('all')">全部</button></div>
 <table id="codes"><thead><tr><th>码</th><th>天数</th><th>使用者</th><th>状态</th><th></th></tr></thead><tbody></tbody></table>
 
+<h2>交易总开关</h2>
+<div id="ks">加载中…</div>
+
 <h2>用户</h2>
 <table id="users"><thead><tr><th>ID</th><th>用户名</th><th>状态</th><th>到期</th><th>操作</th></tr></thead><tbody></tbody></table>
 
@@ -314,25 +317,57 @@ const ADMIN_HTML: &str = r##"<!doctype html>
 async function api(u,m,b){const r=await fetch(u,{method:m||'GET',headers:b?{'content-type':'application/json'}:{},body:b?JSON.stringify(b):undefined});if(r.status===404){document.body.innerHTML='<h1>403</h1>';return null;}return r.json().catch(()=>({}));}
 async function ov(){const j=await api('/api/admin/overview');if(j)document.getElementById('ov').textContent=`用户 ${j.total} · 在用 ${j.active} · 临期 ${j.warning}`;}
 async function gen(){const days=+document.getElementById('days').value,count=+document.getElementById('count').value;const j=await api('/api/admin/codes','POST',{days,count});document.getElementById('newcodes').textContent=(j.codes||[]).join('\n');loadCodes('unused');}
-async function loadCodes(f){const j=await api('/api/admin/codes?filter='+f);const tb=document.querySelector('#codes tbody');tb.innerHTML='';(j||[]).forEach(c=>{const st=c.revoked?'已作废':(c.used_by?'已用':'未用');tb.innerHTML+=`<tr><td><code>${c.code}</code></td><td>${c.days}</td><td>${c.used_by||''}</td><td>${st}</td><td>${c.used_by||c.revoked?'':`<button onclick="revoke('${c.code}')">作废</button>`}</td></tr>`;});}
+async function loadCodes(f){const j=await api('/api/admin/codes?filter='+f);const tb=document.querySelector('#codes tbody');tb.innerHTML='';(j||[]).forEach(c=>{const st=c.revoked?'已作废':(c.used_by?'已用':'未用');const act=(c.used_by||c.revoked)?'':`<button data-code="${esc(c.code)}" class="revoke-btn">作废</button>`;tb.innerHTML+=`<tr><td><code>${esc(c.code)}</code></td><td>${Number(c.days)}</td><td>${esc(c.used_by||'')}</td><td>${esc(st)}</td><td>${act}</td></tr>`;});}
+document.querySelector('#codes tbody').addEventListener('click',e=>{const b=e.target.closest('button[data-code]');if(b)revoke(b.dataset.code);});
 async function revoke(code){await api('/api/admin/codes/revoke','POST',{code});loadCodes('unused');}
-async function loadUsers(){const j=await api('/api/admin/users');const tb=document.querySelector('#users tbody');tb.innerHTML='';(j.users||[]).forEach(u=>{tb.innerHTML+=`<tr><td>${u.id}</td><td>${u.username}${u.is_admin?' 👑':''}</td><td>${u.status}${u.disabled?' (封禁)':''}${u.cancelled?' (已注销)':''}</td><td>${u.expires_at||'—'}</td><td>
-  <input type="number" value="30" style="width:64px" id="d${u.id}"><button onclick="ext(${u.id})">续期</button>
-  <button onclick="dis(${u.id},${!u.disabled})">${u.disabled?'解封':'封禁'}</button>
-  <button onclick="adm(${u.id},${!u.is_admin})">${u.is_admin?'撤管理':'设管理'}</button>
-  <button onclick="rst(${u.id})">重置密码</button>
-  <button onclick="cxl(${u.id},${!u.cancelled})">${u.cancelled?'恢复':'注销'}</button>
-  <button onclick="del(${u.id})">删除</button></td></tr>`;});}
+async function loadUsers(){const j=await api('/api/admin/users');const tb=document.querySelector('#users tbody');tb.innerHTML='';(j.users||[]).forEach(u=>{tb.innerHTML+=`<tr><td>${Number(u.id)}</td><td>${esc(u.username)}${u.is_admin?' 👑':''}</td><td>${esc(u.status)}${u.disabled?' (封禁)':''}${u.cancelled?' (已注销)':''}</td><td>${esc(u.expires_at||'—')}</td><td>
+  <input type="number" value="30" style="width:64px" id="d${Number(u.id)}"><button onclick="ext(${Number(u.id)})">续期</button>
+  <button onclick="dis(${Number(u.id)},${!u.disabled})">${u.disabled?'解封':'封禁'}</button>
+  <button onclick="adm(${Number(u.id)},${!u.is_admin})">${u.is_admin?'撤管理':'设管理'}</button>
+  <button onclick="rst(${Number(u.id)})">重置密码</button>
+  <button onclick="cxl(${Number(u.id)},${!u.cancelled})">${u.cancelled?'恢复':'注销'}</button>
+  <button onclick="del(${Number(u.id)})">删除</button></td></tr>`;});}
 async function ext(id){const days=+document.getElementById('d'+id).value;await api('/api/admin/users/extend','POST',{user_id:id,days});loadUsers();ov();}
 async function dis(id,d){await api('/api/admin/users/disable','POST',{user_id:id,disabled:d});loadUsers();}
 async function adm(id,a){await api('/api/admin/users/set_admin','POST',{user_id:id,is_admin:a});loadUsers();}
 async function rst(id){const p=prompt('输入新密码（至少6位）');if(!p)return;if(p.length<6){alert('至少6位');return;}const j=await api('/api/admin/users/reset_password','POST',{user_id:id,new_password:p});if(j&&j.ok){alert('已重置该用户密码');}else{alert('失败: '+((j&&j.error)||''));}}
 async function cxl(id,c){const j=await api('/api/admin/users/cancel','POST',{user_id:id,cancelled:c});if(j&&j.error==='last_admin'){alert('不能注销唯一管理员');}loadUsers();}
 async function del(id){if(!confirm('确认删除该账号？此操作不可恢复'))return;const j=await api('/api/admin/users/delete','POST',{user_id:id});if(j&&j.error){alert(({must_cancel_first:'请先注销该已激活账号',last_admin:'不能删除唯一管理员',user_not_found:'用户不存在'})[j.error]||('删除失败: '+j.error));}loadUsers();ov();}
-async function loadPushHistory(){const j=await api('/api/admin/push-history');const tb=document.querySelector('#pushhist tbody');tb.innerHTML='';(j||[]).forEach(function(r){tb.innerHTML+=`<tr><td>${r.created_at}</td><td>${r.summary}</td><td><button onclick="showPush(${r.id})">详情</button></td></tr>`;});}
+async function loadPushHistory(){const j=await api('/api/admin/push-history');const tb=document.querySelector('#pushhist tbody');tb.innerHTML='';(j||[]).forEach(function(r){tb.innerHTML+=`<tr><td>${esc(r.created_at)}</td><td>${esc(r.summary)}</td><td><button onclick="showPush(${Number(r.id)})">详情</button></td></tr>`;});}
 async function showPush(id){const r=await fetch('/api/admin/push-history/'+id);if(!r.ok){return;}const j=await r.json();const el=document.getElementById('pushdetail');el.style.display='block';el.textContent=JSON.stringify(j,null,2);}
-ov();loadCodes('unused');loadUsers();loadPushHistory();
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+async function loadKillSwitch(){const el=document.getElementById('ks');let j;try{j=await api('/api/admin/trade/kill-switch');}catch(e){j={};}if(!j)return;if(typeof j.on!=='boolean'){el.textContent='当前:读取失败,请刷新';return;}const status=j.on?`已暂停(由用户 #${esc(j.by==null?'—':j.by)} 于 ${esc(j.updated_at||'—')} 操作)`:'运行中';const label=j.on?'恢复交易':'暂停全部交易';el.innerHTML=`当前:${status} <button onclick="toggleKillSwitch(${j.on?'false':'true'})">${esc(label)}</button>`;}
+async function toggleKillSwitch(on){if(on&&!confirm('暂停后所有用户都不会生成新工单、不能确认工单(回填成交不受影响)。确定?'))return;let j;try{j=await api('/api/admin/trade/kill-switch','POST',{on});}catch(e){j={error:'网络错误'};}if(!j||!j.ok)alert('操作失败: '+((j&&j.error)||'未知错误'));loadKillSwitch();}
+ov();loadCodes('unused');loadUsers();loadPushHistory();loadKillSwitch();
 </script></body></html>"##;
+
+/// 交易管理员总开关(计划 4a §8,4b 补留痕):打开后所有来源的信号都被拦,确认接口返回 409。
+pub async fn get_kill_switch(State(st): State<AuthState>) -> Response {
+    let conn = st.db.lock().unwrap();
+    match crate::trade::settings::kill_switch_state(&conn) {
+        Ok(s) => Json(s).into_response(),
+        Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct KillSwitchReq {
+    pub on: bool,
+}
+
+/// 操作人取自登录态(`require_login` 已注入 `Extension<CurrentUser>`),留痕于 `kill_switch_by`。
+pub async fn set_kill_switch(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<KillSwitchReq>,
+) -> Response {
+    let now = chrono::Local::now().naive_local();
+    let conn = st.db.lock().unwrap();
+    match crate::trade::settings::set_kill_switch(&conn, req.on, Some(user.id), now) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None),
+    }
+}
 
 pub async fn overview(State(st): State<AuthState>) -> Response {
     let now = chrono::Local::now().date_naive();
@@ -351,4 +386,72 @@ pub async fn overview(State(st): State<AuthState>) -> Response {
         }
     }
     Json(json!({"total": total, "active": active, "warning": warning})).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ADMIN_HTML;
+
+    #[test]
+    fn admin_html_has_kill_switch_section_before_users() {
+        for s in ["交易总开关", "/api/admin/trade/kill-switch", "暂停全部交易"] {
+            assert!(ADMIN_HTML.contains(s), "缺 {s}");
+        }
+        let ks = ADMIN_HTML.find("交易总开关").unwrap();
+        let users = ADMIN_HTML.find("<h2>用户</h2>").unwrap();
+        assert!(ks < users, "交易总开关区块应放在「用户」之前");
+    }
+
+    #[test]
+    fn admin_kill_switch_reports_read_and_write_failures() {
+        for s in [
+            "typeof j.on!=='boolean'",
+            "读取失败,请刷新",
+            "操作失败: ",
+            "!j||!j.ok",
+        ] {
+            assert!(ADMIN_HTML.contains(s), "缺 {s}");
+        }
+    }
+
+    #[test]
+    fn admin_page_escapes_server_data_in_lists() {
+        let p = ADMIN_HTML;
+        // 列表渲染必须经 esc()
+        for s in [
+            "esc(c.code)",
+            "esc(u.username)",
+            "esc(r.summary)",
+            "esc(u.status)",
+            "esc(c.used_by",
+            "esc(r.created_at)",
+        ] {
+            assert!(p.contains(s), "缺 {s}");
+        }
+        assert!(
+            !p.contains("revoke('${c.code}')"),
+            "不得把授权码字符串拼进内联 JS"
+        );
+        // 授权码用 data-code 属性 + esc,配合事件委托,而不是拼进 onclick
+        assert!(
+            p.contains("data-code=\"${esc(c.code)}\""),
+            "缺 data-code 属性写法"
+        );
+        assert!(
+            p.contains("dataset.code") || p.contains("data-code"),
+            "缺事件委托读取 data-code"
+        );
+        // 数值 id 拼进内联 onclick 时应显式 Number(x)
+        for s in [
+            "ext(${Number(u.id)})",
+            "dis(${Number(u.id)}",
+            "adm(${Number(u.id)}",
+            "rst(${Number(u.id)})",
+            "cxl(${Number(u.id)}",
+            "del(${Number(u.id)})",
+            "showPush(${Number(r.id)})",
+        ] {
+            assert!(p.contains(s), "缺 {s}");
+        }
+    }
 }

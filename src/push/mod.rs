@@ -20,9 +20,14 @@ pub fn run_once(
     job::run_forced(cfg, hist, user_id)
 }
 
-/// 多用户 cron 守护。
-pub fn run_multi_daemon(conn: &Connection, warn_days: i64, grace_days: i64) -> anyhow::Result<()> {
-    schedule::run_multi(conn, warn_days, grace_days)
+/// 多用户 cron 守护。`trade` 为交易监听线程的异动接收端(未启用交易监听时为 None)。
+pub fn run_multi_daemon(
+    conn: &Connection,
+    warn_days: i64,
+    grace_days: i64,
+    trade: Option<crate::trade::daemon::MoverSink>,
+) -> anyhow::Result<()> {
+    schedule::run_multi(conn, warn_days, grace_days, trade)
 }
 
 /// 对所有授权用户强制跑一次。

@@ -140,11 +140,51 @@ fn main() -> Result<()> {
             let conn = xlh::web::auth::store::open(&auth_cfg.db_path)?;
             xlh::history::migrate(&conn)?;
             xlh::push::store::migrate(&conn)?;
+            xlh::trade::store::migrate(&conn)?;
             xlh::push::store::migrate_legacy_push(&conn, std::path::Path::new("push.toml")).ok();
+            // 配置无效时两个线程都不启动:`trade::config::get()` 在 init 失败后会
+            // 惰性回退成默认配置,若只靠它来起评估线程,就会用被拒绝配置的默认阈值
+            // 悄悄裁决策略准入/暂停——这是决定真金白银信号能否发出的判定,必须
+            // fail-closed,不能 fail-open。两个线程统一拿 init 这一次的结果。
+            let trade_cfg = match xlh::trade::config::init(&cli.config) {
+                Ok(c) => Some(c.clone()),
+                Err(e) => {
+                    eprintln!("⚠ [trade] 配置无效,交易监听与评估线程均未启用:{e}");
+                    None
+                }
+            };
             if once {
                 xlh::push::run_all_once(&conn, auth_cfg.warn_days, auth_cfg.grace_days)
             } else {
-                xlh::push::run_multi_daemon(&conn, auth_cfg.warn_days, auth_cfg.grace_days)
+                let sink = match &trade_cfg {
+                    Some(c) if c.enabled => match xlh::trade::daemon::spawn(
+                        auth_cfg.db_path.clone(),
+                        c.clone(),
+                        auth_cfg.warn_days,
+                        auth_cfg.grace_days,
+                    ) {
+                        Ok((_handle, sink)) => Some(sink),
+                        Err(e) => {
+                            eprintln!("⚠ [trade] 交易监听线程启动失败:{e}");
+                            None
+                        }
+                    },
+                    _ => None,
+                };
+                if let Some(c) = &trade_cfg {
+                    // `[trade.eval]` 嵌在 `[trade]` 之下:用户把 `[trade] enabled = false`
+                    // 理解为「两个交易相关线程都别跑」是合理预期,只看 `eval.enabled` 会让
+                    // 评估线程在总开关关闭时仍继续裁决策略的准入/暂停。
+                    if c.enabled && c.eval.enabled {
+                        if let Err(e) = xlh::trade::admission::thread::spawn(
+                            auth_cfg.db_path.clone(),
+                            c.clone(),
+                        ) {
+                            eprintln!("[trade] 评估线程启动失败: {e:#}");
+                        }
+                    }
+                }
+                xlh::push::run_multi_daemon(&conn, auth_cfg.warn_days, auth_cfg.grace_days, sink)
             }
         }
         Some(Commands::Admin { action }) => match action {

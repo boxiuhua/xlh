@@ -132,6 +132,15 @@ pub fn parse(body: &str) -> Vec<Tick> {
     out
 }
 
+/// 响应是否像腾讯快照:至少含一行 `v_xxx="...~..."`。
+/// 封禁页 / 错误页 / 空响应返回 false —— 调用方应视为抓取失败,而不是「没有行情」。
+pub fn looks_like_snapshot(body: &str) -> bool {
+    body.split(';').any(|line| {
+        let line = line.trim();
+        line.starts_with("v_") && line.contains("=\"") && line.contains('~')
+    })
+}
+
 fn client() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
@@ -142,21 +151,31 @@ fn client() -> Result<reqwest::blocking::Client> {
 /// 抓一批（≤BATCH 个符号）。
 fn fetch_batch(c: &reqwest::blocking::Client, symbols: &[String]) -> Result<Vec<Tick>> {
     let url = format!("https://qt.gtimg.cn/q={}", symbols.join(","));
-    let mut last_err = None;
+    let mut last_err: Option<String> = None;
     for attempt in 0..3u32 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(300) * 2u32.pow(attempt - 1));
         }
         // 用 bytes() + lossy 而非 text()：腾讯是 GBK，text() 在未启用 charset feature 时
         // 按 UTF-8 强解。数值字段是 ASCII，lossy 后完好；名称我们本就不取。
+        // error_for_status():非 2xx(如封禁期间的 403/502)直接视为失败,不再当成有效
+        // 空报价——否则监听会把「被限流」误判成「全部停牌」,静默丢失止盈止损。
         match c
             .get(&url)
             .header("User-Agent", "Mozilla/5.0")
             .send()
+            .and_then(|r| r.error_for_status())
             .and_then(|r| r.bytes())
         {
-            Ok(b) => return Ok(parse(&String::from_utf8_lossy(&b))),
-            Err(e) => last_err = Some(e),
+            Ok(b) => {
+                let text = String::from_utf8_lossy(&b);
+                if looks_like_snapshot(&text) {
+                    return Ok(parse(&text));
+                }
+                // 2xx 但内容不像快照(限流/封禁页、空响应):同样按失败重试,不能返回 Ok(vec![])。
+                last_err = Some("腾讯快照返回无效内容(可能被限流或封禁)".to_string());
+            }
+            Err(e) => last_err = Some(format!("{e}")),
         }
     }
     Err(anyhow!("腾讯快照抓取失败(重试3次): {}", last_err.unwrap()))
@@ -282,6 +301,29 @@ mod tests {
         assert!(
             parse(r#"v_sh600519="1~n~600519~1.0";"#).is_empty(),
             "字段不足应跳过"
+        );
+    }
+
+    #[test]
+    fn looks_like_snapshot_accepts_real_and_suspended_rejects_error_pages() {
+        assert!(
+            looks_like_snapshot(SNAP),
+            "真实响应(含正常股与停牌股)应识别为快照"
+        );
+        assert!(
+            looks_like_snapshot(
+                r#"v_sz000003="51~PT����A~000003~2.71~2.71~0.00~0~~20260716090000~";"#
+            ),
+            "单条停牌行也应识别为快照"
+        );
+        assert!(!looks_like_snapshot(""), "空响应不是快照");
+        assert!(
+            !looks_like_snapshot("<html><body>403 Forbidden</body></html>"),
+            "封禁/错误页不是快照"
+        );
+        assert!(
+            !looks_like_snapshot(r#"v_pv_none_match="1";"#),
+            "无 ~ 分隔不是快照行"
         );
     }
 

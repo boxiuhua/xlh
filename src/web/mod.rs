@@ -1,6 +1,8 @@
 pub mod auth;
 pub mod page;
 pub mod stock;
+pub mod trade;
+pub mod trade_page;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
@@ -389,8 +391,11 @@ pub fn router(state: AuthState) -> Router {
         .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/login", get(page::login_html_handler))
+        .route("/trade", get(trade_page::trade_page))
+        .route("/trade/t/:id", get(trade_page::signed_ticket_page))
         .route("/api/auth/register", post(auth::handlers::register))
-        .route("/api/auth/login", post(auth::handlers::login));
+        .route("/api/auth/login", post(auth::handlers::login))
+        .merge(trade::public_routes());
 
     // 需登录（不要求授权）：logout、activate、me
     let authed = Router::new()
@@ -407,6 +412,7 @@ pub fn router(state: AuthState) -> Router {
     let licensed = core_routes::<AuthState>()
         .merge(holdings_history_routes())
         .merge(push_user_routes())
+        .merge(trade::routes())
         .route_layer(from_fn_with_state(state.clone(), auth::require_license))
         .route_layer(from_fn_with_state(state.clone(), auth::require_login));
 
@@ -481,7 +487,11 @@ async fn security_headers(
     let headers = response.headers_mut();
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     headers.insert("x-frame-options", "DENY".parse().unwrap());
-    headers.insert("referrer-policy", "same-origin".parse().unwrap());
+    // 签名链接落地页自己设了 `Referrer-Policy: no-referrer`（防止签名经 Referer 外泄，
+    // design decision 5）；这里只在 handler 未设置时才填默认值，不覆盖它。
+    if !headers.contains_key("referrer-policy") {
+        headers.insert("referrer-policy", "same-origin".parse().unwrap());
+    }
     headers.insert(
         "permissions-policy",
         "camera=(), microphone=(), geolocation=()".parse().unwrap(),
@@ -535,6 +545,7 @@ pub async fn serve(config_path: std::path::PathBuf, port: u16) -> Result<()> {
     let conn = auth::store::open(&cfg.db_path).context("打开授权数据库失败")?;
     crate::history::migrate(&conn).context("建历史表失败")?;
     crate::push::store::migrate(&conn).context("建推送配置表失败")?;
+    crate::trade::store::migrate(&conn).context("建交易表失败")?;
     crate::push::store::migrate_legacy_push(&conn, std::path::Path::new("push.toml")).ok();
     let state = auth::AuthState::new(conn, cfg);
 
@@ -1389,6 +1400,7 @@ mod tests {
         let conn = crate::web::auth::store::open_in_memory().unwrap();
         crate::history::migrate(&conn).unwrap();
         crate::push::store::migrate(&conn).unwrap();
+        crate::trade::store::migrate(&conn).unwrap();
         crate::web::auth::AuthState::new(conn, Default::default())
     }
     /// 造一个已授权用户 + 会话，返回 token。
@@ -1528,6 +1540,33 @@ mod tests {
         assert!(body.contains("/api/sync"), "应有同步端点调用");
         assert!(body.contains("数据同步"), "应有同步卡片标题");
         assert!(body.contains("id=\"sync-result\""), "应有结果区");
+    }
+
+    #[test]
+    fn index_has_manual_ticket_modal_and_entry_points() {
+        let p = crate::web::page::INDEX_HTML;
+        for s in [
+            "id=\"ticket-modal\"",
+            "/api/trade/manual",
+            "request_id",
+            "randomUUID",
+            "生成工单",
+            "按此分析生成工单",
+            "去交易页确认",
+            "/trade#pending",
+            // 按码点截断(终审 M8)
+            "Array.from(String(s)).slice(0, n).join('')",
+            "clipChars(opts.reason || '', 500)",
+            "clipChars(opts.aiNote, 8000)",
+            // 生成后锁定,重新打开才解除(终审 M6)
+            "TICKET_DONE = true;\n        setTicketLocked(true);",
+            "if (TICKET_DONE) return;",
+        ] {
+            assert!(p.contains(s), "缺 {s}");
+        }
+        for s in [".slice(0,500)", ".slice(0,8000)"] {
+            assert!(!p.contains(s), "不应按 UTF-16 码元截断: {s}");
+        }
     }
 
     #[test]
