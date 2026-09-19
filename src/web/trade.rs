@@ -12,8 +12,12 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::trade::actions::{self, ConfirmError};
-use crate::trade::model::{Account, Position, RiskRules, SignalSource, Ticket, TicketStatus};
+use crate::trade::actions::{self, CancelOutcome, ConfirmError, SubmitStrategyOutcome};
+use crate::trade::admission::scorecard::{self, Scorecard};
+use crate::trade::model::{
+    Account, EvalJob, NewStrategy, Position, RiskRules, SignalSource, StrategyDef, StrategyStatus,
+    Ticket, TicketStatus,
+};
 use crate::trade::ticket::{self as tk, Transition};
 use crate::trade::{notify, settings, store};
 use crate::web::auth::{AuthState, CurrentUser};
@@ -117,6 +121,19 @@ pub fn routes() -> Router<AuthState> {
         .route("/api/trade/positions/exit-levels", post(exit_levels))
         .route("/api/trade/positions/calibrate", post(calibrate))
         .route("/api/trade/positions/adjusts", get(adjusts))
+        .route(
+            "/api/trade/strategies",
+            get(list_strategies).post(create_strategy),
+        )
+        .route("/api/trade/strategies/:id", post(update_strategy))
+        .route("/api/trade/strategies/:id/submit", post(submit_strategy))
+        .route(
+            "/api/trade/strategies/:id/scorecard",
+            get(strategy_scorecard),
+        )
+        .route("/api/trade/strategies/:id/events", get(strategy_events))
+        .route("/api/trade/jobs", get(list_jobs))
+        .route("/api/trade/jobs/:id/cancel", post(cancel_job))
 }
 
 // ===== 概览 =====
@@ -542,6 +559,161 @@ async fn adjusts(
     Ok(Json(store::list_adjusts(&conn, user.id, ADJUSTS_LIMIT)?))
 }
 
+// ===== 策略管理、成绩单、评估任务 =====
+
+#[derive(Deserialize)]
+struct StrategyBody {
+    name: String,
+    kind: String,
+    grid_toml: String,
+    pool: Vec<String>,
+}
+
+impl StrategyBody {
+    fn into_new(self, user_id: i64) -> NewStrategy {
+        NewStrategy {
+            user_id,
+            name: self.name,
+            kind: self.kind,
+            grid_toml: self.grid_toml,
+            pool: self.pool,
+        }
+    }
+}
+
+async fn list_strategies(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+) -> ApiResult<Vec<StrategyDef>> {
+    let conn = st.db.lock().unwrap();
+    Ok(Json(store::list_strategies(&conn, user.id)?))
+}
+
+async fn create_strategy(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<StrategyBody>, JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    let Json(body) = body?;
+    let s = body.into_new(user.id);
+    store::validate_new_strategy(&s).map_err(|e| ApiError::bad(e.to_string()))?;
+    let conn = st.db.lock().unwrap();
+    let id = store::create_strategy(&conn, &s, now())?;
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn update_strategy(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<StrategyBody>, JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    let Path(id) = id?;
+    let Json(body) = body?;
+    let s = body.into_new(user.id);
+    store::validate_new_strategy(&s).map_err(|e| ApiError::bad(e.to_string()))?;
+    let conn = st.db.lock().unwrap();
+    let result = match store::update_definition(&conn, user.id, id, &s, now())? {
+        store::DefinitionUpdate::NotFound => return Err(ApiError::not_found()),
+        store::DefinitionUpdate::Unchanged => "unchanged",
+        store::DefinitionUpdate::Renamed => "renamed",
+        store::DefinitionUpdate::Reversioned => "reversioned",
+    };
+    Ok(Json(json!({ "result": result })))
+}
+
+async fn submit_strategy(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<serde_json::Value> {
+    let Path(id) = id?;
+    let conn = st.db.lock().unwrap();
+    match actions::submit_strategy(&conn, user.id, id, now())? {
+        SubmitStrategyOutcome::Queued { job_id } => {
+            Ok(Json(json!({ "result": "queued", "job_id": job_id })))
+        }
+        SubmitStrategyOutcome::Paper => Ok(Json(json!({ "result": "paper" }))),
+        SubmitStrategyOutcome::AlreadyHandled => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "already_handled",
+            "策略状态不允许提交",
+        )),
+        SubmitStrategyOutcome::NotFound => Err(ApiError::not_found()),
+    }
+}
+
+async fn strategy_scorecard(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Scorecard> {
+    let Path(id) = id?;
+    let conn = st.db.lock().unwrap();
+    let sc = scorecard::scorecard(&conn, user.id, id)?;
+    sc.map(Json).ok_or_else(ApiError::not_found)
+}
+
+#[derive(Serialize)]
+struct StatusEventView {
+    from: StrategyStatus,
+    to: StrategyStatus,
+    reason: String,
+    at: NaiveDateTime,
+}
+
+async fn strategy_events(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Vec<StatusEventView>> {
+    let Path(id) = id?;
+    let conn = st.db.lock().unwrap();
+    if store::get_strategy(&conn, user.id, id)?.is_none() {
+        return Err(ApiError::not_found());
+    }
+    let events = store::list_status_events(&conn, id, user.id)?
+        .into_iter()
+        .map(|(from, to, reason, at)| StatusEventView {
+            from,
+            to,
+            reason,
+            at,
+        })
+        .collect();
+    Ok(Json(events))
+}
+
+/// `/api/trade/jobs` 最多返回的评估任务数(spec:最近 50 个)。
+const JOBS_LIMIT: usize = 50;
+
+async fn list_jobs(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+) -> ApiResult<Vec<EvalJob>> {
+    let conn = st.db.lock().unwrap();
+    Ok(Json(store::list_jobs(&conn, user.id, JOBS_LIMIT)?))
+}
+
+async fn cancel_job(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<serde_json::Value> {
+    let Path(id) = id?;
+    let conn = st.db.lock().unwrap();
+    match actions::cancel_job(&conn, user.id, id, now())? {
+        CancelOutcome::Cancelled => Ok(Json(json!({ "result": "cancelled" }))),
+        CancelOutcome::Requested => Ok(Json(json!({ "result": "requested" }))),
+        CancelOutcome::NotCancellable => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "not_cancellable",
+            "任务已结束,不可取消",
+        )),
+        CancelOutcome::NotFound => Err(ApiError::not_found()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,6 +732,17 @@ mod tests {
     fn seed_user(st: &AuthState, name: &str, token: &str) -> i64 {
         let c = st.db.lock().unwrap();
         let uid = crate::web::auth::store::create_user(&c, name, "h", false).unwrap();
+        let today = chrono::Local::now().date_naive();
+        crate::web::auth::store::set_expiry(&c, uid, today + chrono::Duration::days(30)).unwrap();
+        crate::web::auth::store::create_session(&c, token, uid, today + chrono::Duration::days(1))
+            .unwrap();
+        uid
+    }
+
+    /// 管理员账号(用于管理员总开关测试)。
+    fn seed_admin(st: &AuthState, name: &str, token: &str) -> i64 {
+        let c = st.db.lock().unwrap();
+        let uid = crate::web::auth::store::create_user(&c, name, "h", true).unwrap();
         let today = chrono::Local::now().date_naive();
         crate::web::auth::store::set_expiry(&c, uid, today + chrono::Duration::days(30)).unwrap();
         crate::web::auth::store::create_session(&c, token, uid, today + chrono::Duration::days(1))
@@ -990,5 +1173,174 @@ mod tests {
         )
         .await;
         assert_eq!((s, list.as_array().unwrap().len()), (StatusCode::OK, 0));
+    }
+
+    #[tokio::test]
+    async fn strategy_lifecycle_create_submit_cancel_and_scorecard() {
+        let st = state();
+        seed_user(&st, "u", "t");
+        seed_user(&st, "v", "tv");
+        let body = serde_json::json!({
+            "name": "趋势", "kind": "trend",
+            "grid_toml": "short_window = [5]\nlong_window = [20]", "pool": ["600000"]
+        });
+        let (s, r) = call(
+            &st,
+            "POST",
+            "/api/trade/strategies",
+            "t",
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{r}");
+        let id = r["id"].as_i64().unwrap();
+        let (s, _) = call(&st, "POST", "/api/trade/strategies", "t",
+            Some(serde_json::json!({"name": "x", "kind": "nope", "grid_toml": "a = [1]", "pool": ["600000"]}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        let (s, r) = call(
+            &st,
+            "POST",
+            &format!("/api/trade/strategies/{id}/submit"),
+            "t",
+            None,
+        )
+        .await;
+        assert_eq!((s, r["result"].as_str()), (StatusCode::OK, Some("queued")));
+        let job = r["job_id"].as_i64().unwrap();
+        let (s, _) = call(
+            &st,
+            "POST",
+            &format!("/api/trade/strategies/{id}/submit"),
+            "t",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT);
+
+        let (_, jobs) = call(&st, "GET", "/api/trade/jobs", "t", None).await;
+        assert_eq!(jobs.as_array().unwrap().len(), 1);
+        let (_, jobs_v) = call(&st, "GET", "/api/trade/jobs", "tv", None).await;
+        assert!(jobs_v.as_array().unwrap().is_empty(), "按用户隔离");
+        let (s, _) = call(
+            &st,
+            "POST",
+            &format!("/api/trade/jobs/{job}/cancel"),
+            "tv",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, r) = call(
+            &st,
+            "POST",
+            &format!("/api/trade/jobs/{job}/cancel"),
+            "t",
+            None,
+        )
+        .await;
+        assert_eq!(
+            (s, r["result"].as_str()),
+            (StatusCode::OK, Some("cancelled"))
+        );
+
+        let (s, sc) = call(
+            &st,
+            "GET",
+            &format!("/api/trade/strategies/{id}/scorecard"),
+            "t",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(sc["status"], "failed");
+        let (s, _) = call(
+            &st,
+            "GET",
+            &format!("/api/trade/strategies/{id}/scorecard"),
+            "tv",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (_, ev) = call(
+            &st,
+            "GET",
+            &format!("/api/trade/strategies/{id}/events"),
+            "t",
+            None,
+        )
+        .await;
+        assert!(ev.as_array().unwrap().len() >= 2);
+
+        let mut renamed = body.clone();
+        renamed["name"] = serde_json::json!("趋势2");
+        let (_, r) = call(
+            &st,
+            "POST",
+            &format!("/api/trade/strategies/{id}"),
+            "t",
+            Some(renamed),
+        )
+        .await;
+        assert_eq!(r["result"], "renamed");
+
+        // 列表应能看到该用户的策略。
+        let (s, list) = call(&st, "GET", "/api/trade/strategies", "t", None).await;
+        assert_eq!((s, list.as_array().unwrap().len()), (StatusCode::OK, 1));
+        let (_, list_v) = call(&st, "GET", "/api/trade/strategies", "tv", None).await;
+        assert!(list_v.as_array().unwrap().is_empty(), "按用户隔离");
+
+        // 不存在的策略更新 → 404。
+        let (s, _) = call(&st, "POST", "/api/trade/strategies/999999", "t", Some(body)).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn kill_switch_admin_only() {
+        let st = state();
+        seed_user(&st, "u", "t");
+        let (s, _) = call(
+            &st,
+            "POST",
+            "/api/admin/trade/kill-switch",
+            "t",
+            Some(serde_json::json!({"on": true})),
+        )
+        .await;
+        assert_ne!(s, StatusCode::OK, "普通用户不可操作");
+        let (s, _) = call(&st, "GET", "/api/admin/trade/kill-switch", "t", None).await;
+        assert_ne!(s, StatusCode::OK, "普通用户不可查看");
+
+        seed_admin(&st, "root", "ta");
+        let (s, r) = call(
+            &st,
+            "POST",
+            "/api/admin/trade/kill-switch",
+            "ta",
+            Some(serde_json::json!({"on": true})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{r}");
+        assert_eq!(r["ok"], true);
+        let (s, r) = call(&st, "GET", "/api/admin/trade/kill-switch", "ta", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(r["on"], true);
+
+        // 普通用户 overview 的 kill_switch 应为 true(全局开关)。
+        let (_, ov) = call(&st, "GET", "/api/trade/overview", "t", None).await;
+        assert_eq!(ov["kill_switch"], true);
+
+        let (s, r) = call(
+            &st,
+            "POST",
+            "/api/admin/trade/kill-switch",
+            "ta",
+            Some(serde_json::json!({"on": false})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{r}");
+        let (_, r) = call(&st, "GET", "/api/admin/trade/kill-switch", "ta", None).await;
+        assert_eq!(r["on"], false);
     }
 }

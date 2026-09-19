@@ -334,6 +334,32 @@ async function showPush(id){const r=await fetch('/api/admin/push-history/'+id);i
 ov();loadCodes('unused');loadUsers();loadPushHistory();
 </script></body></html>"##;
 
+/// 交易管理员总开关(计划 4a §8):打开后所有来源的信号都被拦,确认接口返回 409。
+pub async fn get_kill_switch(State(st): State<AuthState>) -> Response {
+    let conn = st.db.lock().unwrap();
+    match crate::trade::settings::kill_switch(&conn) {
+        Ok(on) => Json(json!({ "on": on })).into_response(),
+        Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct KillSwitchReq {
+    pub on: bool,
+}
+
+pub async fn set_kill_switch(
+    State(st): State<AuthState>,
+    Json(req): Json<KillSwitchReq>,
+) -> Response {
+    let now = chrono::Local::now().naive_local();
+    let conn = st.db.lock().unwrap();
+    match crate::trade::settings::set_kill_switch(&conn, req.on, now) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None),
+    }
+}
+
 pub async fn overview(State(st): State<AuthState>) -> Response {
     let now = chrono::Local::now().date_naive();
     let conn = st.db.lock().unwrap();

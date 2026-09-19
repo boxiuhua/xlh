@@ -28,6 +28,10 @@ pub fn admin_router() -> Router<AuthState> {
             "/api/admin/push-history/:id",
             get(admin::push_history_detail),
         )
+        .route(
+            "/api/admin/trade/kill-switch",
+            get(admin::get_kill_switch).post(admin::set_kill_switch),
+        )
 }
 
 #[cfg(test)]
