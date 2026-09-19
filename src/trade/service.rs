@@ -1,5 +1,6 @@
 //! 信号提交全流程:入库去重 → 收集闸门输入 → 判定 → 生成工单 → 模拟盘即时成交。
 
+use crate::event::Direction;
 use crate::trade::gate::{self, Admission, GateDecision, GateInput, GateReject};
 use crate::trade::model::{Account, NewSignal, Quote, TicketStatus};
 use crate::trade::router;
@@ -58,7 +59,10 @@ pub fn submit_signal(
 
     let admission = resolve_admission(&tx, sig)?;
 
-    let rules = store::get_risk_rules(&tx, sig.user_id)?;
+    let mut rules = store::get_risk_rules(&tx, sig.user_id)?;
+    if crate::trade::settings::kill_switch(&tx)? {
+        rules.enabled = false;
+    }
     let real_account = store::get_account(&tx, sig.user_id, Account::Real)?;
     let mut paper_account = store::get_account(&tx, sig.user_id, Account::Paper)?;
     if paper_account.is_none() {
@@ -76,6 +80,24 @@ pub fn submit_signal(
     let real_reserved_cash = ticket::reserved_cash(&tx, sig.user_id, Account::Real)?;
     let paper_reserved_cash = ticket::reserved_cash(&tx, sig.user_id, Account::Paper)?;
 
+    // 绑定策略的卖出:每个账户只能卖该策略自己买入的部分(计划 4a 设计裁决 6)
+    let cap = |account| -> Result<Option<u64>> {
+        match (sig.side, sig.strategy_id) {
+            (Direction::Sell, Some(sid)) => {
+                Ok(Some(crate::trade::admission::stats::strategy_net_qty(
+                    &tx,
+                    sig.user_id,
+                    sid,
+                    account,
+                    &sig.code,
+                )?))
+            }
+            _ => Ok(None),
+        }
+    };
+    let real_strategy_cap = cap(Account::Real)?;
+    let paper_strategy_cap = cap(Account::Paper)?;
+
     let decision = gate::evaluate(&GateInput {
         signal: sig,
         quote: ctx.quote,
@@ -87,6 +109,8 @@ pub fn submit_signal(
         paper_position: paper_position.as_ref(),
         real_reserved_cash,
         paper_reserved_cash,
+        real_strategy_cap,
+        paper_strategy_cap,
         has_open_ticket,
         last_signal_at,
         tickets_today,
@@ -311,5 +335,104 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// 计划 4a 设计裁决 6:绑定策略的卖出信号,实盘持仓 1000 股,但该策略自己只买了
+    /// 200 股 → 实盘工单数量应被限成 200(不能连用户手动买入的部分一并卖掉)。
+    #[test]
+    fn strategy_sell_ticket_is_capped_by_the_strategys_own_buys() {
+        let mut c = db();
+        let id = paper_strategy(&c);
+        state::update_status(
+            &c,
+            1,
+            id,
+            StrategyStatus::Paper,
+            StrategyStatus::Admitted,
+            "x",
+            now(),
+        )
+        .unwrap();
+
+        // 实盘持仓 1000 股,昨日买入(今日可卖)
+        let mut pos = crate::trade::model::Position::empty(1, Account::Real, "600000");
+        pos.qty = 1000;
+        pos.avg_cost = 10.0;
+        pos.last_buy_date = Some(NaiveDate::from_ymd_opt(2026, 9, 15).unwrap());
+        store::upsert_position(&c, &pos, now()).unwrap();
+
+        // 该策略自己只买了 200 股(其余 800 股是用户手动买的,不在该策略的成交记录里)
+        let buy_sig = sig(SignalSource::Strategy, Some(id), "buy200");
+        let buy_sid = ticket::insert_signal(&c, &buy_sig, now()).unwrap().unwrap();
+        let buy_tid = ticket::create_ticket(
+            &c,
+            &NewTicket {
+                user_id: 1,
+                signal_id: buy_sid,
+                account: Account::Real,
+                code: "600000".into(),
+                side: Direction::Buy,
+                suggest_price: 10.0,
+                qty: 200,
+                expires_at: now() + chrono::Duration::minutes(30),
+                deviation_th: 0.015,
+                status: TicketStatus::Confirmed,
+                urgency: 0,
+                created_at: now(),
+            },
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO trade_fills (ticket_id, user_id, account, code, side, price, qty, fee, realized_pnl, source, filled_at)
+             VALUES (?1, 1, 'real', '600000', 'buy', 10.0, 200, 5.0, NULL, 'test', ?2)",
+            rusqlite::params![buy_tid, crate::trade::model::fmt_ts(now())],
+        )
+        .unwrap();
+
+        let mut sell = sig(SignalSource::Strategy, Some(id), "sell1");
+        sell.side = Direction::Sell;
+        let q = quote();
+        let ctx = SubmitContext {
+            quote: Some(&q),
+            now: now(),
+        };
+        let real_ticket_id = match submit_signal(&mut c, &sell, &ctx).unwrap() {
+            SubmitOutcome::Ticketed {
+                real_ticket: Some(id),
+                paper_ticket: None,
+                ..
+            } => id,
+            other => panic!("期望只生成实盘工单,实际 {other:?}"),
+        };
+        let t = ticket::get_ticket(&c, real_ticket_id).unwrap().unwrap();
+        assert_eq!(t.qty, 200, "卖出上限 = 该策略自己的净买入 200 股");
+    }
+
+    #[test]
+    fn kill_switch_rejects_every_source() {
+        let mut c = db();
+        crate::trade::settings::set_kill_switch(&c, true, now()).unwrap();
+        let q = quote();
+        let ctx = SubmitContext {
+            quote: Some(&q),
+            now: now(),
+        };
+        for (i, src) in [
+            SignalSource::Exit,
+            SignalSource::Manual,
+            SignalSource::Mover,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let s = sig(src, None, &format!("k{i}"));
+            assert!(matches!(
+                submit_signal(&mut c, &s, &ctx).unwrap(),
+                SubmitOutcome::Rejected {
+                    reason: GateReject::TradingDisabled,
+                    ..
+                }
+            ));
+        }
     }
 }

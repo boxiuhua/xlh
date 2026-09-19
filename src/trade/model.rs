@@ -239,6 +239,57 @@ impl Default for RiskRules {
     }
 }
 
+impl RiskRules {
+    /// 风控规则范围校验(计划 4a):落库前拦住非法值,阈值一律带范围校验。
+    pub fn validate(&self) -> Result<()> {
+        let in_range = |v: f64, lo: f64, hi: f64, lo_incl: bool, hi_incl: bool| {
+            v.is_finite()
+                && (if lo_incl { v >= lo } else { v > lo })
+                && (if hi_incl { v <= hi } else { v < hi })
+        };
+        if !(self.max_order_amount.is_finite() && self.max_order_amount > 0.0) {
+            return Err(anyhow!("单笔限额必须为正数: {}", self.max_order_amount));
+        }
+        if !in_range(self.max_position_pct, 0.0, 1.0, false, true) {
+            return Err(anyhow!(
+                "单只仓位占比须在 (0, 1] 之间: {}",
+                self.max_position_pct
+            ));
+        }
+        if self.max_daily_tickets < 1 {
+            return Err(anyhow!("每日工单上限须 >= 1: {}", self.max_daily_tickets));
+        }
+        if !in_range(self.daily_loss_halt_pct, 0.0, 0.5, false, true) {
+            return Err(anyhow!(
+                "日内亏损熔断比例须在 (0, 0.5] 之间: {}",
+                self.daily_loss_halt_pct
+            ));
+        }
+        if self.cooldown_min < 0 {
+            return Err(anyhow!("冷却分钟数须 >= 0: {}", self.cooldown_min));
+        }
+        if !in_range(self.deviation_th, 0.0, 0.1, false, true) {
+            return Err(anyhow!("偏离阈值须在 (0, 0.1] 之间: {}", self.deviation_th));
+        }
+        if !in_range(self.default_stop_loss_pct, 0.0, 0.5, false, true) {
+            return Err(anyhow!(
+                "默认止损比例须在 (0, 0.5] 之间: {}",
+                self.default_stop_loss_pct
+            ));
+        }
+        if !in_range(self.default_take_profit_pct, 0.0, 5.0, false, true) {
+            return Err(anyhow!(
+                "默认止盈比例须在 (0, 5] 之间: {}",
+                self.default_take_profit_pct
+            ));
+        }
+        if !in_range(self.slippage, 0.0, 0.05, true, true) {
+            return Err(anyhow!("滑点须在 [0, 0.05] 之间: {}", self.slippage));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AccountState {
     pub user_id: i64,
@@ -597,5 +648,79 @@ mod tests {
                 &["600000".into(), "000001".into()]
             )
         );
+    }
+
+    #[test]
+    fn risk_rules_validation_rejects_out_of_range_values() {
+        assert!(RiskRules::default().validate().is_ok());
+        let bad = [
+            RiskRules {
+                max_order_amount: 0.0,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                max_position_pct: 1.5,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                max_position_pct: 0.0,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                max_daily_tickets: 0,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                daily_loss_halt_pct: 0.0,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                daily_loss_halt_pct: 0.6,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                cooldown_min: -1,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                deviation_th: 0.0,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                deviation_th: 0.2,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                default_stop_loss_pct: 0.0,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                default_stop_loss_pct: 0.6,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                default_take_profit_pct: 0.0,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                default_take_profit_pct: 5.1,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                slippage: -0.01,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                slippage: 0.06,
+                ..RiskRules::default()
+            },
+            RiskRules {
+                max_order_amount: f64::NAN,
+                ..RiskRules::default()
+            },
+        ];
+        for r in bad {
+            assert!(r.validate().is_err(), "{r:?}");
+        }
     }
 }

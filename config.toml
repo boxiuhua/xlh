@@ -56,6 +56,7 @@ max_push_per_tick = 5
 # monitor_interval_secs = 15    # 交易时段报价轮询间隔(秒)
 # alert_after_secs = 180        # 连续失败多久推送「止损监听中断」
 # mover_signals = true          # 实时异动转为观察期(仅模拟盘)交易信号
+# link_base_url = ""            # 推送工单链接的站点根地址(如 https://xlh.example.com),空则不带链接
 
 # [trade.eval]
 # enabled = true       # 是否启动策略评估线程

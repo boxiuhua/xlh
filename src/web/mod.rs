@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod page;
 pub mod stock;
+pub mod trade;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
@@ -390,7 +391,8 @@ pub fn router(state: AuthState) -> Router {
         .route("/healthz", get(healthz))
         .route("/login", get(page::login_html_handler))
         .route("/api/auth/register", post(auth::handlers::register))
-        .route("/api/auth/login", post(auth::handlers::login));
+        .route("/api/auth/login", post(auth::handlers::login))
+        .merge(trade::public_routes());
 
     // 需登录（不要求授权）：logout、activate、me
     let authed = Router::new()
@@ -407,6 +409,7 @@ pub fn router(state: AuthState) -> Router {
     let licensed = core_routes::<AuthState>()
         .merge(holdings_history_routes())
         .merge(push_user_routes())
+        .merge(trade::routes())
         .route_layer(from_fn_with_state(state.clone(), auth::require_license))
         .route_layer(from_fn_with_state(state.clone(), auth::require_login));
 

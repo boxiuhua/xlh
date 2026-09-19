@@ -1,12 +1,15 @@
 //! 交易表结构与账户 / 风控 / 持仓读写。所有查询按 user_id 隔离。
 
+use crate::event::Direction;
 use crate::trade::model::{
-    fmt_ts, parse_ts, strategy_version_hash, Account, AccountState, EvalJob, EvalKind, JobStatus,
-    NewStrategy, Position, Quote, RiskRules, StrategyDef, StrategyStatus, DATE_FMT,
+    fmt_ts, parse_side, parse_ts, strategy_version_hash, Account, AccountState, EvalJob, EvalKind,
+    JobStatus, NewStrategy, Position, Quote, RiskRules, SignalSource, StrategyDef, StrategyStatus,
+    DATE_FMT,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{NaiveDate, NaiveDateTime};
 use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde::Serialize;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS trade_accounts (
@@ -161,6 +164,12 @@ CREATE TABLE IF NOT EXISTS trade_calendar (
   checked_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS trade_settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS trade_strategy_plans (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id      INTEGER NOT NULL,
@@ -180,6 +189,18 @@ CREATE TABLE IF NOT EXISTS trade_strategy_plans (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_strategy_plans_key
   ON trade_strategy_plans(strategy_id, code, basis_date);
 CREATE INDEX IF NOT EXISTS idx_trade_strategy_plans_status ON trade_strategy_plans(status, basis_date);
+
+CREATE TABLE IF NOT EXISTS trade_position_adjusts (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     INTEGER NOT NULL,
+  account     TEXT NOT NULL,
+  code        TEXT NOT NULL,
+  before_json TEXT,
+  after_json  TEXT,
+  reason      TEXT NOT NULL,
+  at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trade_position_adjusts_user ON trade_position_adjusts(user_id, id);
 "#;
 
 /// 表已存在但缺列时补建:`CREATE TABLE IF NOT EXISTS` 对已存在的旧表是空操作,
@@ -209,6 +230,13 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'both'",
     )
     .context("补建 trade_signals.scope 失败")?;
+    ensure_column(
+        conn,
+        "trade_eval_jobs",
+        "cancel_requested",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .context("补建 trade_eval_jobs.cancel_requested 失败")?;
     Ok(())
 }
 
@@ -296,6 +324,7 @@ pub fn save_risk_rules(
     rules: &RiskRules,
     now: NaiveDateTime,
 ) -> Result<()> {
+    rules.validate()?;
     conn.execute(
         "INSERT INTO trade_risk_rules (user_id, rules_json, updated_at) VALUES (?1, ?2, ?3)
          ON CONFLICT(user_id) DO UPDATE SET rules_json = excluded.rules_json, updated_at = excluded.updated_at",
@@ -424,6 +453,95 @@ pub fn upsert_position(conn: &Connection, p: &Position, now: NaiveDateTime) -> R
         ],
     )?;
     Ok(())
+}
+
+/// 删除一行持仓(实盘持仓校准归零用)。返回是否确有该行。
+pub fn delete_position(
+    conn: &Connection,
+    user_id: i64,
+    account: Account,
+    code: &str,
+) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM trade_positions WHERE user_id = ?1 AND account = ?2 AND code = ?3",
+        params![user_id, account.as_str(), code],
+    )?;
+    Ok(n > 0)
+}
+
+/// 持仓校准留痕(计划 4a):改前 / 改后各以 `Position` 的 JSON 快照存,没有则 NULL。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PositionAdjust {
+    pub id: i64,
+    pub code: String,
+    pub before: Option<serde_json::Value>,
+    pub after: Option<serde_json::Value>,
+    pub reason: String,
+    pub at: NaiveDateTime,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_position_adjust(
+    conn: &Connection,
+    user_id: i64,
+    account: Account,
+    code: &str,
+    before: Option<serde_json::Value>,
+    after: Option<serde_json::Value>,
+    reason: &str,
+    now: NaiveDateTime,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO trade_position_adjusts (user_id, account, code, before_json, after_json, reason, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            user_id,
+            account.as_str(),
+            code,
+            before.map(|v| v.to_string()),
+            after.map(|v| v.to_string()),
+            reason,
+            fmt_ts(now),
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn list_adjusts(conn: &Connection, user_id: i64, limit: usize) -> Result<Vec<PositionAdjust>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, code, before_json, after_json, reason, at FROM trade_position_adjusts
+         WHERE user_id = ?1 ORDER BY id DESC LIMIT ?2",
+    )?;
+    let raws = stmt
+        .query_map(params![user_id, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    raws.into_iter()
+        .map(|(id, code, before, after, reason, at)| {
+            Ok(PositionAdjust {
+                id,
+                code,
+                before: before
+                    .map(|s| serde_json::from_str(&s))
+                    .transpose()
+                    .context("持仓校准前值格式错误")?,
+                after: after
+                    .map(|s| serde_json::from_str(&s))
+                    .transpose()
+                    .context("持仓校准后值格式错误")?,
+                reason,
+                at: parse_ts(&at)?,
+            })
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -603,6 +721,70 @@ pub fn last_beat(conn: &Connection, name: &str) -> Result<Option<NaiveDateTime>>
         )
         .optional()?;
     s.as_deref().map(parse_ts).transpose()
+}
+
+/// 信号来源(工单列表展示用);信号不存在返回 None。
+pub fn signal_source(conn: &Connection, signal_id: i64) -> Result<Option<SignalSource>> {
+    let s: Option<String> = conn
+        .query_row(
+            "SELECT source FROM trade_signals WHERE id = ?1",
+            [signal_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    s.as_deref().map(SignalSource::parse).transpose()
+}
+
+/// 被闸门拦下的信号(计划 4a:让用户看到「为什么没出工单」)。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RejectedSignal {
+    pub id: i64,
+    pub source: SignalSource,
+    pub code: String,
+    pub side: Direction,
+    pub reason: String,
+    pub reject_reason: Option<String>,
+    pub created_at: NaiveDateTime,
+}
+
+/// 该用户最近被拒的信号,按 id 倒序,最多 `limit` 条。
+pub fn list_rejected_signals(
+    conn: &Connection,
+    user_id: i64,
+    limit: usize,
+) -> Result<Vec<RejectedSignal>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, source, code, side, reason, reject_reason, created_at FROM trade_signals
+         WHERE user_id = ?1 AND status = 'rejected' ORDER BY id DESC LIMIT ?2",
+    )?;
+    let raws = stmt
+        .query_map(params![user_id, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    raws.into_iter()
+        .map(
+            |(id, source, code, side, reason, reject_reason, created_at)| {
+                Ok(RejectedSignal {
+                    id,
+                    source: SignalSource::parse(&source)?,
+                    code,
+                    side: parse_side(&side)?,
+                    reason,
+                    reject_reason,
+                    created_at: parse_ts(&created_at)?,
+                })
+            },
+        )
+        .collect()
 }
 
 #[allow(clippy::type_complexity)]
@@ -1189,6 +1371,17 @@ pub fn list_jobs(conn: &Connection, user_id: i64, limit: usize) -> Result<Vec<Ev
     raws.into_iter().map(to_job).collect()
 }
 
+/// 任务是否被标记为待取消(评估取消,design decision 7)。不按 user_id 隔离:
+/// 只供 worker 的 `on_code` 闭包高频轮询,归属校验已在 `cancel_job` 写入时做过。
+pub fn job_cancel_requested(conn: &Connection, job_id: i64) -> Result<bool> {
+    let flag: i64 = conn.query_row(
+        "SELECT cancel_requested FROM trade_eval_jobs WHERE id = ?1",
+        params![job_id],
+        |r| r.get(0),
+    )?;
+    Ok(flag != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1355,7 +1548,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 14);
+        assert_eq!(n, 16);
     }
 
     #[test]

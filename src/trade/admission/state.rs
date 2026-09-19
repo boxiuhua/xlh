@@ -92,6 +92,20 @@ pub fn submit_for_backtest(
     id: i64,
     now: NaiveDateTime,
 ) -> Result<Transition> {
+    let tx = conn.unchecked_transaction()?;
+    let transition = submit_for_backtest_in(&tx, user_id, id, now)?;
+    tx.commit()?;
+    Ok(transition)
+}
+
+/// `submit_for_backtest` 的事务内版本:调用方持有事务并负责提交,
+/// 供 `actions::submit_strategy` 把状态转换与入队放进同一个事务。
+pub fn submit_for_backtest_in(
+    conn: &Connection,
+    user_id: i64,
+    id: i64,
+    now: NaiveDateTime,
+) -> Result<Transition> {
     let Some(s) = store::get_strategy(conn, user_id, id)? else {
         return Ok(Transition::AlreadyHandled);
     };
@@ -111,10 +125,37 @@ pub fn submit_for_backtest(
         StrategyStatus::Suspended,
     ] {
         if s.status == expect {
-            return update_status(conn, user_id, id, expect, to, reason, now);
+            return transition_status(conn, user_id, id, expect, to, reason, now);
         }
     }
     Ok(Transition::AlreadyHandled)
+}
+
+/// 评估取消(design decision 7):被取消的首次回测不能滞留 `Backtesting`。
+/// 排队中的任务被 `actions::cancel_job` 直接判失败、运行中的任务被
+/// `admission::worker` 的 `on_code` 中止,两处都要把仍在 `Backtesting` 的策略
+/// 推回 `Failed`——共享一处定义,避免原因文案与判断逻辑在两个文件里各写一份。
+/// 策略已经离开 `Backtesting`(不存在、或已被别的路径转走)时什么都不做。
+pub fn fail_cancelled_backtest(
+    conn: &Connection,
+    user_id: i64,
+    strategy_id: i64,
+    now: NaiveDateTime,
+) -> Result<()> {
+    if let Some(s) = store::get_strategy(conn, user_id, strategy_id)? {
+        if s.status == StrategyStatus::Backtesting {
+            update_status(
+                conn,
+                user_id,
+                strategy_id,
+                StrategyStatus::Backtesting,
+                StrategyStatus::Failed,
+                "用户取消前推回测",
+                now,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// 落库回测结论并推进状态:通过 → 观察期,不通过 → 未通过。
