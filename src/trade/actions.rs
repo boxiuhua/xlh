@@ -200,9 +200,25 @@ pub fn calibrate_position(
     let after: Option<Position> = if c.qty == 0 {
         None
     } else {
-        let mut p = before
-            .clone()
-            .unwrap_or_else(|| Position::empty(user_id, Account::Real, &c.code));
+        let mut p = match &before {
+            Some(p) => p.clone(),
+            None => {
+                // 新建持仓:与 `record_fill` 首次建仓同口径,套用用户的默认止损 / 止盈
+                // (以成本价为基准,按价格精度取整);已有持仓保持原止盈止损。
+                let rules = store::get_risk_rules(&tx, user_id)?;
+                let decimals = crate::stock::ashare::price_decimals(&c.code);
+                let mut p = Position::empty(user_id, Account::Real, &c.code);
+                p.stop_loss = Some(ticket::round_dec(
+                    c.avg_cost * (1.0 - rules.default_stop_loss_pct),
+                    decimals,
+                ));
+                p.take_profit = Some(ticket::round_dec(
+                    c.avg_cost * (1.0 + rules.default_take_profit_pct),
+                    decimals,
+                ));
+                p
+            }
+        };
         p.today_bought_qty = p.today_bought_qty.min(c.qty);
         p.qty = c.qty;
         p.avg_cost = c.avg_cost;
@@ -589,6 +605,47 @@ mod tests {
         assert!(
             store::list_adjusts(&c, 2, 10).unwrap().is_empty(),
             "按用户隔离"
+        );
+    }
+
+    /// 校准新建的实盘持仓套用用户的默认止损 / 止盈(以成本价为基准,按价格精度取整,
+    /// 与 `record_fill` 首次建仓同口径);已有持仓的止盈止损保持不变。
+    #[test]
+    fn calibration_new_position_gets_default_exit_levels_existing_keeps_them() {
+        let mut c = db();
+        let cal = |qty: u64, avg_cost: f64| Calibration {
+            code: "600000".into(),
+            qty,
+            avg_cost,
+            reason: "券商对账".into(),
+        };
+        calibrate_position(&mut c, 1, &cal(1000, 10.37), at(15, 0, 0)).unwrap();
+        let p = store::get_position(&c, 1, Account::Real, "600000")
+            .unwrap()
+            .unwrap();
+        // 默认 8% / 20%:10.37 × 0.92 = 9.5404 → 9.54;10.37 × 1.2 = 12.444 → 12.44
+        assert_eq!((p.stop_loss, p.take_profit), (Some(9.54), Some(12.44)));
+
+        store::set_exit_levels(
+            &c,
+            1,
+            Account::Real,
+            "600000",
+            Some(9.0),
+            Some(13.0),
+            None,
+            at(15, 0, 30),
+        )
+        .unwrap();
+        calibrate_position(&mut c, 1, &cal(1500, 11.0), at(15, 1, 0)).unwrap();
+        let p = store::get_position(&c, 1, Account::Real, "600000")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.qty, 1500);
+        assert_eq!(
+            (p.stop_loss, p.take_profit),
+            (Some(9.0), Some(13.0)),
+            "已有持仓保持原止盈止损"
         );
     }
 
