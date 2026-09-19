@@ -335,8 +335,8 @@ async function del(id){if(!confirm('确认删除该账号？此操作不可恢�
 async function loadPushHistory(){const j=await api('/api/admin/push-history');const tb=document.querySelector('#pushhist tbody');tb.innerHTML='';(j||[]).forEach(function(r){tb.innerHTML+=`<tr><td>${r.created_at}</td><td>${r.summary}</td><td><button onclick="showPush(${r.id})">详情</button></td></tr>`;});}
 async function showPush(id){const r=await fetch('/api/admin/push-history/'+id);if(!r.ok){return;}const j=await r.json();const el=document.getElementById('pushdetail');el.style.display='block';el.textContent=JSON.stringify(j,null,2);}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
-async function loadKillSwitch(){const j=await api('/api/admin/trade/kill-switch');if(!j)return;const el=document.getElementById('ks');const status=j.on?`已暂停(由用户 #${esc(j.by==null?'—':j.by)} 于 ${esc(j.updated_at||'—')} 操作)`:'运行中';const label=j.on?'恢复交易':'暂停全部交易';el.innerHTML=`当前:${status} <button onclick="toggleKillSwitch(${j.on?'false':'true'})">${esc(label)}</button>`;}
-async function toggleKillSwitch(on){if(on&&!confirm('暂停后所有用户都不会生成新工单、不能确认工单(回填成交不受影响)。确定?'))return;await api('/api/admin/trade/kill-switch','POST',{on});loadKillSwitch();}
+async function loadKillSwitch(){const el=document.getElementById('ks');let j;try{j=await api('/api/admin/trade/kill-switch');}catch(e){j={};}if(!j)return;if(typeof j.on!=='boolean'){el.textContent='当前:读取失败,请刷新';return;}const status=j.on?`已暂停(由用户 #${esc(j.by==null?'—':j.by)} 于 ${esc(j.updated_at||'—')} 操作)`:'运行中';const label=j.on?'恢复交易':'暂停全部交易';el.innerHTML=`当前:${status} <button onclick="toggleKillSwitch(${j.on?'false':'true'})">${esc(label)}</button>`;}
+async function toggleKillSwitch(on){if(on&&!confirm('暂停后所有用户都不会生成新工单、不能确认工单(回填成交不受影响)。确定?'))return;let j;try{j=await api('/api/admin/trade/kill-switch','POST',{on});}catch(e){j={error:'网络错误'};}if(!j||!j.ok)alert('操作失败: '+((j&&j.error)||'未知错误'));loadKillSwitch();}
 ov();loadCodes('unused');loadUsers();loadPushHistory();loadKillSwitch();
 </script></body></html>"##;
 
@@ -399,5 +399,17 @@ mod tests {
         let ks = ADMIN_HTML.find("交易总开关").unwrap();
         let users = ADMIN_HTML.find("<h2>用户</h2>").unwrap();
         assert!(ks < users, "交易总开关区块应放在「用户」之前");
+    }
+
+    #[test]
+    fn admin_kill_switch_reports_read_and_write_failures() {
+        for s in [
+            "typeof j.on!=='boolean'",
+            "读取失败,请刷新",
+            "操作失败: ",
+            "!j||!j.ok",
+        ] {
+            assert!(ADMIN_HTML.contains(s), "缺 {s}");
+        }
     }
 }
