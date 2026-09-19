@@ -391,6 +391,18 @@ impl StrategyStatus {
         }
     }
 
+    /// 中文文案,与交易页 `STRATEGY_STATUS` 保持一致(日报等推送用)。
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            StrategyStatus::Draft => "草稿",
+            StrategyStatus::Backtesting => "回测中",
+            StrategyStatus::Failed => "未通过",
+            StrategyStatus::Paper => "观察期",
+            StrategyStatus::Admitted => "已准入",
+            StrategyStatus::Suspended => "已暂停",
+        }
+    }
+
     pub fn parse(s: &str) -> Result<Self> {
         Ok(match s {
             "draft" => StrategyStatus::Draft,

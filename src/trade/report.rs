@@ -285,6 +285,31 @@ fn push_holding_line(md: &mut String, label: &str, h: &HoldingSummary) {
     md.push('\n');
 }
 
+/// 模拟盘成交最多列出的笔数(实盘成交不设上限)。
+const MAX_PAPER_FILL_LINES: usize = 10;
+/// 被拦截信号最多列出的原因种类数。
+const MAX_REJECT_LINES: usize = 5;
+/// 策略状态变化最多列出的条数。
+const MAX_STRATEGY_CHANGE_LINES: usize = 10;
+
+fn fill_line(f: &FillLine) -> String {
+    let mut line = format!(
+        "- {} {} {}",
+        account_label(f.account),
+        side_label(f.side),
+        f.code
+    );
+    if let Some(name) = &f.name {
+        line.push(' ');
+        line.push_str(name);
+    }
+    line.push_str(&format!(" {} 股 @ {:.2}(费 {:.2})", f.qty, f.price, f.fee));
+    if let Some(pnl) = f.realized_pnl {
+        line.push_str(&format!(",已实现盈亏 {pnl:+.2}"));
+    }
+    line
+}
+
 /// 渲染为 (标题, Markdown 正文)。只陈述系统记录的统计事实,不出现任何
 /// 「建议买入 / 建议卖出」措辞(设计裁决 2,spec §15 合规);没有内容的节省略。
 pub fn render_daily_report(r: &DailyReport) -> (String, String) {
@@ -294,30 +319,30 @@ pub fn render_daily_report(r: &DailyReport) -> (String, String) {
     let c = &r.real_tickets;
     if c.created > 0 {
         md.push_str(&format!(
-            "#### 今日工单\n\n- 实盘工单共 {} 张:待确认 {}、已确认待成交 {}、已成交 {}、已过期 {}、已忽略 {}、已撤销 {}\n\n",
+            "#### 今日工单\n\n- 实盘工单共 {} 张:待确认 {}、待成交(含部分成交) {}、已成交 {}、已过期 {}、已拒绝 {}、已取消 {}\n\n",
             c.created, c.open, c.confirmed, c.filled, c.expired, c.ignored, c.cancelled
         ));
     }
 
     if !r.fills.is_empty() {
         md.push_str("#### 今日成交\n\n");
+        // 实盘成交全部列出(需要线下核对);模拟盘成交可能很多,只列前若干笔,
+        // 余下给出笔数——正文过长会被推送渠道(如企业微信 markdown 4096 字节)拒收。
+        let mut paper_listed = 0;
+        let mut paper_omitted = 0;
         for f in &r.fills {
-            let mut line = format!(
-                "- {} {} {}",
-                account_label(f.account),
-                side_label(f.side),
-                f.code
-            );
-            if let Some(name) = &f.name {
-                line.push(' ');
-                line.push_str(name);
+            if f.account == Account::Paper {
+                if paper_listed >= MAX_PAPER_FILL_LINES {
+                    paper_omitted += 1;
+                    continue;
+                }
+                paper_listed += 1;
             }
-            line.push_str(&format!(" {} 股 @ {:.2}(费 {:.2})", f.qty, f.price, f.fee));
-            if let Some(pnl) = f.realized_pnl {
-                line.push_str(&format!(",已实现盈亏 {pnl:+.2}"));
-            }
-            md.push_str(&line);
+            md.push_str(&fill_line(f));
             md.push('\n');
+        }
+        if paper_omitted > 0 {
+            md.push_str(&format!("- 另 {paper_omitted} 笔模拟盘成交(详见交易页)\n"));
         }
         md.push('\n');
     }
@@ -335,8 +360,13 @@ pub fn render_daily_report(r: &DailyReport) -> (String, String) {
 
     if !r.rejected.is_empty() {
         md.push_str("#### 被拦截的信号\n\n");
-        for (label, n) in &r.rejected {
+        for (label, n) in r.rejected.iter().take(MAX_REJECT_LINES) {
             md.push_str(&format!("- {label} × {n}\n"));
+        }
+        let rest = &r.rejected[r.rejected.len().min(MAX_REJECT_LINES)..];
+        if !rest.is_empty() {
+            let times: usize = rest.iter().map(|(_, n)| n).sum();
+            md.push_str(&format!("- 其它 {} 类 × {times}\n", rest.len()));
         }
         md.push('\n');
     }
@@ -350,15 +380,22 @@ pub fn render_daily_report(r: &DailyReport) -> (String, String) {
 
     if !r.strategy_changes.is_empty() {
         md.push_str("#### 策略状态变化\n\n");
-        for ch in &r.strategy_changes {
+        for ch in r.strategy_changes.iter().take(MAX_STRATEGY_CHANGE_LINES) {
             md.push_str(&format!(
                 "- {}(#{}):{} → {},原因:{}\n",
                 ch.name,
                 ch.strategy_id,
-                ch.from.as_str(),
-                ch.to.as_str(),
+                ch.from.label_zh(),
+                ch.to.label_zh(),
                 ch.reason
             ));
+        }
+        let rest = r
+            .strategy_changes
+            .len()
+            .saturating_sub(MAX_STRATEGY_CHANGE_LINES);
+        if rest > 0 {
+            md.push_str(&format!("- 另 {rest} 条策略状态变化(详见交易页)\n"));
         }
         md.push('\n');
     }
@@ -762,6 +799,146 @@ mod tests {
             assert!(!md.contains(banned), "不得出现 {banned}: {md}");
         }
         assert!(md.contains("以上为系统记录的统计,不构成投资建议。"), "{md}");
+    }
+
+    fn fill(account: Account, code: String, side: Direction) -> FillLine {
+        FillLine {
+            account,
+            code,
+            name: Some("某某股份".into()),
+            side,
+            qty: 1000,
+            price: 12.34,
+            fee: 5.0,
+            realized_pnl: Some(-123.45),
+        }
+    }
+
+    #[test]
+    fn long_report_caps_paper_fills_rejections_and_strategy_changes() {
+        let mut fills: Vec<FillLine> = (0..5)
+            .map(|i| fill(Account::Real, format!("60{i:04}"), Direction::Buy))
+            .collect();
+        fills.extend((0..100).map(|i| fill(Account::Paper, format!("30{i:04}"), Direction::Sell)));
+        let rejected: Vec<(String, usize)> = (0..20)
+            .map(|i| (format!("某种相当长的拦截原因文案第{i}类"), 20 - i))
+            .collect();
+        let strategy_changes: Vec<StrategyChange> = (0..15)
+            .map(|i| StrategyChange {
+                strategy_id: i,
+                name: format!("策略{i}"),
+                from: StrategyStatus::Paper,
+                to: StrategyStatus::Admitted,
+                reason: "观察期达标".into(),
+            })
+            .collect();
+        let r = DailyReport {
+            user_id: 1,
+            date: day(23),
+            real_tickets: TicketCounts {
+                created: 5,
+                filled: 5,
+                ..TicketCounts::default()
+            },
+            fills,
+            realized_real: 0.0,
+            realized_paper: -12345.0,
+            rejected,
+            real_holdings: HoldingSummary::default(),
+            paper_holdings: HoldingSummary {
+                positions: 30,
+                market_value: 1_000_000.0,
+                cost: 990_000.0,
+                unpriced: 2,
+            },
+            strategy_changes,
+        };
+        let (_, md) = render_daily_report(&r);
+        assert!(md.len() < 4000, "正文 {} 字节,超出推送上限: {md}", md.len());
+        for i in 0..5 {
+            assert!(
+                md.contains(&format!("实盘 买入 60{i:04}")),
+                "实盘成交须全部列出: {md}"
+            );
+        }
+        assert_eq!(md.matches("- 模拟盘 卖出").count(), 10, "{md}");
+        assert!(md.contains("- 另 90 笔模拟盘成交(详见交易页)"), "{md}");
+        assert!(md.contains("第4类 × 16"), "{md}");
+        assert!(!md.contains("第5类"), "{md}");
+        assert!(md.contains("- 其它 15 类"), "{md}");
+        assert!(md.contains("策略9(#9)"), "{md}");
+        assert!(!md.contains("策略10(#10)"), "{md}");
+        assert!(md.contains("- 另 5 条策略状态变化(详见交易页)"), "{md}");
+        assert!(md.contains("以上为系统记录的统计,不构成投资建议。"), "{md}");
+    }
+
+    #[test]
+    fn short_lists_render_without_remainder_lines() {
+        let r = DailyReport {
+            user_id: 1,
+            date: day(23),
+            real_tickets: TicketCounts::default(),
+            fills: (0..10)
+                .map(|i| fill(Account::Paper, format!("30{i:04}"), Direction::Buy))
+                .collect(),
+            realized_real: 0.0,
+            realized_paper: 0.0,
+            rejected: (0..5).map(|i| (format!("原因{i}"), 1)).collect(),
+            real_holdings: HoldingSummary::default(),
+            paper_holdings: HoldingSummary::default(),
+            strategy_changes: vec![],
+        };
+        let (_, md) = render_daily_report(&r);
+        assert_eq!(md.matches("- 模拟盘 买入").count(), 10, "{md}");
+        assert!(md.contains("原因4 × 1"), "{md}");
+        assert!(!md.contains("- 另 "), "{md}");
+        assert!(!md.contains("其它"), "{md}");
+    }
+
+    #[test]
+    fn strategy_status_labels_match_trade_page() {
+        assert_eq!(StrategyStatus::Draft.label_zh(), "草稿");
+        assert_eq!(StrategyStatus::Backtesting.label_zh(), "回测中");
+        assert_eq!(StrategyStatus::Failed.label_zh(), "未通过");
+        assert_eq!(StrategyStatus::Paper.label_zh(), "观察期");
+        assert_eq!(StrategyStatus::Admitted.label_zh(), "已准入");
+        assert_eq!(StrategyStatus::Suspended.label_zh(), "已暂停");
+    }
+
+    #[test]
+    fn rendering_uses_page_wording_for_statuses() {
+        let r = DailyReport {
+            user_id: 1,
+            date: day(23),
+            real_tickets: TicketCounts {
+                created: 6,
+                open: 1,
+                confirmed: 1,
+                filled: 1,
+                expired: 1,
+                ignored: 1,
+                cancelled: 1,
+            },
+            fills: vec![],
+            realized_real: 0.0,
+            realized_paper: 0.0,
+            rejected: vec![],
+            real_holdings: HoldingSummary::default(),
+            paper_holdings: HoldingSummary::default(),
+            strategy_changes: vec![StrategyChange {
+                strategy_id: 7,
+                name: "策略A".into(),
+                from: StrategyStatus::Paper,
+                to: StrategyStatus::Admitted,
+                reason: "准入".into(),
+            }],
+        };
+        let (_, md) = render_daily_report(&r);
+        assert!(md.contains("已拒绝 1"), "{md}");
+        assert!(md.contains("已取消 1"), "{md}");
+        assert!(!md.contains("已忽略") && !md.contains("已撤销"), "{md}");
+        assert!(md.contains("策略A(#7):观察期 → 已准入,原因:准入"), "{md}");
+        assert!(!md.contains("paper") && !md.contains("admitted"), "{md}");
     }
 
     #[test]
