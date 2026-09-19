@@ -221,6 +221,105 @@ fn run_repair(conn: &Connection, through: NaiveDate, all: bool) -> Result<Repair
     Ok(report)
 }
 
+/// 回退值的审计口径:未复权日 K 收盘价。
+pub const DAILY_CLOSE_METHOD: &str = "daily_close";
+
+/// 补填 `repair` 之后仍为空的标签,在它之后调用。
+///
+/// 目标交易日:收盘为信号当日;T+N 为信号当日之后第 N 个已观测交易日
+/// (与 `repair` 同口径;信号当天全市场都没有收盘快照时也能往后数)。
+/// 取价:目标日有收盘快照就用快照(同源优先,即便 `repair` 因信号当日无
+/// 快照而跳过了该信号);没有快照且该日严格早于 `through`(已收盘、永远
+/// 不会再有快照)时,回退到 `daily_close(code, start, end)` 给出的未复权
+/// 日收盘价,审计 method 记 `daily_close`。日线也没有该日时留空,绝不写 0。
+///
+/// `daily_close` 按股票最多调用一次,仅在确有需要回退时调用;返回 None
+/// 视为无数据。只填空值,从不改已有值。
+pub fn fill_missing(
+    conn: &Connection,
+    through: NaiveDate,
+    mut daily_close: impl FnMut(&str, NaiveDate, NaiveDate) -> Option<Vec<(NaiveDate, f64)>>,
+) -> Result<RepairReport> {
+    ensure_audit_table(conn)?;
+    let tx = conn.unchecked_transaction()?;
+    let mut report = RepairReport::default();
+    let signals = load_signals(&tx, through, false)?;
+    let Some(first) = signals.iter().map(|s| s.day).min() else {
+        return Ok(report);
+    };
+    let days = sessions(&tx, first, through)?;
+    let last_finished = through.pred_opt().expect("date in range");
+    let mut first_day_of: HashMap<&str, NaiveDate> = HashMap::new();
+    for s in &signals {
+        let e = first_day_of.entry(s.code.as_str()).or_insert(s.day);
+        *e = (*e).min(s.day);
+    }
+    let mut bars: HashMap<String, HashMap<NaiveDate, f64>> = HashMap::new();
+    let mut writes = Vec::new();
+    for s in &signals {
+        if !s.trigger.is_finite() || s.trigger <= 0.0 {
+            report.skipped += 1;
+            continue;
+        }
+        // 当日有收盘快照却早于触发时刻:与 repair 一致,整条跳过
+        if close_tick(&tx, &s.code, s.day)?.is_some_and(|(ts, _)| ts < s.ts) {
+            report.skipped += 1;
+            continue;
+        }
+        let later: Vec<NaiveDate> = days.iter().copied().filter(|d| *d > s.day).collect();
+        for (slot, horizon, column) in HORIZONS {
+            if s.old[slot].is_some() {
+                continue;
+            }
+            let target_day = if horizon == 0 {
+                s.day
+            } else {
+                match later.get(horizon - 1) {
+                    Some(d) => *d,
+                    None => continue,
+                }
+            };
+            let (price, ts, method) =
+                if let Some((ts, price)) = close_tick(&tx, &s.code, target_day)? {
+                    (price, ts, TICKS_METHOD)
+                } else if target_day < through {
+                    let closes = bars.entry(s.code.clone()).or_insert_with(|| {
+                        let start = first_day_of[s.code.as_str()];
+                        daily_close(&s.code, start, last_finished)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect()
+                    });
+                    match closes.get(&target_day) {
+                        Some(p) if p.is_finite() && *p > 0.0 => {
+                            let (ts, _) = close_window(target_day);
+                            (*p, ts, DAILY_CLOSE_METHOD)
+                        }
+                        _ => continue,
+                    }
+                } else {
+                    continue;
+                };
+            let ret = price / s.trigger - 1.0;
+            writes.push((s.id, horizon, column, ret, s.trigger, price, ts, method));
+        }
+    }
+    for (id, horizon, column, ret, trigger, price, ts, method) in writes {
+        tx.execute("INSERT INTO signal_outcome_audit(signal_id,horizon,old_return,new_return,trigger_price,target_price,target_ts,repaired_at,method) VALUES (?1,?2,NULL,?3,?4,?5,?6,?7,?8)",params![id,horizon as i64,ret,trigger,price,ts,chrono::Utc::now().to_rfc3339(),method])?;
+        tx.execute(
+            &format!("UPDATE signals SET {column}=?1 WHERE id=?2 AND {column} IS NULL"),
+            params![ret, id],
+        )?;
+        match horizon {
+            0 => report.close += 1,
+            1 => report.t1 += 1,
+            _ => report.t5 += 1,
+        };
+    }
+    tx.commit()?;
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +438,87 @@ mod tests {
                 "{sql} 不应全表扫描: {plan:?}"
             );
         }
+    }
+
+    fn audit_methods(c: &Connection) -> Vec<(i64, String)> {
+        c.prepare("SELECT horizon,method FROM signal_outcome_audit ORDER BY horizon")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn missing_close_snapshot_falls_back_to_daily_close_for_finished_days() {
+        let c = store::open_in_memory().unwrap();
+        let days = six_sessions();
+        let through = days[5];
+        // 市场每日都有收盘快照(交易日已观测),但本股只在第 2–4 日有
+        for day in &days {
+            tick(&c, "000001", ts(*day, 15, 0, 0), 5.0);
+        }
+        for (i, day) in days.iter().enumerate().skip(2).take(3) {
+            tick(&c, "600519", ts(*day, 15, 0, 0), 11.0 + i as f64);
+        }
+        let id = signal(&c, "600519", ts(days[0], 10, 0, 0), 10.0, [None; 3]);
+        assert_eq!(repair(&c, through).unwrap().skipped, 1);
+        let mut calls = 0;
+        let r = fill_missing(&c, through, |code, start, end| {
+            calls += 1;
+            assert_eq!(code, "600519");
+            assert_eq!((start, end), (days[0], days[4]), "只取已结束的交易日");
+            // 第 1 日无日线(停牌),第 5 日 = through 当天的盘中价不得使用
+            Some(vec![(days[0], 20.0), (days[2], 99.0), (days[5], 30.0)])
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!((r.close, r.t1, r.t5), (1, 0, 0));
+        let [close, t1, t5] = labels(&c, id);
+        assert!((close.unwrap() - 1.0).abs() < 1e-10);
+        assert!(t1.is_none(), "日线也没有时留空,不写 0");
+        assert!(t5.is_none(), "through 当天未结束,不回退日线");
+        assert_eq!(audit_methods(&c), vec![(0, DAILY_CLOSE_METHOD.to_string())]);
+        // 再跑一次:已填的不动,留空的仍留空
+        let r = fill_missing(&c, through, |_, _, _| Some(vec![])).unwrap();
+        assert_eq!((r.close, r.t1, r.t5), (0, 0, 0));
+        assert_eq!(audit_methods(&c).len(), 1);
+    }
+
+    #[test]
+    fn fill_uses_later_snapshots_when_signal_day_has_no_session() {
+        let c = store::open_in_memory().unwrap();
+        let days = six_sessions();
+        // 信号当天守护进程没赶上收盘,全市场无收盘快照;之后每天都有
+        for (i, day) in days.iter().enumerate().skip(1) {
+            tick(&c, "600519", ts(*day, 15, 0, 0), 11.0 + i as f64);
+        }
+        let id = signal(&c, "600519", ts(days[0], 10, 0, 0), 10.0, [None; 3]);
+        repair(&c, days[5]).unwrap();
+        assert_eq!(labels(&c, id), [None; 3]);
+        let r = fill_missing(&c, days[5], |_, _, _| Some(vec![(days[0], 20.0)])).unwrap();
+        assert_eq!((r.close, r.t1, r.t5), (1, 1, 1));
+        let [close, t1, t5] = labels(&c, id);
+        assert!((close.unwrap() - 1.0).abs() < 1e-10);
+        assert!((t1.unwrap() - 0.2).abs() < 1e-10);
+        assert!((t5.unwrap() - 0.6).abs() < 1e-10);
+        let methods = audit_methods(&c);
+        assert_eq!(methods[0].1, DAILY_CLOSE_METHOD);
+        assert_eq!(methods[1].1, TICKS_METHOD);
+        assert_eq!(methods[2].1, TICKS_METHOD);
+    }
+
+    #[test]
+    fn fill_waits_for_todays_close_without_touching_the_loader() {
+        let c = store::open_in_memory().unwrap();
+        let today = d(7, 16);
+        tick(&c, "000001", ts(today, 14, 50, 0), 5.0);
+        let id = signal(&c, "600519", ts(today, 10, 0, 0), 10.0, [None; 3]);
+        let r = fill_missing(&c, today, |_, _, _| -> Option<Vec<(NaiveDate, f64)>> {
+            panic!("当天未结束,不应取日线")
+        })
+        .unwrap();
+        assert_eq!((r.close, r.t1, r.t5), (0, 0, 0));
+        assert_eq!(labels(&c, id), [None; 3]);
     }
 }
