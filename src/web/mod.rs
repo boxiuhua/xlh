@@ -1531,6 +1531,33 @@ mod tests {
     }
 
     #[test]
+    fn index_has_manual_ticket_modal_and_entry_points() {
+        let p = crate::web::page::INDEX_HTML;
+        for s in [
+            "id=\"ticket-modal\"",
+            "/api/trade/manual",
+            "request_id",
+            "randomUUID",
+            "生成工单",
+            "按此分析生成工单",
+            "去交易页确认",
+            "/trade#pending",
+            // 按码点截断(终审 M8)
+            "Array.from(String(s)).slice(0, n).join('')",
+            "clipChars(opts.reason || '', 500)",
+            "clipChars(opts.aiNote, 8000)",
+            // 生成后锁定,重新打开才解除(终审 M6)
+            "TICKET_DONE = true;\n        setTicketLocked(true);",
+            "if (TICKET_DONE) return;",
+        ] {
+            assert!(p.contains(s), "缺 {s}");
+        }
+        for s in [".slice(0,500)", ".slice(0,8000)"] {
+            assert!(!p.contains(s), "不应按 UTF-16 码元截断: {s}");
+        }
+    }
+
+    #[test]
     fn index_has_adaptive_option() {
         let body = crate::web::page::INDEX_HTML;
         assert!(

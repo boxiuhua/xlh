@@ -11,18 +11,23 @@ use chrono::{NaiveDate, NaiveDateTime};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::future::Future;
+use std::time::Duration;
 
 use crate::broker::Fee;
 use crate::event::Direction;
 use crate::stock::fee::StockFee;
-use crate::trade::actions::{self, CancelOutcome, ConfirmError, FillError, SubmitStrategyOutcome};
+use crate::trade::actions::{
+    self, CancelOutcome, ConfirmError, FillError, ManualOutcome, SubmitStrategyOutcome,
+};
 use crate::trade::admission::scorecard::{self, Scorecard};
 use crate::trade::model::{
-    Account, EvalJob, NewStrategy, Position, RiskRules, SignalSource, StrategyDef, StrategyStatus,
-    Ticket, TicketStatus,
+    Account, EvalJob, NewStrategy, Position, Quote, RiskRules, SignalSource, StrategyDef,
+    StrategyStatus, Ticket, TicketStatus,
 };
+use crate::trade::quotes::{QuoteSource, TencentQuotes};
 use crate::trade::ticket::{self as tk, Transition};
-use crate::trade::{notify, settings, store};
+use crate::trade::{monitor, settings, store};
 use crate::web::auth::config::AuthCfg;
 use crate::web::auth::model::LicenseStatus;
 use crate::web::auth::store as auth_store;
@@ -120,6 +125,7 @@ pub fn routes() -> Router<AuthState> {
         .route("/api/trade/tickets/:id/confirm", post(confirm))
         .route("/api/trade/tickets/:id/ignore", post(ignore))
         .route("/api/trade/tickets/:id/fill", post(fill))
+        .route("/api/trade/manual", post(manual_ticket))
         .route("/api/trade/signals/rejected", get(rejected_signals))
         .route("/api/trade/risk", get(get_risk).post(post_risk))
         .route("/api/trade/capital", post(set_capital))
@@ -204,13 +210,16 @@ struct TicketView {
     ai_note: Option<String>,
     /// 来自信号的来源策略。
     strategy_id: Option<i64>,
+    /// 股票名称(来自信号,4c);手动信号未填名称时为 `None`。
+    name: Option<String>,
+    /// 服务端计算的工单剩余有效秒数,下限 0(4c:倒计时以服务端为准,不再由前端解析时间字符串)。
+    expires_in_secs: i64,
 }
 
 fn ticket_view(conn: &Connection, t: Ticket, now: NaiveDateTime) -> anyhow::Result<TicketView> {
-    let source = store::signal_source(conn, t.signal_id)?;
-    // reason 的读取错误不再吞掉(4a 遗留):信号缺失等内部错误应上抛为 500,而不是静默空字符串。
-    let reason = notify::signal_reason(conn, t.signal_id)?;
-    let (ai_note, strategy_id) = store::signal_ai_note_and_strategy(conn, t.signal_id)?;
+    // 一次查询取齐信号展示元数据(4c);信号缺失等内部错误应上抛为 500,而不是静默空字符串(4a 遗留)。
+    let meta = store::signal_meta(conn, t.signal_id)?
+        .ok_or_else(|| anyhow::anyhow!("信号 {} 不存在", t.signal_id))?;
     let q = store::get_quote(conn, &t.code)?;
     let deviation = q
         .as_ref()
@@ -226,16 +235,19 @@ fn ticket_view(conn: &Connection, t: Ticket, now: NaiveDateTime) -> anyhow::Resu
         Direction::Buy => fee_model.buy_fee(est_amount),
         Direction::Sell => fee_model.sell_fee(t.qty as f64, t.suggest_price, 0),
     };
+    let expires_in_secs = (t.expires_at - now).num_seconds().max(0);
     Ok(TicketView {
+        source: Some(meta.source),
+        reason: meta.reason,
+        ai_note: meta.ai_note,
+        strategy_id: meta.strategy_id,
+        name: meta.name,
+        expires_in_secs,
         ticket: t,
-        source,
-        reason,
         quote,
         deviation,
         est_amount,
         est_fee,
-        ai_note,
-        strategy_id,
     })
 }
 
@@ -491,6 +503,116 @@ async fn fill(
         "fee": out.fee,
         "realized_pnl": out.realized_pnl,
     })))
+}
+
+// ===== 手动 / AI 工单(计划 4c) =====
+
+/// 补拉行情的超时(终审 M3):超时按获取失败处理。
+const MANUAL_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+const MANUAL_OFF_SESSION: &str = "非交易时段(交易日 9:30–11:30、13:00–15:00),无法生成工单";
+const MANUAL_NO_TODAY_QUOTE: &str = "暂无今日行情(盘前、休市或停牌),无法生成工单";
+const MANUAL_FETCH_FAILED: &str = "行情获取失败,请稍后重试";
+
+fn no_quote(msg: &str) -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, "no_quote", msg)
+}
+
+/// 手动 / AI 建议下单入口(design decision 1-3):与自动信号同一闸门。
+async fn manual_ticket(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<actions::ManualOrder>, JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    let Json(o) = body?;
+    let fetch = |code: String| async move {
+        tokio::task::spawn_blocking(move || TencentQuotes.fetch(&[code]))
+            .await
+            .map_err(|e| anyhow::anyhow!("行情抓取任务异常: {e}"))?
+    };
+    manual_ticket_at(&st, user.id, o, now, fetch, MANUAL_FETCH_TIMEOUT).await
+}
+
+/// `manual_ticket` 的主体,时钟与补拉行情可注入(测试用固定时刻与桩,不依赖挂钟、不联网)。
+///
+/// 1. 校验字段;非交易时段直接 400,不查缓存也不联网(终审 I1)。
+/// 2. 先用缓存(≤60s);未命中则锁外补拉,限时 `fetch_timeout`;失败 / 超时记日志并
+///    返回「行情获取失败」(M1/M3),不把网络错误变成 500。
+/// 3. 补拉后重新取时刻(M3),持锁提交;补拉结果写缓存,但不覆盖期间别处写入的
+///    更新行情——那条更新的行情也直接用于本次提交(M4)。
+async fn manual_ticket_at<C, F, Fut>(
+    st: &AuthState,
+    user_id: i64,
+    o: actions::ManualOrder,
+    clock: C,
+    fetch: F,
+    fetch_timeout: Duration,
+) -> ApiResult<serde_json::Value>
+where
+    C: Fn() -> NaiveDateTime,
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = anyhow::Result<Vec<Quote>>>,
+{
+    actions::validate_manual(&o).map_err(|e| ApiError::bad(e.to_string()))?;
+    let now = clock();
+    if !monitor::is_session(now) {
+        return Err(no_quote(MANUAL_OFF_SESSION));
+    }
+    let cached = {
+        let conn = st.db.lock().unwrap();
+        store::fresh_quote(&conn, &o.code, now, actions::QUOTE_MAX_AGE_SECS)?
+    };
+    let fetched = match cached {
+        Some(_) => None,
+        None => match tokio::time::timeout(fetch_timeout, fetch(o.code.clone())).await {
+            Ok(Ok(qs)) => qs
+                .into_iter()
+                .find(|q| q.code == o.code && q.ts.date() == now.date()),
+            Ok(Err(e)) => {
+                eprintln!("[trade-api] 手动工单补拉行情失败 {}: {e:#}", o.code);
+                return Err(no_quote(MANUAL_FETCH_FAILED));
+            }
+            Err(_) => {
+                eprintln!(
+                    "[trade-api] 手动工单补拉行情超时 {}({}s)",
+                    o.code,
+                    fetch_timeout.as_secs_f64()
+                );
+                return Err(no_quote(MANUAL_FETCH_FAILED));
+            }
+        },
+    };
+    let now = clock();
+    let mut conn = st.db.lock().unwrap();
+    let quote = match (cached, fetched) {
+        (Some(q), _) => Some(q),
+        (None, Some(f)) => match store::get_quote(&conn, &o.code)? {
+            Some(newer) if newer.ts > f.ts => Some(newer),
+            _ => {
+                store::upsert_quotes(&conn, std::slice::from_ref(&f), now)?;
+                Some(f)
+            }
+        },
+        (None, None) => None,
+    };
+    let outcome = actions::submit_manual(&mut conn, user_id, &o, quote.as_ref(), now)?;
+    Ok(Json(match outcome {
+        ManualOutcome::Ticketed {
+            real_ticket,
+            paper_ticket,
+        } => {
+            json!({ "result": "ticketed", "real_ticket": real_ticket, "paper_ticket": paper_ticket })
+        }
+        ManualOutcome::Duplicate => json!({ "result": "duplicate" }),
+        ManualOutcome::Rejected(r) => {
+            let mut e = ApiError::new(StatusCode::CONFLICT, "rejected", r.label_zh());
+            e.extra = Some(json!({ "reason": r.as_str() }));
+            return Err(e);
+        }
+        ManualOutcome::NoQuote if !monitor::is_session(now) => {
+            return Err(no_quote(MANUAL_OFF_SESSION))
+        }
+        ManualOutcome::NoQuote => return Err(no_quote(MANUAL_NO_TODAY_QUOTE)),
+    }))
 }
 
 // ===== 被拦信号 =====
@@ -928,7 +1050,7 @@ mod tests {
             source: SignalSource::Manual,
             strategy_id: None,
             code: code.into(),
-            name: None,
+            name: Some("浦发银行".into()),
             side: Direction::Buy,
             scope: AccountScope::RealOnly,
             ref_price: 10.0,
@@ -977,6 +1099,11 @@ mod tests {
         );
         assert!(list[0]["est_fee"].as_f64().unwrap() > 0.0);
         assert!(list[0]["strategy_id"].is_null(), "手动信号无来源策略");
+        assert!(
+            list[0]["expires_in_secs"].as_i64().unwrap() > 0,
+            "倒计时以服务端剩余秒数为准"
+        );
+        assert_eq!(list[0]["name"], "浦发银行");
 
         let url = format!("/api/trade/tickets/{id}/confirm");
         let (s, e) = call(&st, "POST", &url, "t1", Some(serde_json::json!({}))).await;
@@ -1730,5 +1857,287 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{r}");
         let (_, r) = call(&st, "GET", "/api/admin/trade/kill-switch", "ta", None).await;
         assert_eq!(r["on"], false);
+    }
+
+    /// 手动 / AI 工单 API 的路由层(计划 4c):登录、请求体校验(含北交所代码)先于
+    /// 时段检查,与挂钟无关。业务路径见下面固定时刻的 `manual_ticket_at` 测试。
+    #[tokio::test]
+    async fn manual_ticket_route_validates_and_requires_login() {
+        let st = state();
+        seed_user(&st, "u", "t");
+        let body = serde_json::json!({
+            "request_id": "abc-1", "code": "600000", "name": "浦发银行", "side": "buy",
+            "amount": 5000.0, "reason": "看好", "ai_note": null
+        });
+        let mut bad = body.clone();
+        bad["reason"] = serde_json::json!(" ");
+        let (s, r) = call(&st, "POST", "/api/trade/manual", "t", Some(bad)).await;
+        assert_eq!(
+            (s, r["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("bad_request"))
+        );
+
+        let mut bse = body.clone();
+        bse["code"] = serde_json::json!("830799");
+        let (s, r) = call(&st, "POST", "/api/trade/manual", "t", Some(bse)).await;
+        assert_eq!(
+            (s, r["code"].as_str(), r["error"].as_str()),
+            (
+                StatusCode::BAD_REQUEST,
+                Some("bad_request"),
+                Some("暂不支持该市场(仅沪深)")
+            )
+        );
+
+        let (s, _) = call(&st, "POST", "/api/trade/manual", "", Some(body)).await;
+        assert_ne!(s, StatusCode::OK, "需登录");
+    }
+
+    /// 2026-09-23(周三)的某个时刻。
+    fn wed(h: u32, m: u32, s: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 9, 23)
+            .unwrap()
+            .and_hms_opt(h, m, s)
+            .unwrap()
+    }
+
+    fn q600000(price: f64, ts: NaiveDateTime) -> Quote {
+        Quote {
+            code: "600000".into(),
+            price,
+            limit_up: Some(11.0),
+            limit_down: Some(9.0),
+            ts,
+        }
+    }
+
+    fn manual_order(req: &str, side: &str) -> actions::ManualOrder {
+        let amount = if side == "buy" {
+            serde_json::json!(5000.0)
+        } else {
+            serde_json::Value::Null
+        };
+        serde_json::from_value(serde_json::json!({
+            "request_id": req, "code": "600000", "name": "浦发银行", "side": side,
+            "amount": amount, "reason": "看好", "ai_note": null
+        }))
+        .unwrap()
+    }
+
+    /// 缓存命中 / 非交易时段路径不得联网:被调用即 panic。
+    fn no_fetch(_code: String) -> std::future::Ready<anyhow::Result<Vec<Quote>>> {
+        panic!("此路径不应补拉行情")
+    }
+
+    fn fetched(q: Vec<Quote>) -> std::future::Ready<anyhow::Result<Vec<Quote>>> {
+        std::future::ready(Ok(q))
+    }
+
+    const FAST: std::time::Duration = std::time::Duration::from_millis(20);
+
+    fn seed_capital(st: &AuthState, uid: i64) {
+        let c = st.db.lock().unwrap();
+        store::set_capital(&c, uid, Account::Real, 100_000.0, wed(9, 0, 0)).unwrap();
+    }
+
+    fn cache_quote(st: &AuthState, q: Quote) {
+        let c = st.db.lock().unwrap();
+        store::upsert_quotes(&c, &[q], wed(9, 0, 0)).unwrap();
+    }
+
+    fn cached(st: &AuthState) -> Option<Quote> {
+        let c = st.db.lock().unwrap();
+        store::get_quote(&c, "600000").unwrap()
+    }
+
+    fn expect_err(r: ApiResult<serde_json::Value>) -> (StatusCode, &'static str, String) {
+        match r {
+            Ok(Json(v)) => panic!("应失败,实际 {v}"),
+            Err(e) => (e.status, e.code, e.msg),
+        }
+    }
+
+    fn expect_ok(r: ApiResult<serde_json::Value>) -> serde_json::Value {
+        match r {
+            Ok(Json(v)) => v,
+            Err(e) => panic!("应成功,实际 {} {}", e.code, e.msg),
+        }
+    }
+
+    /// 固定盘中时刻 + 预置缓存:生成、幂等、闸门拦截,全程不联网(终审 I1)。
+    #[tokio::test]
+    async fn manual_ticket_in_session_uses_cache_dedupes_and_rejects() {
+        let st = state();
+        let uid = seed_user(&st, "u", "t");
+        seed_capital(&st, uid);
+        cache_quote(&st, q600000(10.0, wed(10, 0, 0)));
+        let clock = || wed(10, 0, 5);
+
+        let o = manual_order("abc-1", "buy");
+        let r = expect_ok(manual_ticket_at(&st, uid, o.clone(), clock, no_fetch, FAST).await);
+        assert_eq!(r["result"], "ticketed", "{r}");
+        assert!(r["real_ticket"].is_i64());
+        let r = expect_ok(manual_ticket_at(&st, uid, o, clock, no_fetch, FAST).await);
+        assert_eq!(r["result"], "duplicate");
+
+        let sell = manual_order("abc-2", "sell");
+        let e = manual_ticket_at(&st, uid, sell, clock, no_fetch, FAST)
+            .await
+            .expect_err("无持仓卖出应被拦截");
+        assert_eq!((e.status, e.code), (StatusCode::CONFLICT, "rejected"));
+        assert_eq!(e.extra.unwrap()["reason"], "nothing_sellable");
+    }
+
+    /// 非交易时段:直接 400 no_quote,不看缓存也不联网(终审 I1)。
+    #[tokio::test]
+    async fn manual_ticket_off_session_is_400_without_fetching() {
+        let st = state();
+        let uid = seed_user(&st, "u", "t");
+        seed_capital(&st, uid);
+        let sat = NaiveDate::from_ymd_opt(2026, 9, 26)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        let times = [wed(16, 0, 0), wed(12, 0, 0), wed(9, 29, 59), sat];
+        for (i, t) in times.into_iter().enumerate() {
+            // 缓存里放一条「看起来新鲜」的行情,证明时段检查在前
+            cache_quote(&st, q600000(10.0, t));
+            let o = manual_order(&format!("off-{i}"), "buy");
+            let r = manual_ticket_at(&st, uid, o, || t, no_fetch, FAST).await;
+            assert_eq!(
+                expect_err(r),
+                (
+                    StatusCode::BAD_REQUEST,
+                    "no_quote",
+                    MANUAL_OFF_SESSION.to_string()
+                ),
+                "{t}"
+            );
+        }
+    }
+
+    /// 补拉失败 / 超时:400 no_quote「行情获取失败」;补拉成功但无今日行情:原文案(M1/M3)。
+    #[tokio::test]
+    async fn manual_ticket_fetch_failure_timeout_and_no_today_quote() {
+        let st = state();
+        let uid = seed_user(&st, "u", "t");
+        seed_capital(&st, uid);
+        let clock = || wed(10, 0, 0);
+        let failed = (
+            StatusCode::BAD_REQUEST,
+            "no_quote",
+            MANUAL_FETCH_FAILED.to_string(),
+        );
+
+        let net_err = |_| std::future::ready(Err(anyhow::anyhow!("网络不通")));
+        let o = manual_order("f-1", "buy");
+        let r = manual_ticket_at(&st, uid, o, clock, net_err, FAST).await;
+        assert_eq!(expect_err(r), failed, "网络错误");
+
+        let hang = |_| std::future::pending::<anyhow::Result<Vec<Quote>>>();
+        let o = manual_order("f-2", "buy");
+        let r = manual_ticket_at(&st, uid, o, clock, hang, FAST).await;
+        assert_eq!(expect_err(r), failed, "超时");
+
+        let yesterday = NaiveDate::from_ymd_opt(2026, 9, 22)
+            .unwrap()
+            .and_hms_opt(15, 0, 0)
+            .unwrap();
+        let old = |_| fetched(vec![q600000(10.0, yesterday)]);
+        let o = manual_order("f-3", "buy");
+        let r = manual_ticket_at(&st, uid, o, clock, old, FAST).await;
+        assert_eq!(
+            expect_err(r),
+            (
+                StatusCode::BAD_REQUEST,
+                "no_quote",
+                MANUAL_NO_TODAY_QUOTE.to_string()
+            ),
+            "停牌 / 无今日行情"
+        );
+        assert_eq!(cached(&st), None, "非今日行情不写缓存");
+    }
+
+    /// 补拉结果写缓存,但不覆盖补拉期间别处写入的更新行情(M4);提交用补拉后的时刻(M3)。
+    #[tokio::test]
+    async fn manual_ticket_fetch_caches_without_overwriting_newer_quote() {
+        let st = state();
+        let uid = seed_user(&st, "u", "t");
+        seed_capital(&st, uid);
+
+        // a) 缓存陈旧 → 补拉 → 写入缓存并生成工单
+        cache_quote(&st, q600000(9.8, wed(9, 50, 0)));
+        let fresh = |_| fetched(vec![q600000(10.1, wed(9, 59, 58))]);
+        let o = manual_order("c-1", "buy");
+        let r = expect_ok(manual_ticket_at(&st, uid, o, || wed(10, 0, 0), fresh, FAST).await);
+        assert_eq!(r["result"], "ticketed");
+        assert_eq!(cached(&st), Some(q600000(10.1, wed(9, 59, 58))));
+
+        // b) 补拉期间监听线程写入了更新的行情 → 不被较旧的补拉结果覆盖
+        cache_quote(&st, q600000(9.8, wed(10, 10, 0)));
+        let st2 = st.clone();
+        let racing = move |_| {
+            cache_quote(&st2, q600000(10.3, wed(10, 20, 2)));
+            fetched(vec![q600000(10.2, wed(10, 20, 1))])
+        };
+        // 另一个用户,避开 a) 留下的冷却 / 未完结工单
+        let uid2 = seed_user(&st, "u2", "t2");
+        seed_capital(&st, uid2);
+        let o = manual_order("c-2", "buy");
+        let r = expect_ok(manual_ticket_at(&st, uid2, o, || wed(10, 20, 3), racing, FAST).await);
+        let real = r["real_ticket"].as_i64().expect("应生成实盘工单");
+        let t = {
+            let c = st.db.lock().unwrap();
+            tk::get_ticket(&c, real).unwrap().unwrap()
+        };
+        assert_eq!(t.suggest_price, 10.3, "用补拉期间写入的更新行情提交");
+        assert_eq!(
+            cached(&st),
+            Some(q600000(10.3, wed(10, 20, 2))),
+            "较新的缓存未被覆盖"
+        );
+
+        // c) 补拉前在时段内、补拉后已过 11:30 → 以补拉后的时刻判定为非交易时段
+        cache_quote(&st, q600000(10.0, wed(11, 0, 0)));
+        let calls = std::cell::Cell::new(0);
+        let clock = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                wed(11, 30, 50)
+            } else {
+                wed(11, 31, 0)
+            }
+        };
+        let late = |_| fetched(vec![q600000(10.0, wed(11, 30, 50))]);
+        let o = manual_order("c-3", "sell");
+        let r = manual_ticket_at(&st, uid, o, clock, late, FAST).await;
+        assert_eq!(
+            expect_err(r),
+            (
+                StatusCode::BAD_REQUEST,
+                "no_quote",
+                MANUAL_OFF_SESSION.to_string()
+            )
+        );
+        assert_eq!(calls.get(), 2, "补拉后重新取时刻");
+    }
+
+    /// 拦截原因中文文案一致性(计划 4c):`GateReject::label_zh` 与 `TRADE_HTML` 里
+    /// `REJECT_REASONS` 的文案须逐一一致,不允许两处悄悄走样。
+    #[test]
+    fn gate_reject_label_zh_matches_trade_html_reject_reasons() {
+        use crate::trade::gate::GateReject;
+        let html = crate::web::trade_page::TRADE_HTML;
+        // 键与文案成对出现,格式同页面里 REJECT_REASONS 的字面量:`  key: '文案',`
+        // (终审 M9:只查文案会放过「文案挂错键」)。
+        for r in GateReject::ALL {
+            let entry = format!("\n  {}: '{}',\n", r.as_str(), r.label_zh());
+            assert!(
+                html.contains(&entry),
+                "TRADE_HTML 的 REJECT_REASONS 缺少 {:?} 的映射 {}",
+                r,
+                entry.trim()
+            );
+        }
     }
 }

@@ -43,6 +43,22 @@ pub enum GateReject {
 }
 
 impl GateReject {
+    /// 遍历全部变体(计划 4c):供 web 层做中文文案一致性测试。
+    pub const ALL: [GateReject; 12] = [
+        GateReject::TradingDisabled,
+        GateReject::DuplicateOpenTicket,
+        GateReject::Cooldown,
+        GateReject::NotAdmitted,
+        GateReject::NoQuote,
+        GateReject::LimitUp,
+        GateReject::LimitDown,
+        GateReject::DailyTicketCap,
+        GateReject::DailyLossHalt,
+        GateReject::NoCapital,
+        GateReject::BelowOneLot,
+        GateReject::NothingSellable,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             GateReject::TradingDisabled => "trading_disabled",
@@ -57,6 +73,25 @@ impl GateReject {
             GateReject::NoCapital => "no_capital",
             GateReject::BelowOneLot => "below_one_lot",
             GateReject::NothingSellable => "nothing_sellable",
+        }
+    }
+
+    /// 拦截原因的中文文案(计划 4c):与 `trade_page.rs` 里 `TRADE_HTML` 的
+    /// `REJECT_REASONS` 同一套文案,一致性由 `src/web/trade.rs` 的测试钉住。
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            GateReject::TradingDisabled => "交易已关闭",
+            GateReject::DuplicateOpenTicket => "已有未完结工单",
+            GateReject::Cooldown => "冷却中",
+            GateReject::NotAdmitted => "策略未准入",
+            GateReject::NoQuote => "无行情",
+            GateReject::LimitUp => "涨停不买",
+            GateReject::LimitDown => "跌停不卖",
+            GateReject::DailyTicketCap => "超过每日工单上限",
+            GateReject::DailyLossHalt => "当日亏损已达上限",
+            GateReject::NoCapital => "未设置资金",
+            GateReject::BelowOneLot => "不足一手",
+            GateReject::NothingSellable => "无可卖数量",
         }
     }
 }
