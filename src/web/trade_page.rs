@@ -1030,14 +1030,14 @@ function fillRiskForm(rules){
   const f = riskForm();
   f.elements.enabled.checked = !!rules.enabled;
   f.elements.max_order_amount.value = rules.max_order_amount;
-  f.elements.max_position_pct.value = pct2(rules.max_position_pct * 100);
+  f.elements.max_position_pct.value = pct2(rules.max_position_pct);
   f.elements.max_daily_tickets.value = rules.max_daily_tickets;
-  f.elements.daily_loss_halt_pct.value = pct2(rules.daily_loss_halt_pct * 100);
+  f.elements.daily_loss_halt_pct.value = pct2(rules.daily_loss_halt_pct);
   f.elements.cooldown_min.value = rules.cooldown_min;
-  f.elements.deviation_th.value = pct2(rules.deviation_th * 100);
-  f.elements.default_stop_loss_pct.value = pct2(rules.default_stop_loss_pct * 100);
-  f.elements.default_take_profit_pct.value = pct2(rules.default_take_profit_pct * 100);
-  f.elements.slippage.value = pct2(rules.slippage * 100);
+  f.elements.deviation_th.value = pct2(rules.deviation_th);
+  f.elements.default_stop_loss_pct.value = pct2(rules.default_stop_loss_pct);
+  f.elements.default_take_profit_pct.value = pct2(rules.default_take_profit_pct);
+  f.elements.slippage.value = pct2(rules.slippage);
 }
 
 async function onSaveRisk(ev){
@@ -1141,7 +1141,7 @@ function positionRowHtml(p){
   const priceHtml = q
     ? `<span class="${q.stale ? 'stale-q' : ''}">${esc(fmtMoney(q.price))}</span>${q.stale ? ' <span class="tag urgent">延迟</span>' : ''}`
     : '—';
-  const trailingDisplay = p.trailing_pct == null ? '' : pct2(p.trailing_pct * 100);
+  const trailingDisplay = p.trailing_pct == null ? '' : pct2(p.trailing_pct);
   return `<tr data-code="${esc(p.code)}">
     <td>${esc(p.code)}</td>
     <td>${esc(p.qty)}</td>
@@ -1833,6 +1833,37 @@ mod tests {
             "function canConfirm(",
         ] {
             assert!(signed.contains(s), "SIGNED_TICKET_HTML 缺 {s}");
+        }
+    }
+
+    /// 比例 → 百分数只换算一次:`pct2` 自己 ×100,调用处必须传原始比例(4b 终审 M4 复审)。
+    /// 钉住每个回显行的确切写法,并确认 `pct2` 的实现就是「×100 后保留 2 位小数」。
+    #[test]
+    fn ratio_fields_convert_to_percent_exactly_once() {
+        let trade = crate::web::trade_page::TRADE_HTML;
+        let pct2 = extract_fn(trade, "pct2").expect("TRADE_HTML 应有 function pct2(");
+        assert!(pct2.contains("Math.round(x * 10000) / 100"), "{pct2}");
+        for field in [
+            "max_position_pct",
+            "daily_loss_halt_pct",
+            "deviation_th",
+            "default_stop_loss_pct",
+            "default_take_profit_pct",
+            "slippage",
+        ] {
+            let line = format!("f.elements.{field}.value = pct2(rules.{field});");
+            assert!(trade.contains(&line), "缺 {line}");
+        }
+        assert!(trade.contains(
+            "const trailingDisplay = p.trailing_pct == null ? '' : pct2(p.trailing_pct);"
+        ));
+        let calls: Vec<&str> = trade
+            .match_indices("pct2(")
+            .map(|(i, _)| &trade[i..])
+            .collect();
+        for c in calls {
+            let arg = &c[..c.find(')').unwrap()];
+            assert!(!arg.contains("100"), "pct2 的参数不得再 ×100: {arg}");
         }
     }
 
