@@ -296,8 +296,14 @@ pub fn emit_due(
                 continue;
             }
         };
-        if plans::settle_plan(conn, p.id, PlanStatus::Submitted, &note, now)? {
-            r.submitted += 1;
+        // 结算失败不能 `?` 返回:已收集的实盘工单随报告一起丢掉就再也推送不到
+        // (下一轮 dedup_key 命中只会记「信号已存在」)。记错误,继续处理其余计划。
+        match plans::settle_plan(conn, p.id, PlanStatus::Submitted, &note, now) {
+            Ok(true) => r.submitted += 1,
+            Ok(false) => {}
+            Err(e) => r
+                .errors
+                .push(format!("计划 {} 结算失败({note}): {e:#}", p.id)),
         }
     }
     Ok(r)
@@ -721,5 +727,36 @@ mod tests {
         );
         assert_eq!(drop_unsent(&c, &cfg, at(9, 22, 10, 30)).unwrap(), 1);
         assert!(plans::due_plans(&c, d(9, 22)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn real_ticket_survives_a_failed_plan_settle() {
+        let mut c = db();
+        let sid = planned_buy(&c);
+        state::update_status(
+            &c,
+            1,
+            sid,
+            StrategyStatus::Paper,
+            StrategyStatus::Admitted,
+            "x",
+            at(9, 18, 16, 0),
+        )
+        .unwrap();
+        // 模拟结算计划时写失败(如写锁超时):工单已生成,不能因此丢掉推送
+        c.execute_batch(
+            "CREATE TRIGGER fail_settle BEFORE UPDATE ON trade_strategy_plans
+             BEGIN SELECT RAISE(ABORT, 'locked'); END;",
+        )
+        .unwrap();
+        let fresh = Stub(vec![q("600000", 25.0, at(9, 21, 9, 25))]);
+        let r = emit_due(&mut c, &fresh, &SignalCfg::default(), at(9, 21, 9, 26)).unwrap();
+        assert_eq!(
+            r.new_real_tickets.len(),
+            1,
+            "已生成的实盘工单仍要返回以便推送"
+        );
+        assert_eq!(r.submitted, 0);
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
     }
 }
