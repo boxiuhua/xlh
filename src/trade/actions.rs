@@ -2,8 +2,14 @@
 //! Web 层不含业务规则(design decision 1):偏离保护、行情延迟、总开关、
 //! 持仓校准留痕都在这里实现并单测;handler 只调用。
 
+use crate::event::Direction;
 use crate::trade::admission::state;
-use crate::trade::model::{fmt_ts, Account, EvalKind, JobStatus, Position, TicketStatus};
+use crate::trade::gate::GateReject;
+use crate::trade::model::{
+    fmt_ts, Account, AccountScope, EvalKind, JobStatus, NewSignal, Position, Quote, SignalSource,
+    TicketStatus,
+};
+use crate::trade::service::{submit_signal, SubmitContext, SubmitOutcome};
 use crate::trade::settings;
 use crate::trade::store;
 use crate::trade::ticket::{self, Transition};
@@ -382,6 +388,142 @@ pub fn cancel_job(
         }
         JobStatus::Done | JobStatus::Failed => Ok(CancelOutcome::NotCancellable),
     }
+}
+
+/// 手动 / AI 建议下单(计划 4c)。字段校验见 `validate_manual`。
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct ManualOrder {
+    pub request_id: String,
+    pub code: String,
+    pub name: Option<String>,
+    pub side: Direction,
+    /// 买入金额;`None` 按风控单笔上限
+    pub amount: Option<f64>,
+    /// 卖出股数;`None` 全部可卖
+    pub qty: Option<u64>,
+    pub reason: String,
+    pub ai_note: Option<String>,
+}
+
+/// 手动工单字段校验(design decision 1/2:与自动信号同路径,只是入口不同)。
+pub fn validate_manual(o: &ManualOrder) -> Result<()> {
+    if o.request_id.is_empty()
+        || o.request_id.len() > 64
+        || !o
+            .request_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(anyhow!(
+            "request_id 须为 1-64 个字符,只能包含字母、数字、'-': {}",
+            o.request_id
+        ));
+    }
+    if o.code.len() != 6 || !o.code.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(anyhow!("股票代码须为 6 位数字: {}", o.code));
+    }
+    if let Some(n) = &o.name {
+        if n.trim().chars().count() > 20 {
+            return Err(anyhow!("股票名称过长(最多 20 字符)"));
+        }
+    }
+    match o.side {
+        Direction::Buy => {
+            if let Some(a) = o.amount {
+                if !(a.is_finite() && a > 0.0) {
+                    return Err(anyhow!("买入金额必须为正数: {a}"));
+                }
+            }
+            if o.qty.is_some() {
+                return Err(anyhow!("买入不支持指定股数"));
+            }
+        }
+        Direction::Sell => {
+            if o.amount.is_some() {
+                return Err(anyhow!("卖出不支持指定金额"));
+            }
+            if let Some(q) = o.qty {
+                if q == 0 {
+                    return Err(anyhow!("卖出股数必须大于 0"));
+                }
+            }
+        }
+    }
+    if o.reason.trim().is_empty() {
+        return Err(anyhow!("下单理由不能为空"));
+    }
+    if o.reason.trim().chars().count() > 500 {
+        return Err(anyhow!("下单理由过长(最多 500 字符)"));
+    }
+    if let Some(note) = &o.ai_note {
+        if note.chars().count() > 8000 {
+            return Err(anyhow!("AI 备注过长(最多 8000 字符)"));
+        }
+    }
+    Ok(())
+}
+
+/// `submit_manual` 的结果。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ManualOutcome {
+    Ticketed {
+        real_ticket: Option<i64>,
+        paper_ticket: Option<i64>,
+    },
+    Rejected(GateReject),
+    Duplicate,
+    /// 无今日行情(盘前 / 休市 / 停牌),或行情代码与工单不符。
+    NoQuote,
+}
+
+/// 手动 / AI 工单入口(design decision 1-3):与自动信号同一闸门(`submit_signal`),
+/// 只在有今日行情时放行,`request_id` 映射为 `dedup_key` 做幂等。
+pub fn submit_manual(
+    conn: &mut Connection,
+    user_id: i64,
+    o: &ManualOrder,
+    quote: Option<&Quote>,
+    now: NaiveDateTime,
+) -> Result<ManualOutcome> {
+    validate_manual(o)?;
+    let Some(q) = quote.filter(|q| q.ts.date() == now.date() && q.code == o.code) else {
+        return Ok(ManualOutcome::NoQuote);
+    };
+    let sig = NewSignal {
+        user_id,
+        source: SignalSource::Manual,
+        strategy_id: None,
+        code: o.code.clone(),
+        name: o.name.clone(),
+        side: o.side,
+        scope: AccountScope::Both,
+        ref_price: q.price,
+        reason: o.reason.trim().to_string(),
+        ai_note: o.ai_note.clone(),
+        dedup_key: format!("manual-{}", o.request_id),
+        suggest_cash: o.amount,
+        suggest_qty: o.qty,
+    };
+    let outcome = submit_signal(
+        conn,
+        &sig,
+        &SubmitContext {
+            quote: Some(q),
+            now,
+        },
+    )?;
+    Ok(match outcome {
+        SubmitOutcome::Duplicate => ManualOutcome::Duplicate,
+        SubmitOutcome::Rejected { reason, .. } => ManualOutcome::Rejected(reason),
+        SubmitOutcome::Ticketed {
+            real_ticket,
+            paper_ticket,
+            ..
+        } => ManualOutcome::Ticketed {
+            real_ticket,
+            paper_ticket,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -1088,5 +1230,168 @@ mod tests {
             CancelOutcome::Requested
         );
         assert!(store::job_cancel_requested(&c, job_id).unwrap());
+    }
+
+    fn manual(side: Direction, req: &str) -> ManualOrder {
+        ManualOrder {
+            request_id: req.into(),
+            code: "600000".into(),
+            name: Some("浦发银行".into()),
+            side,
+            amount: (side == Direction::Buy).then_some(5_000.0),
+            qty: None,
+            reason: "看好".into(),
+            ai_note: Some("AI:估值偏低".into()),
+        }
+    }
+
+    #[test]
+    fn manual_buy_creates_real_and_paper_tickets_and_is_idempotent() {
+        let mut c = db();
+        let q = quote(10.0, at(10, 0, 0));
+        let o = manual(Direction::Buy, "req-1");
+        let r = submit_manual(&mut c, 1, &o, Some(&q), at(10, 0, 0)).unwrap();
+        let ManualOutcome::Ticketed {
+            real_ticket: Some(real),
+            paper_ticket: Some(_),
+        } = r
+        else {
+            panic!("{r:?}");
+        };
+        let t = crate::trade::ticket::get_ticket(&c, real).unwrap().unwrap();
+        assert_eq!(t.expires_at, at(15, 0, 0), "手动工单默认当日 15:00 到期");
+        assert_eq!(
+            submit_manual(&mut c, 1, &o, Some(&q), at(10, 0, 5)).unwrap(),
+            ManualOutcome::Duplicate,
+            "同一 request_id 重复提交"
+        );
+        let meta = store::signal_meta(&c, t.signal_id).unwrap().unwrap();
+        assert_eq!(meta.name.as_deref(), Some("浦发银行"));
+        assert_eq!(meta.ai_note.as_deref(), Some("AI:估值偏低"));
+    }
+
+    #[test]
+    fn manual_needs_todays_quote_for_the_same_code() {
+        let mut c = db();
+        let o = manual(Direction::Buy, "req-2");
+        assert_eq!(
+            submit_manual(&mut c, 1, &o, None, at(10, 0, 0)).unwrap(),
+            ManualOutcome::NoQuote
+        );
+        let yesterday = NaiveDate::from_ymd_opt(2026, 9, 22)
+            .unwrap()
+            .and_hms_opt(15, 0, 0)
+            .unwrap();
+        assert_eq!(
+            submit_manual(&mut c, 1, &o, Some(&quote(10.0, yesterday)), at(10, 0, 0)).unwrap(),
+            ManualOutcome::NoQuote
+        );
+        let other = Quote {
+            code: "600036".into(),
+            ..quote(10.0, at(10, 0, 0))
+        };
+        assert_eq!(
+            submit_manual(&mut c, 1, &o, Some(&other), at(10, 0, 0)).unwrap(),
+            ManualOutcome::NoQuote
+        );
+    }
+
+    #[test]
+    fn manual_goes_through_the_gate() {
+        let mut c = db();
+        crate::trade::settings::set_kill_switch(&c, true, None, at(9, 0, 0)).unwrap();
+        let r = submit_manual(
+            &mut c,
+            1,
+            &manual(Direction::Buy, "req-3"),
+            Some(&quote(10.0, at(10, 0, 0))),
+            at(10, 0, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            ManualOutcome::Rejected(crate::trade::gate::GateReject::TradingDisabled)
+        );
+        crate::trade::settings::set_kill_switch(&c, false, None, at(9, 0, 0)).unwrap();
+        let r = submit_manual(
+            &mut c,
+            1,
+            &manual(Direction::Sell, "req-4"),
+            Some(&quote(10.0, at(10, 0, 0))),
+            at(10, 0, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            ManualOutcome::Rejected(crate::trade::gate::GateReject::NothingSellable),
+            "无持仓卖出"
+        );
+    }
+
+    #[test]
+    fn manual_validation() {
+        let ok = manual(Direction::Buy, "req-5");
+        assert!(validate_manual(&ok).is_ok());
+        let bad = [
+            ManualOrder {
+                request_id: "".into(),
+                ..ok.clone()
+            },
+            ManualOrder {
+                request_id: "有中文".into(),
+                ..ok.clone()
+            },
+            ManualOrder {
+                request_id: "x".repeat(65),
+                ..ok.clone()
+            },
+            ManualOrder {
+                code: "60000".into(),
+                ..ok.clone()
+            },
+            ManualOrder {
+                amount: Some(0.0),
+                ..ok.clone()
+            },
+            ManualOrder {
+                amount: Some(f64::NAN),
+                ..ok.clone()
+            },
+            ManualOrder {
+                qty: Some(100),
+                ..ok.clone()
+            },
+            ManualOrder {
+                reason: "  ".into(),
+                ..ok.clone()
+            },
+            ManualOrder {
+                reason: "长".repeat(501),
+                ..ok.clone()
+            },
+            ManualOrder {
+                ai_note: Some("长".repeat(8001)),
+                ..ok.clone()
+            },
+            ManualOrder {
+                name: Some("长".repeat(21)),
+                ..ok.clone()
+            },
+            ManualOrder {
+                side: Direction::Sell,
+                amount: Some(1000.0),
+                qty: None,
+                ..ok.clone()
+            },
+            ManualOrder {
+                side: Direction::Sell,
+                amount: None,
+                qty: Some(0),
+                ..ok.clone()
+            },
+        ];
+        for b in bad {
+            assert!(validate_manual(&b).is_err(), "{b:?}");
+        }
     }
 }
