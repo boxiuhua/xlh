@@ -248,10 +248,13 @@ pub fn emit_due(
     let mut codes: Vec<String> = live.iter().map(|p| p.code.clone()).collect();
     codes.sort();
     codes.dedup();
+    // 只认窗口开始之后的今日报价:09:25 之前的快照是集合竞价的虚拟撮合价,
+    // 日期虽是今天却还不是开盘价,当作「还没有报价」等下一轮。
+    let open_at = hm(cfg.emit_hour, cfg.emit_minute);
     let fresh: Vec<Quote> = source
         .fetch(&codes)?
         .into_iter()
-        .filter(|q| q.ts.date() == today)
+        .filter(|q| q.ts.date() == today && q.ts.time() >= open_at)
         .collect();
     store::upsert_quotes(conn, &fresh, now)?;
     let quotes: HashMap<&str, &Quote> = fresh.iter().map(|q| (q.code.as_str(), q)).collect();
@@ -657,6 +660,20 @@ mod tests {
         assert_eq!(paper, 1);
         let r = emit_due(&mut c, &fresh, &cfg, at(9, 21, 9, 27)).unwrap();
         assert_eq!(r, EmitReport::default(), "计划已结,不重复发");
+    }
+
+    /// 09:25 之前的快照是集合竞价的虚拟撮合价,不是开盘价:即便日期是今天也只能等。
+    #[test]
+    fn emit_ignores_call_auction_preview_quotes_before_the_window() {
+        let mut c = db();
+        planned_buy(&c);
+        let cfg = SignalCfg::default();
+        let preview = Stub(vec![q("600000", 25.0, at(9, 21, 9, 20))]);
+        let r = emit_due(&mut c, &preview, &cfg, at(9, 21, 9, 25)).unwrap();
+        assert_eq!((r.submitted, r.waiting), (0, 1), "09:20 的预览价不算开盘价");
+        let open = Stub(vec![q("600000", 25.0, at(9, 21, 9, 25))]);
+        let r = emit_due(&mut c, &open, &cfg, at(9, 21, 9, 26)).unwrap();
+        assert_eq!(r.submitted, 1);
     }
 
     #[test]
