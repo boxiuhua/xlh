@@ -65,6 +65,26 @@ table.tbl td.wrap-cell{white-space:normal;min-width:160px}
 table.tbl th{color:#7f8c8d;font-weight:500}
 .fill-form{display:flex;gap:6px;align-items:center}
 .fill-form input{width:90px;padding:4px 6px;border:1px solid #ccd2da;border-radius:5px}
+.st{display:inline-block;padding:1px 8px;border-radius:10px;font-size:.8rem;font-weight:600}
+.st-draft{background:#eef1f4;color:#555}
+.st-backtesting{background:#dbeafe;color:#1d4ed8}
+.st-failed{background:#fdecea;color:#c0392b}
+.st-paper{background:#fef3c7;color:#b45309}
+.st-admitted{background:#dcfce7;color:#15803d}
+.st-suspended{background:#ede9fe;color:#6d28d9}
+.form-title{font-size:1rem;margin-bottom:10px}
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px 16px}
+.form-grid label{display:flex;flex-direction:column;gap:4px;font-size:.85rem;color:#555}
+.form-grid label.full{grid-column:1/-1}
+.form-grid input,.form-grid select,.form-grid textarea{padding:6px 8px;border:1px solid #ccd2da;border-radius:5px;font:inherit;font-size:.9rem;color:#2c3e50}
+.form-grid textarea{font-family:ui-monospace,Consolas,monospace;resize:vertical}
+.form-err{color:#c0392b;font-size:.85rem;margin-top:8px;white-space:pre-wrap}
+.sc-head{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:10px}
+.sc-head b{font-size:1.05rem}
+.sc-head .linkish{margin-left:auto}
+.sc-events{font-size:.85rem;margin:0 0 12px 0;padding-left:18px;color:#555}
+.sc-events li{margin:2px 0}
+table.tbl td.num,table.tbl th.num{text-align:right;font-variant-numeric:tabular-nums}
 @media (max-width:640px){
   #trade-bar{flex-direction:column;align-items:flex-start}
   .card{padding:12px}
@@ -99,7 +119,33 @@ table.tbl th{color:#7f8c8d;font-weight:500}
   <div id="panel-working" class="panel"><div class="card"><div class="hint">加载中…</div></div></div>
   <div id="panel-done" class="panel"><div class="card"><div class="hint">加载中…</div></div></div>
   <div id="panel-rejected" class="panel"><div class="card"><div class="hint">加载中…</div></div></div>
-  <div id="panel-strategies" class="panel"><div class="card"><div class="hint">加载中…</div></div></div>
+  <div id="panel-strategies" class="panel">
+    <div id="strategy-list"><div class="card"><div class="hint">加载中…</div></div></div>
+    <div id="scorecard"></div>
+    <form id="strategy-form" class="card" autocomplete="off">
+      <h3 id="strategy-form-title" class="form-title">新建策略</h3>
+      <div class="form-grid">
+        <label>名称<input type="text" name="name" maxlength="60" required/></label>
+        <label>类型<select name="kind">
+          <option value="trend">均线择时</option>
+          <option value="rsi">RSI</option>
+          <option value="smart_dca">智能定投</option>
+          <option value="dca">定投</option>
+          <option value="adaptive">自适应</option>
+          <option value="mover">盘中异动</option>
+        </select></label>
+        <label class="full">参数网格（TOML，每个参数给出候选值列表）<textarea name="grid_toml" rows="5" placeholder="short_window = [5, 10]&#10;long_window = [20, 60]&#10;amount = [10000.0]"></textarea></label>
+        <label class="full">股票池（6 位代码，逗号或空白分隔）<input type="text" name="pool" placeholder="600000, 000001"/></label>
+      </div>
+      <div id="strategy-form-err" class="form-err"></div>
+      <div class="ticket-actions">
+        <button type="submit" class="btn js-save">保存</button>
+        <button type="button" class="btn ghost js-cancel-edit" style="display:none">取消编辑</button>
+        <span class="hint">修改类型、参数网格或股票池会让策略回到草稿，需要重新提交评估；只改名称不影响状态。</span>
+      </div>
+    </form>
+    <div id="jobs"><div class="card"><div class="hint">加载中…</div></div></div>
+  </div>
   <div id="panel-risk" class="panel"><div class="card"><div class="hint">加载中…</div></div></div>
   <div id="panel-positions" class="panel"><div class="card"><div class="hint">加载中…</div></div></div>
 </div>
@@ -564,6 +610,322 @@ LOADERS.rejected = loadRejected;
 
 // ===== Task 4: 策略 / 风控设置（追加区） =====
 
+// ----- 策略 -----
+
+const STRATEGY_KINDS = {
+  trend: '均线择时',
+  rsi: 'RSI',
+  smart_dca: '智能定投',
+  dca: '定投',
+  adaptive: '自适应',
+  mover: '盘中异动',
+};
+
+const STRATEGY_STATUS = {
+  draft: '草稿',
+  backtesting: '回测中',
+  failed: '未通过',
+  paper: '观察期',
+  admitted: '已准入',
+  suspended: '已暂停',
+};
+
+// 只有这些状态可以（重新）提交评估
+const SUBMITTABLE = ['draft', 'failed', 'suspended'];
+
+function kindLabel(k){
+  return STRATEGY_KINDS[k] || (k || '—');
+}
+
+// 状态徽标（配色区分），返回已转义的 HTML 片段；class 只取白名单内的值
+function strategyStatusHtml(st){
+  const cls = STRATEGY_STATUS[st] ? ' st-' + st : '';
+  return `<span class="st${cls}">${esc(STRATEGY_STATUS[st] || st || '—')}</span>`;
+}
+
+function jobKindLabel(k){
+  return { walk_forward: '前推回测', paper_check: '观察期检查', watchdog: '实盘监控' }[k] || (k || '—');
+}
+
+function jobStatusLabel(s){
+  return { queued: '排队', running: '运行中', done: '完成', failed: '失败' }[s] || (s || '—');
+}
+
+function poolSummary(pool){
+  const list = Array.isArray(pool) ? pool : [];
+  const head = list.slice(0, 5).join(', ');
+  return list.length > 5 ? `${head} 等 ${list.length} 只` : (head || '—');
+}
+
+// 成绩单四栏取值（设计裁决 6）：[指标, 样本内, 样本外, 模拟盘, 实盘]。
+// 字段名已与 PoolMetrics / TradeBaseline / StageMetrics 对齐；池级 PoolMetrics
+// 没有 oos_annualized，故「年化收益」样本外一格恒为「—」（不自行推算）。
+function scorecardRows(sc) {
+  const oos = sc.oos, tb = oos && oos.trade_baseline;
+  const dash = '—';
+  const pct = (x) => (x == null || Number.isNaN(x) ? dash : fmtPct(x));
+  const num = (x, d = 2) => (x == null || Number.isNaN(x) ? dash : Number(x).toFixed(d));
+  const stage = (m) => m && m.trades > 0 ? m : null;
+  const paper = stage(sc.paper), real = stage(sc.real);
+  return [
+    ['年化收益', dash, oos ? pct(oos.oos_annualized ?? null) : dash, dash, dash],
+    ['超额(相对买入持有)', dash, oos ? pct(oos.oos_return - oos.buy_hold_return) : dash, dash, dash],
+    ['夏普', oos ? num(oos.is_sharpe) : dash, oos ? num(oos.oos_sharpe) : dash, dash, dash],
+    ['最大回撤', dash, oos ? pct(oos.oos_max_drawdown) : dash, paper ? pct(paper.max_drawdown) : dash, real ? pct(real.max_drawdown) : dash],
+    ['胜率', dash, tb ? pct(tb.win_rate) : dash, paper ? pct(paper.win_rate) : dash, real ? pct(real.win_rate) : dash],
+    ['盈亏比', dash, dash, paper ? num(paper.profit_factor) : dash, real ? num(real.profit_factor) : dash],
+    ['交易笔数', dash, oos ? String(oos.oos_trades) : dash, paper ? String(paper.trades) : dash, real ? String(real.trades) : dash],
+    ['平均每笔收益', dash, tb ? pct(tb.avg_return) : dash, paper ? pct(paper.avg_trade_return) : dash, real ? pct(real.avg_trade_return) : dash],
+    ['已实现盈亏', dash, dash, paper ? fmtMoney(paper.realized_pnl) : dash, real ? fmtMoney(real.realized_pnl) : dash],
+  ];
+}
+
+let strategiesSeq = 0;
+let scorecardSeq = 0;
+let scorecardId = null;   // 当前展开成绩单的策略 id（null = 未展开）
+let editingId = null;     // 表单正在编辑的策略 id（null = 新建）
+let scorecardScroll = false; // 成绩单下次渲染后是否滚动到可见处
+let strategiesById = new Map();
+
+function strategyForm(){
+  return document.getElementById('strategy-form');
+}
+
+function resetStrategyForm(){
+  const f = strategyForm();
+  editingId = null;
+  f.reset();
+  document.getElementById('strategy-form-title').textContent = '新建策略';
+  document.getElementById('strategy-form-err').textContent = '';
+  f.querySelector('.js-save').textContent = '保存';
+  f.querySelector('.js-cancel-edit').style.display = 'none';
+}
+
+function editStrategy(s){
+  const f = strategyForm();
+  editingId = s.id;
+  f.elements.name.value = s.name || '';
+  f.elements.kind.value = s.kind;
+  f.elements.grid_toml.value = s.grid_toml || '';
+  f.elements.pool.value = (Array.isArray(s.pool) ? s.pool : []).join(', ');
+  document.getElementById('strategy-form-title').textContent = `编辑策略：${s.name}`;
+  document.getElementById('strategy-form-err').textContent = '';
+  f.querySelector('.js-save').textContent = '保存修改';
+  f.querySelector('.js-cancel-edit').style.display = '';
+  f.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+async function onSaveStrategy(ev){
+  ev.preventDefault();
+  const f = strategyForm();
+  const errEl = document.getElementById('strategy-form-err');
+  errEl.textContent = '';
+  const body = {
+    name: f.elements.name.value.trim(),
+    kind: f.elements.kind.value,
+    grid_toml: f.elements.grid_toml.value,
+    pool: f.elements.pool.value.split(/[\s,，、]+/).filter(Boolean),
+  };
+  const id = editingId;
+  const btn = f.querySelector('.js-save');
+  btn.disabled = true;
+  const r = id == null
+    ? await api('/api/trade/strategies', 'POST', body)
+    : await api(`/api/trade/strategies/${encodeURIComponent(id)}`, 'POST', body);
+  btn.disabled = false;
+  if (!r.ok) {
+    const msg = (r.data && r.data.error) || `保存失败(${r.status})`;
+    if (r.status === 400) { errEl.textContent = msg; return; }
+    toast(r.status === 404 ? '策略不存在' : msg, 'err');
+    if (r.status === 404) { resetStrategyForm(); LOADERS.strategies(); }
+    return;
+  }
+  if (id == null) {
+    toast('已新建策略（草稿），可提交评估', 'ok');
+  } else {
+    const result = r.data && r.data.result;
+    if (result === 'reversioned') {
+      toast('定义已变更,策略回到草稿,需要重新提交评估', 'ok');
+    } else if (result === 'renamed') {
+      toast('已改名', 'ok');
+    } else {
+      toast('没有变化', 'ok');
+    }
+  }
+  resetStrategyForm();
+  LOADERS.strategies();
+}
+
+async function onSubmitStrategy(s, btn){
+  btn.disabled = true;
+  const r = await api(`/api/trade/strategies/${encodeURIComponent(s.id)}/submit`, 'POST');
+  if (r.ok) {
+    const result = r.data && r.data.result;
+    toast(result === 'paper' ? '异动类策略直接进入观察期' : '已排队前推回测', 'ok');
+  } else if (r.status === 409) {
+    toast('当前状态不能提交', 'err');
+  } else {
+    toast((r.data && r.data.error) || `提交失败(${r.status})`, 'err');
+  }
+  LOADERS.strategies();
+}
+
+async function onCancelJob(job, btn){
+  btn.disabled = true;
+  const r = await api(`/api/trade/jobs/${encodeURIComponent(job.id)}/cancel`, 'POST');
+  if (r.ok) {
+    const result = r.data && r.data.result;
+    toast(result === 'requested' ? '已请求取消,将在处理下一只股票前停止' : '已取消', 'ok');
+  } else if (r.status === 409) {
+    toast('任务已结束,不可取消', 'err');
+  } else if (r.status === 404) {
+    toast('任务不存在', 'err');
+  } else {
+    toast((r.data && r.data.error) || `取消失败(${r.status})`, 'err');
+  }
+  LOADERS.strategies();
+}
+
+function renderStrategyList(list){
+  const host = document.getElementById('strategy-list');
+  if (!list.length) {
+    host.innerHTML = hintCard('还没有策略，用下方表单新建一个');
+    return;
+  }
+  const rows = list.map(s => {
+    const canSubmit = SUBMITTABLE.includes(s.status);
+    return `<tr data-id="${esc(s.id)}">
+      <td>${esc(s.name)}</td>
+      <td>${esc(kindLabel(s.kind))}</td>
+      <td class="wrap-cell">${esc(poolSummary(s.pool))}</td>
+      <td>${strategyStatusHtml(s.status)}</td>
+      <td class="wrap-cell">${esc(s.status_reason || '')}</td>
+      <td>${esc(fmtTime(s.updated_at))}</td>
+      <td><div class="ticket-actions" style="margin-top:0">
+        <button type="button" class="btn js-submit"${canSubmit ? '' : ' disabled'}>提交评估</button>
+        <button type="button" class="btn ghost js-edit">编辑</button>
+        <button type="button" class="linkish js-scorecard">成绩单</button>
+      </div></td>
+    </tr>`;
+  }).join('');
+  host.innerHTML = `<div class="card"><div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>名称</th><th>类型</th><th>股票池</th><th>状态</th><th>状态原因</th><th>更新时间</th><th>操作</th></tr></thead>
+    <tbody>${rows}</tbody></table></div></div>`;
+  host.querySelectorAll('tr[data-id]').forEach(row => {
+    const s = strategiesById.get(row.getAttribute('data-id'));
+    if (!s) return;
+    const submitBtn = row.querySelector('.js-submit');
+    submitBtn.onclick = () => onSubmitStrategy(s, submitBtn);
+    row.querySelector('.js-edit').onclick = () => editStrategy(s);
+    row.querySelector('.js-scorecard').onclick = () => {
+      scorecardId = s.id;
+      scorecardScroll = true;
+      loadScorecard();
+    };
+  });
+}
+
+function renderJobs(list){
+  const host = document.getElementById('jobs');
+  if (!list.length) {
+    host.innerHTML = `<div class="card"><h3 class="form-title">评估任务</h3><div class="hint">还没有评估任务</div></div>`;
+    return;
+  }
+  const rows = list.map(j => {
+    const s = strategiesById.get(String(j.strategy_id));
+    const cancellable = j.kind === 'walk_forward' && (j.status === 'queued' || j.status === 'running');
+    return `<tr data-id="${esc(j.id)}">
+      <td>${esc(fmtTime(j.created_at))}</td>
+      <td>${esc(s ? s.name : '#' + j.strategy_id)}</td>
+      <td>${esc(jobKindLabel(j.kind))}</td>
+      <td>${esc(jobStatusLabel(j.status))}</td>
+      <td class="wrap-cell">${esc(j.progress || '')}</td>
+      <td class="wrap-cell">${esc(j.error || '')}</td>
+      <td>${cancellable ? '<button type="button" class="btn ghost js-cancel-job">取消</button>' : ''}</td>
+    </tr>`;
+  }).join('');
+  host.innerHTML = `<div class="card"><h3 class="form-title">评估任务</h3><div class="hint" style="margin-bottom:8px">最近 50 个</div><div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>时间</th><th>策略</th><th>类型</th><th>状态</th><th>进度</th><th>错误</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table></div></div>`;
+  const byId = new Map(list.map(j => [String(j.id), j]));
+  host.querySelectorAll('tr[data-id]').forEach(row => {
+    const j = byId.get(row.getAttribute('data-id'));
+    const btn = row.querySelector('.js-cancel-job');
+    if (j && btn) btn.onclick = () => onCancelJob(j, btn);
+  });
+}
+
+async function loadScorecard(){
+  const seq = ++scorecardSeq;
+  const host = document.getElementById('scorecard');
+  const id = scorecardId;
+  if (id == null) { host.innerHTML = ''; return; }
+  const base = `/api/trade/strategies/${encodeURIComponent(id)}`;
+  const [r, ev] = await Promise.all([api(base + '/scorecard'), api(base + '/events')]);
+  if (seq !== scorecardSeq) return;
+  if (!r.ok || !r.data) {
+    host.innerHTML = hintCard(r.status === 404 ? '策略不存在' : loadFailedMsg(r));
+    return;
+  }
+  const sc = r.data;
+  const events = ev.ok && Array.isArray(ev.data) ? ev.data.slice(-10).reverse() : [];
+  const evHtml = events.length
+    ? `<ul class="sc-events">${events.map(e => `<li>${esc(fmtTime(e.at))}　${esc(STRATEGY_STATUS[e.from] || e.from)} → ${esc(STRATEGY_STATUS[e.to] || e.to)}　${esc(e.reason || '')}</li>`).join('')}</ul>`
+    : '<div class="hint" style="margin-bottom:12px">暂无状态变更记录</div>';
+  const rows = scorecardRows(sc).map(row =>
+    `<tr><td>${esc(row[0])}</td>${row.slice(1).map(c => `<td class="num">${esc(c)}</td>`).join('')}</tr>`
+  ).join('');
+  const loss = sc.execution_loss == null ? '—' : fmtPct(sc.execution_loss);
+  host.innerHTML = `<div class="card">
+    <div class="sc-head"><b>成绩单：${esc(sc.name)}</b>${strategyStatusHtml(sc.status)}
+      <button type="button" class="linkish js-close-scorecard">收起</button></div>
+    ${evHtml}
+    <div class="tbl-wrap"><table class="tbl">
+      <thead><tr><th>指标</th><th class="num">样本内</th><th class="num">样本外</th><th class="num">模拟盘</th><th class="num">实盘</th></tr></thead>
+      <tbody>${rows}
+        <tr><td>执行损耗(中位数,实盘相对模拟盘多付)</td><td class="num" colspan="4">${esc(loss)}</td></tr>
+      </tbody></table></div>
+  </div>`;
+  host.querySelector('.js-close-scorecard').onclick = () => {
+    scorecardId = null;
+    ++scorecardSeq;
+    host.innerHTML = '';
+  };
+  if (scorecardScroll) {
+    scorecardScroll = false;
+    host.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+}
+
+async function loadStrategies(){
+  const seq = ++strategiesSeq;
+  loadScorecard(); // 与列表、任务并行拉取
+  const [sr, jr] = await Promise.all([api('/api/trade/strategies'), api('/api/trade/jobs')]);
+  if (seq !== strategiesSeq) return; // 已有更新的请求，丢弃过时结果
+  if (!sr.ok || !Array.isArray(sr.data)) {
+    document.getElementById('strategy-list').innerHTML = hintCard(loadFailedMsg(sr));
+  } else {
+    strategiesById = new Map(sr.data.map(s => [String(s.id), s]));
+    renderStrategyList(sr.data);
+  }
+  if (!jr.ok || !Array.isArray(jr.data)) {
+    document.getElementById('jobs').innerHTML = hintCard(loadFailedMsg(jr));
+  } else {
+    renderJobs(jr.data);
+  }
+}
+LOADERS.strategies = loadStrategies;
+
+// 供「待确认」工单卡片的「查看策略成绩单」调用：切到策略标签并展开该策略成绩单
+function openStrategy(id){
+  scorecardId = id;
+  scorecardScroll = true;
+  showTab('strategies'); // showTab 总会调用 LOADERS.strategies()，其中拉取成绩单
+}
+
+strategyForm().addEventListener('submit', onSaveStrategy);
+strategyForm().querySelector('.js-cancel-edit').addEventListener('click', resetStrategyForm);
+
 // ===== Task 5: 持仓校准（追加区） =====
 
 // ===== 初始化与轮询（须在脚本末尾：各标签的 LOADERS 注册完后再首次加载） =====
@@ -713,6 +1075,30 @@ mod tests {
             "nothing_sellable",
             "daily_loss_halt",
             "paper_ticket",
+        ] {
+            assert!(body.contains(s), "缺 {s}");
+        }
+    }
+
+    #[tokio::test]
+    async fn strategy_tab_has_form_scorecard_and_jobs() {
+        let body = crate::web::trade_page::TRADE_HTML;
+        for s in [
+            "id=\"strategy-form\"",
+            "id=\"scorecard\"",
+            "id=\"jobs\"",
+            "function scorecardRows(",
+            "function openStrategy(",
+            "LOADERS.strategies",
+            "/api/trade/strategies",
+            "/api/trade/jobs",
+            "样本内",
+            "样本外",
+            "模拟盘",
+            "实盘",
+            "执行损耗",
+            "reversioned",
+            "已请求取消",
         ] {
             assert!(body.contains(s), "缺 {s}");
         }
