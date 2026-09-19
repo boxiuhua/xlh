@@ -52,6 +52,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-s
 .ticket-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px 16px;margin:8px 0;font-size:.9rem}
 .ticket-grid .k{color:#7f8c8d;margin-right:4px}
 .dev-bad{color:#c0392b;font-weight:600}
+.stale-q{color:#95a5a6}
 .ticket-reason{font-size:.9rem;margin:6px 0;white-space:pre-wrap;word-break:break-word}
 .ticket-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}
 .ticket.expired{opacity:.55;filter:grayscale(1)}
@@ -926,7 +927,292 @@ function openStrategy(id){
 strategyForm().addEventListener('submit', onSaveStrategy);
 strategyForm().querySelector('.js-cancel-edit').addEventListener('click', resetStrategyForm);
 
-// ===== Task 5: 持仓校准（追加区） =====
+// ===== Task 5: 风控设置、账户资金与持仓校准（追加区） =====
+
+// 四舍五入到 1 位小数（用于比例字段 ×100 后的展示，避免浮点噪声如 7.999999）
+function round1(x){
+  return Math.round(x * 10) / 10;
+}
+
+// ----- 风控设置 -----
+
+function riskForm(){
+  return document.getElementById('risk-form');
+}
+
+// GET /api/trade/risk 返回的最近一次原始对象；保存时以此为底，覆盖表单中的字段，
+// 未在表单中出现的字段（如未来新增字段）原样带回。
+let riskRaw = null;
+
+function riskPanelHtml(){
+  return `<div class="card">
+    <form id="risk-form" autocomplete="off">
+      <h3 class="form-title">风控设置</h3>
+      <div class="form-grid">
+        <label><input type="checkbox" name="enabled"/> 允许生成工单</label>
+        <label>单笔金额上限(元)<input type="number" step="0.01" min="0" name="max_order_amount" required/></label>
+        <label>单票仓位上限(%)<input type="number" step="0.1" min="0" max="100" name="max_position_pct" required/></label>
+        <label>每日工单上限<input type="number" step="1" min="1" name="max_daily_tickets" required/></label>
+        <label>当日亏损停止买入(%)<input type="number" step="0.1" min="0" max="50" name="daily_loss_halt_pct" required/></label>
+        <label>同码冷却(分钟)<input type="number" step="1" min="0" name="cooldown_min" required/></label>
+        <label>偏离提醒阈值(%)<input type="number" step="0.1" min="0" max="10" name="deviation_th" required/></label>
+        <label>默认止损(%)<input type="number" step="0.1" min="0" max="50" name="default_stop_loss_pct" required/></label>
+        <label>默认止盈(%)<input type="number" step="0.1" min="0" max="500" name="default_take_profit_pct" required/></label>
+        <label>模拟盘滑点(%)<input type="number" step="0.01" min="0" name="slippage" required/></label>
+      </div>
+      <div id="risk-form-err" class="form-err"></div>
+      <div class="ticket-actions"><button type="submit" class="btn js-save-risk">保存</button></div>
+    </form>
+  </div>
+  <div class="card">
+    <h3 class="form-title">账户资金</h3>
+    <div class="form-grid">
+      <label>实盘总资金(元)<input type="number" step="0.01" min="0" id="capital-real"/></label>
+      <label>模拟盘总资金(元)<input type="number" step="0.01" min="0" id="capital-paper"/></label>
+    </div>
+    <div id="capital-err" class="form-err"></div>
+    <div class="ticket-actions">
+      <button type="button" class="btn js-save-capital" data-account="real">保存实盘资金</button>
+      <button type="button" class="btn js-save-capital" data-account="paper">保存模拟盘资金</button>
+    </div>
+  </div>`;
+}
+
+function fillRiskForm(rules){
+  const f = riskForm();
+  f.elements.enabled.checked = !!rules.enabled;
+  f.elements.max_order_amount.value = rules.max_order_amount;
+  f.elements.max_position_pct.value = round1(rules.max_position_pct * 100);
+  f.elements.max_daily_tickets.value = rules.max_daily_tickets;
+  f.elements.daily_loss_halt_pct.value = round1(rules.daily_loss_halt_pct * 100);
+  f.elements.cooldown_min.value = rules.cooldown_min;
+  f.elements.deviation_th.value = round1(rules.deviation_th * 100);
+  f.elements.default_stop_loss_pct.value = round1(rules.default_stop_loss_pct * 100);
+  f.elements.default_take_profit_pct.value = round1(rules.default_take_profit_pct * 100);
+  f.elements.slippage.value = round1(rules.slippage * 100);
+}
+
+async function onSaveRisk(ev){
+  ev.preventDefault();
+  const f = riskForm();
+  const errEl = document.getElementById('risk-form-err');
+  errEl.textContent = '';
+  const body = Object.assign({}, riskRaw, {
+    enabled: f.elements.enabled.checked,
+    max_order_amount: Number(f.elements.max_order_amount.value),
+    max_position_pct: Number(f.elements.max_position_pct.value) / 100,
+    max_daily_tickets: Number(f.elements.max_daily_tickets.value),
+    daily_loss_halt_pct: Number(f.elements.daily_loss_halt_pct.value) / 100,
+    cooldown_min: Number(f.elements.cooldown_min.value),
+    deviation_th: Number(f.elements.deviation_th.value) / 100,
+    default_stop_loss_pct: Number(f.elements.default_stop_loss_pct.value) / 100,
+    default_take_profit_pct: Number(f.elements.default_take_profit_pct.value) / 100,
+    slippage: Number(f.elements.slippage.value) / 100,
+  });
+  const btn = f.querySelector('.js-save-risk');
+  btn.disabled = true;
+  const r = await api('/api/trade/risk', 'POST', body);
+  btn.disabled = false;
+  if (!r.ok) {
+    // 400 时保留表单已填的值，只显示错误（Task 3/4 的约定）
+    errEl.textContent = (r.data && r.data.error) || `保存失败(${r.status})`;
+    return;
+  }
+  riskRaw = body;
+  toast('已保存风控设置', 'ok');
+}
+
+async function onSaveCapital(btn){
+  const account = btn.getAttribute('data-account');
+  const input = document.getElementById('capital-' + account);
+  const errEl = document.getElementById('capital-err');
+  errEl.textContent = '';
+  const total = Number(input.value);
+  if (!(total > 0)) { errEl.textContent = '总资金必须为正数'; return; }
+  btn.disabled = true;
+  const r = await api('/api/trade/capital', 'POST', { account, total });
+  btn.disabled = false;
+  if (!r.ok) {
+    errEl.textContent = (r.data && r.data.error) || `保存失败(${r.status})`;
+    return;
+  }
+  toast('已保存账户资金', 'ok');
+  loadOverview();
+}
+
+let riskSeq = 0;
+
+async function loadRisk(){
+  const seq = ++riskSeq;
+  const panel = document.getElementById('panel-risk');
+  const [rr, ov] = await Promise.all([api('/api/trade/risk'), api('/api/trade/overview')]);
+  if (seq !== riskSeq) return; // 已有更新的请求，丢弃过时结果
+  if (!rr.ok || !rr.data) { panel.innerHTML = hintCard(loadFailedMsg(rr)); return; }
+  panel.innerHTML = riskPanelHtml();
+  riskRaw = rr.data;
+  fillRiskForm(rr.data);
+  const acc = (ov.ok && ov.data && ov.data.accounts) || {};
+  document.getElementById('capital-real').value = acc.real ? acc.real.total_capital : '';
+  document.getElementById('capital-paper').value = acc.paper ? acc.paper.total_capital : '';
+  riskForm().addEventListener('submit', onSaveRisk);
+  panel.querySelectorAll('.js-save-capital').forEach(btn => {
+    btn.onclick = () => onSaveCapital(btn);
+  });
+}
+LOADERS.risk = loadRisk;
+
+// ----- 持仓校准 -----
+
+function calibrateForm(){
+  return document.getElementById('calibrate-form');
+}
+
+function positionsPanelHtml(){
+  return `<form id="calibrate-form" class="card" autocomplete="off">
+    <h3 class="form-title">校准持仓（仅实盘）</h3>
+    <div class="hint" style="margin-bottom:10px">以券商账户为准修正系统记录；数量填 0 表示已清仓</div>
+    <div class="form-grid">
+      <label>代码<input type="text" name="code" maxlength="6" required/></label>
+      <label>数量<input type="number" step="1" min="0" name="qty" required/></label>
+      <label>成本价<input type="number" step="0.001" min="0" name="avg_cost"/></label>
+      <label class="full">原因<input type="text" name="reason" required/></label>
+    </div>
+    <div id="calibrate-form-err" class="form-err"></div>
+    <div class="ticket-actions"><button type="submit" class="btn js-save">提交校准</button></div>
+  </form>
+  <div class="card"><h3 class="form-title">实盘持仓</h3><div id="positions-real" class="tbl-wrap"></div></div>
+  <div class="card"><h3 class="form-title">模拟盘持仓</h3><div id="positions-paper" class="tbl-wrap"></div></div>
+  <div class="card"><h3 class="form-title">校准记录</h3><div id="adjusts-list" class="tbl-wrap"></div></div>`;
+}
+
+// 止损 / 止盈 / 移动止盈输入框留空即视为清除（提交 null）；移动止盈以 % 展示，提交时 ÷ 100
+function positionRowHtml(p){
+  const q = p.quote;
+  const priceHtml = q
+    ? `<span class="${q.stale ? 'stale-q' : ''}">${esc(fmtMoney(q.price))}</span>${q.stale ? ' <span class="tag urgent">延迟</span>' : ''}`
+    : '—';
+  const trailingDisplay = p.trailing_pct == null ? '' : round1(p.trailing_pct * 100);
+  return `<tr data-code="${esc(p.code)}">
+    <td>${esc(p.code)}</td>
+    <td>${esc(p.qty)}</td>
+    <td>${esc(p.sellable)}</td>
+    <td>${esc(fmtMoney(p.avg_cost))}</td>
+    <td>${priceHtml}</td>
+    <td>${esc(fmtMoney(p.market_value))}</td>
+    <td>${esc(fmtPct(p.pnl_pct))}</td>
+    <td><div class="fill-form">
+      <input type="number" step="0.001" min="0" class="js-stop-loss" placeholder="止损" value="${esc(p.stop_loss == null ? '' : p.stop_loss)}"/>
+      <input type="number" step="0.001" min="0" class="js-take-profit" placeholder="止盈" value="${esc(p.take_profit == null ? '' : p.take_profit)}"/>
+      <input type="number" step="0.1" min="0" max="50" class="js-trailing" placeholder="移动止盈%" value="${esc(trailingDisplay)}"/>
+      <button type="button" class="btn js-save-exit">保存</button>
+    </div></td>
+  </tr>`;
+}
+
+function positionsTableHtml(list){
+  if (!list.length) return '<div class="hint">无持仓</div>';
+  return `<table class="tbl">
+    <thead><tr><th>代码</th><th>数量</th><th>可卖</th><th>成本</th><th>现价</th><th>市值</th><th>盈亏</th><th>止损 / 止盈 / 移动止盈(%)</th></tr></thead>
+    <tbody>${list.map(positionRowHtml).join('')}</tbody></table>`;
+}
+
+async function onSaveExitLevels(account, p, row){
+  const parseOpt = el => (el.value.trim() === '' ? null : Number(el.value));
+  const stop_loss = parseOpt(row.querySelector('.js-stop-loss'));
+  const take_profit = parseOpt(row.querySelector('.js-take-profit'));
+  const trailingPctInput = parseOpt(row.querySelector('.js-trailing'));
+  const trailing_pct = trailingPctInput === null ? null : trailingPctInput / 100;
+  const btn = row.querySelector('.js-save-exit');
+  btn.disabled = true;
+  const r = await api('/api/trade/positions/exit-levels', 'POST', {
+    account, code: p.code, stop_loss, take_profit, trailing_pct,
+  });
+  btn.disabled = false;
+  if (!r.ok) {
+    toast((r.data && r.data.error) || `保存失败(${r.status})`, 'err');
+    return;
+  }
+  toast('已保存止盈止损', 'ok');
+  LOADERS.positions();
+}
+
+function bindPositionRows(host, account, list){
+  const byCode = new Map(list.map(p => [p.code, p]));
+  host.querySelectorAll('tr[data-code]').forEach(row => {
+    const p = byCode.get(row.getAttribute('data-code'));
+    if (!p) return;
+    row.querySelector('.js-save-exit').onclick = () => onSaveExitLevels(account, p, row);
+  });
+}
+
+function beforeAfterCell(x){
+  return x ? `${esc(x.qty)} / ${esc(fmtMoney(x.avg_cost))}` : '无';
+}
+
+function adjustsTableHtml(list){
+  if (!list.length) return '<div class="hint">暂无校准记录</div>';
+  const rows = list.map(a => `<tr>
+      <td>${esc(fmtTime(a.at))}</td>
+      <td>${esc(a.code)}</td>
+      <td>${beforeAfterCell(a.before)}</td>
+      <td>${beforeAfterCell(a.after)}</td>
+      <td class="wrap-cell">${esc(a.reason)}</td>
+    </tr>`).join('');
+  return `<table class="tbl">
+    <thead><tr><th>时间</th><th>代码</th><th>改前数量 / 成本</th><th>改后数量 / 成本</th><th>原因</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+async function onCalibrate(ev){
+  ev.preventDefault();
+  const f = calibrateForm();
+  const errEl = document.getElementById('calibrate-form-err');
+  errEl.textContent = '';
+  const body = {
+    code: f.elements.code.value.trim(),
+    qty: Number(f.elements.qty.value),
+    avg_cost: f.elements.avg_cost.value.trim() === '' ? 0 : Number(f.elements.avg_cost.value),
+    reason: f.elements.reason.value.trim(),
+  };
+  const btn = f.querySelector('.js-save');
+  btn.disabled = true;
+  const r = await api('/api/trade/positions/calibrate', 'POST', body);
+  btn.disabled = false;
+  if (!r.ok) {
+    // 400 时保留表单已填的值，只显示错误
+    errEl.textContent = (r.data && r.data.error) || `提交失败(${r.status})`;
+    return;
+  }
+  toast('已校准持仓', 'ok');
+  f.reset();
+  LOADERS.positions();
+}
+
+let positionsSeq = 0;
+
+async function loadPositions(){
+  const seq = ++positionsSeq;
+  const panel = document.getElementById('panel-positions');
+  const [pr, ar] = await Promise.all([
+    api('/api/trade/positions'),
+    api('/api/trade/positions/adjusts'),
+  ]);
+  if (seq !== positionsSeq) return; // 已有更新的请求，丢弃过时结果
+  if (!pr.ok || !pr.data) { panel.innerHTML = hintCard(loadFailedMsg(pr)); return; }
+  panel.innerHTML = positionsPanelHtml();
+  const realList = Array.isArray(pr.data.real) ? pr.data.real : [];
+  const paperList = Array.isArray(pr.data.paper) ? pr.data.paper : [];
+  const realHost = document.getElementById('positions-real');
+  realHost.innerHTML = positionsTableHtml(realList);
+  bindPositionRows(realHost, 'real', realList);
+  const paperHost = document.getElementById('positions-paper');
+  paperHost.innerHTML = positionsTableHtml(paperList);
+  bindPositionRows(paperHost, 'paper', paperList);
+  const adjustsHost = document.getElementById('adjusts-list');
+  adjustsHost.innerHTML = ar.ok && Array.isArray(ar.data) ? adjustsTableHtml(ar.data) : hintCard(loadFailedMsg(ar));
+  calibrateForm().addEventListener('submit', onCalibrate);
+}
+LOADERS.positions = loadPositions;
 
 // ===== 初始化与轮询（须在脚本末尾：各标签的 LOADERS 注册完后再首次加载） =====
 
@@ -1107,5 +1393,26 @@ mod tests {
     #[tokio::test]
     async fn index_links_to_trade() {
         assert!(crate::web::page::INDEX_HTML.contains("href=\"/trade\""));
+    }
+
+    #[tokio::test]
+    async fn risk_and_positions_tabs_have_forms() {
+        let body = crate::web::trade_page::TRADE_HTML;
+        for s in [
+            "id=\"risk-form\"",
+            "id=\"calibrate-form\"",
+            "LOADERS.risk",
+            "LOADERS.positions",
+            "/api/trade/risk",
+            "/api/trade/capital",
+            "/api/trade/positions/calibrate",
+            "/api/trade/positions/exit-levels",
+            "/api/trade/positions/adjusts",
+            "max_position_pct",
+            "default_stop_loss_pct",
+            "数量填 0 表示已清仓",
+        ] {
+            assert!(body.contains(s), "缺 {s}");
+        }
     }
 }
