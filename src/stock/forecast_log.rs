@@ -378,8 +378,16 @@ fn refresh_pending_with(
         let Some((market, code)) = symbol.split_once('.') else {
             continue;
         };
+        // 库里一条坏符号不能拖垮其余股票的核验:记错误,继续下一只
+        let market = match market.parse() {
+            Ok(m) => m,
+            Err(e) => {
+                errors.push(format!("{symbol}: 市场号无效: {e}"));
+                continue;
+            }
+        };
         let secid = Secid {
-            market: market.parse()?,
+            market,
             code: code.into(),
         };
         let attempt = (|| -> Result<usize> {
@@ -476,5 +484,43 @@ mod tests {
                 ("1.600519".to_string(), at(82).to_rfc3339()),
             ]
         );
+    }
+
+    #[test]
+    fn bad_stored_symbol_is_reported_without_aborting_the_others() {
+        let mut c = db_with_pending(&[secid(1)]);
+        // 库里混进一条市场号不合法的记录
+        c.execute(
+            "UPDATE forecast_inputs SET symbol='x9.000001' WHERE id=1",
+            [],
+        )
+        .unwrap();
+        record(
+            &mut c,
+            &secid(1),
+            &bars(80),
+            &crate::stock::forecast::forecast(&bars(80)).unwrap(),
+            at(80),
+        )
+        .unwrap();
+        let err = refresh_pending_with(&mut c, |_| Ok(bars(86)), at(86))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("x9.000001"), "{err}");
+        assert!(err.contains("已核验1条"), "{err}");
+        // 正常的那只照常抓取、结算
+        assert_eq!(
+            batches(&c),
+            vec![("1.600519".to_string(), at(86).to_rfc3339())]
+        );
+        let settled: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM forecast_records r JOIN forecast_inputs i ON i.id=r.input_id
+                 WHERE i.symbol='1.600519' AND r.status<>'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(settled, 1);
     }
 }
