@@ -38,6 +38,33 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-s
 .toast-item{padding:8px 14px;border-radius:8px;font-size:.9rem;color:#fff;box-shadow:0 2px 8px rgba(0,0,0,.15)}
 .toast-ok{background:#16a34a}
 .toast-err{background:#c0392b}
+.btn{padding:6px 14px;border:1px solid #c0392b;border-radius:6px;background:#c0392b;color:#fff;cursor:pointer;font-size:.9rem}
+.btn.ghost{background:#fff;color:#555;border-color:#ccd2da}
+.btn.warn{background:#d35400;border-color:#d35400}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.side-buy{color:#c0392b;font-weight:600}
+.side-sell{color:#16a34a;font-weight:600}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;background:#eef1f4;color:#555;font-size:.8rem;margin-left:6px}
+.tag.urgent{background:#fdecea;color:#c0392b}
+.ticket-head{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-bottom:8px}
+.ticket-head .code{font-size:1.1rem;font-weight:700;margin-right:6px}
+.countdown{margin-left:auto;font-variant-numeric:tabular-nums;color:#7f8c8d;font-size:.9rem}
+.ticket-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px 16px;margin:8px 0;font-size:.9rem}
+.ticket-grid .k{color:#7f8c8d;margin-right:4px}
+.dev-bad{color:#c0392b;font-weight:600}
+.ticket-reason{font-size:.9rem;margin:6px 0;white-space:pre-wrap;word-break:break-word}
+.ticket-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}
+.ticket.expired{opacity:.55;filter:grayscale(1)}
+.linkish{background:none;border:none;color:#2563eb;cursor:pointer;font-size:.9rem;padding:0}
+details.ai-note{font-size:.9rem;margin:6px 0}
+details.ai-note summary{cursor:pointer;color:#2563eb}
+.tbl-wrap{overflow-x:auto}
+table.tbl{width:100%;border-collapse:collapse;font-size:.9rem}
+table.tbl th,table.tbl td{padding:7px 8px;border-bottom:1px solid #eef1f4;text-align:left;white-space:nowrap}
+table.tbl td.wrap-cell{white-space:normal;min-width:160px}
+table.tbl th{color:#7f8c8d;font-weight:500}
+.fill-form{display:flex;gap:6px;align-items:center}
+.fill-form input{width:90px;padding:4px 6px;border:1px solid #ccd2da;border-radius:5px}
 @media (max-width:640px){
   #trade-bar{flex-direction:column;align-items:flex-start}
   .card{padding:12px}
@@ -220,7 +247,326 @@ async function loadOverview(){
     (!o.kill_switch && o.trading_enabled === false) ? 'inline-block' : 'none';
 }
 
-// ===== 初始化与轮询 =====
+// ===== Task 3: 待确认 / 待成交 / 已完成 / 被拦截的信号（追加区） =====
+
+const REJECT_REASONS = {
+  trading_disabled: '交易已关闭',
+  duplicate_open_ticket: '已有未完结工单',
+  cooldown: '冷却中',
+  not_admitted: '策略未准入',
+  no_quote: '无行情',
+  limit_up: '涨停不买',
+  limit_down: '跌停不卖',
+  daily_ticket_cap: '超过每日工单上限',
+  daily_loss_halt: '当日亏损已达上限',
+  no_capital: '未设置资金',
+  below_one_lot: '不足一手',
+  nothing_sellable: '无可卖数量',
+};
+
+function rejectReasonLabel(r){
+  return REJECT_REASONS[r] || (r || '—');
+}
+
+function accountLabel(a){
+  return { real: '实盘', paper: '模拟盘' }[a] || (a || '—');
+}
+
+// 方向带颜色（买入红、卖出绿），返回已转义的 HTML 片段
+function sideHtml(side){
+  const cls = side === 'buy' ? 'side-buy' : (side === 'sell' ? 'side-sell' : '');
+  return `<span class="${cls}">${esc(sideLabel(side))}</span>`;
+}
+
+// 服务端时间是本地时区的 "YYYY-MM-DD HH:MM:SS"，按本地时间解析
+function parseLocalTs(ts){
+  if (!ts) return NaN;
+  return new Date(String(ts).replace(' ', 'T')).getTime();
+}
+
+function hintCard(msg){
+  return `<div class="card"><div class="hint">${esc(msg)}</div></div>`;
+}
+
+function loadFailedMsg(r){
+  return (r.data && r.data.error) || `加载失败(${r.status})`;
+}
+
+// ----- 待确认 -----
+
+function confirmState(ticket) {
+  if (!ticket.quote || ticket.quote.stale) return { text: '行情延迟', disabled: true, ack: false };
+  const deviated = ticket.deviation != null && ticket.deviation > ticket.deviation_th;
+  return deviated
+    ? { text: `价格已偏离 ${fmtPct(ticket.deviation)},仍要确认`, disabled: false, ack: true, warn: true }
+    : { text: '确认', disabled: false, ack: false };
+}
+
+async function onConfirm(ticket, btn, ack) {
+  btn.disabled = true;
+  const r = await api(`/api/trade/tickets/${ticket.id}/confirm`, 'POST', { ack_deviation: ack });
+  if (r.ok) { toast('已确认,请在券商 App 下单后回来回填成交', 'ok'); return LOADERS.pending(); }
+  const code = r.data && r.data.code;
+  if (code === 'deviation') {
+    // 服务端判出偏离而页面未预判:改为二次确认
+    btn.textContent = `价格已偏离 ${fmtPct(r.data.deviation)},仍要确认`;
+    btn.classList.add('warn');
+    btn.disabled = false;
+    btn.onclick = () => onConfirm(ticket, btn, true);
+    return;
+  }
+  const msg = {
+    already_handled: '该工单已处理或已过期',
+    stale_quote: '行情延迟,暂不能确认',
+    kill_switch: '管理员已暂停交易',
+  }[code] || (r.data && r.data.error) || `确认失败(${r.status})`;
+  toast(msg, 'err');
+  LOADERS.pending();
+}
+
+async function onIgnore(ticket, btn){
+  const input = prompt(`忽略 ${ticket.code} 的工单，请填写理由：`, '');
+  if (input === null) return;
+  const reason = input.trim();
+  if (!reason) { toast('未填写理由，未提交', 'err'); return; }
+  btn.disabled = true;
+  const r = await api(`/api/trade/tickets/${ticket.id}/ignore`, 'POST', { reason });
+  if (r.ok) {
+    toast('已忽略', 'ok');
+  } else {
+    const code = r.data && r.data.code;
+    toast(code === 'already_handled'
+      ? '该工单已处理或已过期'
+      : ((r.data && r.data.error) || `忽略失败(${r.status})`), 'err');
+  }
+  LOADERS.pending();
+}
+
+function fmtCountdown(ms){
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const p = n => String(n).padStart(2, '0');
+  return `剩 ${p(Math.floor(s / 60))}:${p(s % 60)}`;
+}
+
+// 每秒刷新所有待确认卡片的倒计时；到期置灰并禁用操作按钮。
+// 定时器只在脚本加载时建一次，按 DOM 现状工作，重新渲染不会叠加定时器。
+function tickCountdowns(){
+  const now = Date.now();
+  document.querySelectorAll('#panel-pending .ticket').forEach(card => {
+    const el = card.querySelector('.countdown');
+    const exp = Number(card.getAttribute('data-expires'));
+    if (!exp || !isFinite(exp)) { if (el) el.textContent = '有效期未知'; return; }
+    const left = exp - now;
+    if (left > 0) { if (el) el.textContent = fmtCountdown(left); return; }
+    if (el) el.textContent = '已过期';
+    if (!card.classList.contains('expired')) {
+      card.classList.add('expired');
+      card.querySelectorAll('button.act').forEach(b => { b.disabled = true; });
+    }
+  });
+}
+setInterval(tickCountdowns, 1000);
+
+function ticketCardHtml(t, noteOpen){
+  const st = confirmState(t);
+  const devBad = t.deviation != null && t.deviation > t.deviation_th;
+  const exp = parseLocalTs(t.expires_at);
+  const urgent = t.urgency > 0 ? `<span class="tag urgent">第 ${esc(t.urgency + 1)} 次提醒</span>` : '';
+  const price = t.quote ? fmtMoney(t.quote.price) : '—';
+  const stale = t.quote && t.quote.stale ? '<span class="tag urgent">行情延迟</span>' : '';
+  const note = t.ai_note
+    ? `<details class="ai-note"${noteOpen ? ' open' : ''}><summary>AI 说明</summary><div class="ticket-reason">${esc(t.ai_note)}</div></details>`
+    : '';
+  const strat = t.strategy_id != null
+    ? `<button type="button" class="linkish js-strategy">查看策略成绩单</button>`
+    : '';
+  return `<div class="card ticket" data-id="${esc(t.id)}" data-expires="${esc(isFinite(exp) ? exp : '')}">
+    <div class="ticket-head">
+      <span class="code">${esc(t.code)}</span>${sideHtml(t.side)}
+      <span class="tag">${esc(sourceLabel(t.source))}</span>${urgent}${stale}
+      <span class="countdown"></span>
+    </div>
+    <div class="ticket-grid">
+      <div><span class="k">建议价</span>${esc(fmtMoney(t.suggest_price))}</div>
+      <div><span class="k">现价</span>${esc(price)}</div>
+      <div><span class="k">偏离</span><span class="${devBad ? 'dev-bad' : ''}">${esc(fmtPct(t.deviation))}</span>
+        <span class="hint">(阈值 ${esc(fmtPct(t.deviation_th))})</span></div>
+      <div><span class="k">数量</span>${esc(t.qty)} 股</div>
+      <div><span class="k">预估金额</span>${esc(fmtMoney(t.est_amount))}</div>
+      <div><span class="k">预估费用</span>${esc(fmtMoney(t.est_fee))}</div>
+    </div>
+    <div class="ticket-reason"><span class="k hint">理由：</span>${esc(t.reason || '—')}</div>
+    ${note}
+    <div class="ticket-actions">
+      <button type="button" class="btn act js-confirm${st.warn ? ' warn' : ''}"${st.disabled ? ' disabled' : ''}>${esc(st.text)}</button>
+      <button type="button" class="btn ghost act js-ignore">忽略</button>
+      ${strat}
+    </div>
+  </div>`;
+}
+
+let pendingSeq = 0;
+
+async function loadPending(){
+  const seq = ++pendingSeq;
+  const panel = document.getElementById('panel-pending');
+  const r = await api('/api/trade/tickets?view=pending');
+  if (seq !== pendingSeq) return; // 已有更新的请求，丢弃过时结果
+  if (!r.ok || !Array.isArray(r.data)) { panel.innerHTML = hintCard(loadFailedMsg(r)); return; }
+  const list = r.data;
+  if (!list.length) { panel.innerHTML = hintCard('没有待确认的工单'); return; }
+  // 15 秒重绘时保留已展开的「AI 说明」
+  const openNotes = new Set();
+  panel.querySelectorAll('.ticket').forEach(card => {
+    const d = card.querySelector('details.ai-note');
+    if (d && d.open) openNotes.add(card.getAttribute('data-id'));
+  });
+  panel.innerHTML = list.map(t => ticketCardHtml(t, openNotes.has(String(t.id)))).join('');
+  const byId = new Map(list.map(t => [String(t.id), t]));
+  panel.querySelectorAll('.ticket').forEach(card => {
+    const t = byId.get(card.getAttribute('data-id'));
+    if (!t) return;
+    const confirmBtn = card.querySelector('.js-confirm');
+    const ack = confirmState(t).ack;
+    confirmBtn.onclick = () => onConfirm(t, confirmBtn, ack);
+    const ignoreBtn = card.querySelector('.js-ignore');
+    ignoreBtn.onclick = () => onIgnore(t, ignoreBtn);
+    const sBtn = card.querySelector('.js-strategy');
+    if (sBtn) {
+      const sid = t.strategy_id;
+      sBtn.onclick = () => (typeof openStrategy === 'function' ? openStrategy(sid) : showTab('strategies'));
+    }
+  });
+  tickCountdowns();
+}
+LOADERS.pending = loadPending;
+
+// ----- 待成交 -----
+
+async function onFill(t, row){
+  const priceEl = row.querySelector('.js-fill-price');
+  const qtyEl = row.querySelector('.js-fill-qty');
+  const btn = row.querySelector('.js-fill');
+  const price = Number(priceEl.value);
+  const qty = Number(qtyEl.value);
+  if (!(price > 0)) { toast('请填写有效的成交价', 'err'); return; }
+  if (!Number.isInteger(qty) || qty <= 0) { toast('请填写有效的成交数量（正整数）', 'err'); return; }
+  btn.disabled = true;
+  const r = await api(`/api/trade/tickets/${t.id}/fill`, 'POST', { price, qty });
+  if (r.ok) {
+    toast('已回填', 'ok');
+  } else {
+    const code = r.data && r.data.code;
+    toast(code === 'paper_ticket'
+      ? '模拟盘工单由系统撮合，不可人工回填'
+      : ((r.data && r.data.error) || `回填失败(${r.status})`), 'err');
+    btn.disabled = false;
+    if (r.status !== 400) LOADERS.working();
+    return;
+  }
+  LOADERS.working();
+}
+
+let workingSeq = 0;
+
+async function loadWorking(){
+  const seq = ++workingSeq;
+  const panel = document.getElementById('panel-working');
+  const r = await api('/api/trade/tickets?view=working');
+  if (seq !== workingSeq) return;
+  const tip = '<div class="hint" style="margin-bottom:10px">当日未回填的工单将在次日 9:00 自动撤销；请在券商 App 成交后回填实际成交价与数量。</div>';
+  if (!r.ok || !Array.isArray(r.data)) { panel.innerHTML = hintCard(loadFailedMsg(r)); return; }
+  const list = r.data;
+  if (!list.length) {
+    panel.innerHTML = `<div class="card">${tip}<div class="hint">没有待成交的工单</div></div>`;
+    return;
+  }
+  const rows = list.map(t => {
+    const left = Math.max(0, (Number(t.qty) || 0) - (Number(t.filled_qty) || 0));
+    return `<tr data-id="${esc(t.id)}">
+      <td>${esc(t.code)}</td>
+      <td>${sideHtml(t.side)}</td>
+      <td>${esc(t.qty)}</td>
+      <td>${esc(t.filled_qty)}</td>
+      <td>${esc(statusLabel(t.status))}</td>
+      <td>${esc(fmtTime(t.confirmed_at))}</td>
+      <td><div class="fill-form">
+        <input type="number" step="0.01" min="0" class="js-fill-price" placeholder="成交价"/>
+        <input type="number" step="1" min="1" class="js-fill-qty" value="${esc(left)}"/>
+        <button type="button" class="btn js-fill">回填</button>
+      </div></td>
+    </tr>`;
+  }).join('');
+  panel.innerHTML = `<div class="card">${tip}<div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>代码</th><th>方向</th><th>工单数量</th><th>已成交</th><th>状态</th><th>确认时间</th><th>回填（成交价 / 数量）</th></tr></thead>
+    <tbody>${rows}</tbody></table></div></div>`;
+  const byId = new Map(list.map(t => [String(t.id), t]));
+  panel.querySelectorAll('tr[data-id]').forEach(row => {
+    const t = byId.get(row.getAttribute('data-id'));
+    if (!t) return;
+    row.querySelector('.js-fill').onclick = () => onFill(t, row);
+  });
+}
+LOADERS.working = loadWorking;
+
+// ----- 已完成 -----
+
+let doneSeq = 0;
+
+async function loadDone(){
+  const seq = ++doneSeq;
+  const panel = document.getElementById('panel-done');
+  const r = await api('/api/trade/tickets?view=done');
+  if (seq !== doneSeq) return;
+  if (!r.ok || !Array.isArray(r.data)) { panel.innerHTML = hintCard(loadFailedMsg(r)); return; }
+  const list = r.data;
+  if (!list.length) { panel.innerHTML = hintCard('没有已完成的工单'); return; }
+  const rows = list.map(t => `<tr>
+      <td>${esc(fmtTime(t.created_at))}</td>
+      <td>${esc(accountLabel(t.account))}</td>
+      <td>${esc(t.code)}</td>
+      <td>${sideHtml(t.side)}</td>
+      <td>${esc(t.qty)} / ${esc(t.filled_qty)}</td>
+      <td>${esc(statusLabel(t.status))}</td>
+      <td class="wrap-cell">${esc(t.ignore_reason || '')}</td>
+    </tr>`).join('');
+  panel.innerHTML = `<div class="card"><div class="hint" style="margin-bottom:10px">最近 100 张终态工单（实盘与模拟盘）</div><div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>时间</th><th>账户</th><th>代码</th><th>方向</th><th>数量 / 已成交</th><th>状态</th><th>忽略理由</th></tr></thead>
+    <tbody>${rows}</tbody></table></div></div>`;
+}
+LOADERS.done = loadDone;
+
+// ----- 被拦截的信号 -----
+
+let rejectedSeq = 0;
+
+async function loadRejected(){
+  const seq = ++rejectedSeq;
+  const panel = document.getElementById('panel-rejected');
+  const r = await api('/api/trade/signals/rejected?limit=100');
+  if (seq !== rejectedSeq) return;
+  if (!r.ok || !Array.isArray(r.data)) { panel.innerHTML = hintCard(loadFailedMsg(r)); return; }
+  const list = r.data;
+  if (!list.length) { panel.innerHTML = hintCard('没有被拦截的信号'); return; }
+  const rows = list.map(s => `<tr>
+      <td>${esc(fmtTime(s.created_at))}</td>
+      <td>${esc(sourceLabel(s.source))}</td>
+      <td>${esc(s.code)}</td>
+      <td>${sideHtml(s.side)}</td>
+      <td>${esc(rejectReasonLabel(s.reject_reason))}</td>
+      <td class="wrap-cell">${esc(s.reason || '')}</td>
+    </tr>`).join('');
+  panel.innerHTML = `<div class="card"><div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>时间</th><th>来源</th><th>代码</th><th>方向</th><th>拦截原因</th><th>理由</th></tr></thead>
+    <tbody>${rows}</tbody></table></div></div>`;
+}
+LOADERS.rejected = loadRejected;
+
+// ===== Task 4: 策略 / 风控设置（追加区） =====
+
+// ===== Task 5: 持仓校准（追加区） =====
+
+// ===== 初始化与轮询（须在脚本末尾：各标签的 LOADERS 注册完后再首次加载） =====
 
 function initialTab(){
   const h = location.hash.slice(1);
@@ -236,12 +582,6 @@ setInterval(() => {
   loadOverview();
   if (currentTab === 'pending' && typeof LOADERS.pending === 'function') LOADERS.pending();
 }, 15000);
-
-// ===== Task 3: 待确认 / 待成交 / 已完成 / 被拦截的信号（追加区） =====
-
-// ===== Task 4: 策略 / 风控设置（追加区） =====
-
-// ===== Task 5: 持仓校准（追加区） =====
 </script>
 </body>
 </html>
@@ -352,6 +692,30 @@ mod tests {
             !body.contains("http://") && !body.contains("https://"),
             "不得引用外部资源"
         );
+    }
+
+    #[tokio::test]
+    async fn ticket_tabs_have_confirm_flow_and_reject_reason_labels() {
+        let body = crate::web::trade_page::TRADE_HTML;
+        for s in [
+            "function confirmState(",
+            "function onConfirm(",
+            "ack_deviation",
+            "仍要确认",
+            "行情延迟",
+            "LOADERS.pending",
+            "LOADERS.working",
+            "LOADERS.done",
+            "LOADERS.rejected",
+            "/api/trade/tickets?view=pending",
+            "/api/trade/signals/rejected",
+            "次日 9:00 自动撤销",
+            "nothing_sellable",
+            "daily_loss_halt",
+            "paper_ticket",
+        ] {
+            assert!(body.contains(s), "缺 {s}");
+        }
     }
 
     #[tokio::test]
