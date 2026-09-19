@@ -36,7 +36,9 @@ pub const DAILY_LOOKBACK_DAYS: i64 = 30;
 pub const FALLBACK_WINDOW_DAYS: i64 = 10;
 /// 从信号日数到 T+N 途中,相邻已观测交易日间隔超过这么多自然日即视为
 /// 历史有缺口(采集中断/已清理),不计算 T+N,免得把几个月后的价格当 T+1。
-pub const MAX_SESSION_GAP_DAYS: i64 = 7;
+/// 须容下 A 股最长的正常休市:春节前后最后/首个交易日可相隔 11 个自然日
+/// (如 2024-02-08 → 2024-02-19),国庆约 8 天,故取 12。
+pub const MAX_SESSION_GAP_DAYS: i64 = 12;
 
 fn epoch(day: NaiveDate, h: u32, m: u32, s: u32) -> i64 {
     day.and_hms_opt(h, m, s)
@@ -664,6 +666,20 @@ mod tests {
         // 全量审计同样不跨缺口
         repair_all(&c, through).unwrap();
         assert!(labels(&c, id)[1].is_none());
+    }
+
+    #[test]
+    fn spring_festival_break_is_not_treated_as_a_gap() {
+        let c = store::open_in_memory().unwrap();
+        let ymd = |m, d| NaiveDate::from_ymd_opt(2024, m, d).unwrap();
+        // 2024 春节:2 月 8 日收盘后休市,2 月 19 日复市(相隔 11 个自然日)
+        let sig_day = ymd(2, 8);
+        tick(&c, "600519", ts(sig_day, 15, 0, 0), 11.0);
+        weekday_closes(&c, "600519", ymd(2, 19), ymd(2, 26), 12.0);
+        let id = signal(&c, "600519", ts(sig_day, 10, 0, 0), 10.0, [None; 3]);
+        let r = repair(&c, ymd(2, 26)).unwrap();
+        assert_eq!((r.close, r.t1, r.t5), (1, 1, 1));
+        assert!((labels(&c, id)[1].unwrap() - 0.2).abs() < 1e-10);
     }
 
     #[test]
