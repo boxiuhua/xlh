@@ -12,7 +12,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::trade::actions::{self, CancelOutcome, ConfirmError, SubmitStrategyOutcome};
+use crate::trade::actions::{self, CancelOutcome, ConfirmError, FillError, SubmitStrategyOutcome};
 use crate::trade::admission::scorecard::{self, Scorecard};
 use crate::trade::model::{
     Account, EvalJob, NewStrategy, Position, RiskRules, SignalSource, StrategyDef, StrategyStatus,
@@ -415,7 +415,7 @@ struct FillBody {
     qty: u64,
 }
 
-/// 回填成交。总开关不限制回填(design decision 4:已发生的事实必须能记)。
+/// 回填成交(仅实盘)。业务拒绝 → 404 / 409 / 400;其余错误为内部错误 → 500。
 async fn fill(
     State(st): State<AuthState>,
     Extension(user): Extension<CurrentUser>,
@@ -424,18 +424,22 @@ async fn fill(
 ) -> ApiResult<serde_json::Value> {
     let Path(id) = id?;
     let Json(body) = body?;
-    let mut conn = st.db.lock().unwrap();
-    owned(&conn, user.id, id)?;
-    let out = tk::record_fill(
-        &mut conn,
-        user.id,
-        id,
-        body.price,
-        body.qty,
-        "manual",
-        now(),
-    )
-    .map_err(|e| ApiError::bad(e.to_string()))?;
+    let res = {
+        let mut conn = st.db.lock().unwrap();
+        actions::manual_fill(&mut conn, user.id, id, body.price, body.qty, now())?
+    };
+    let out = match res {
+        Ok(out) => out,
+        Err(FillError::NotFound) => return Err(ApiError::not_found()),
+        Err(FillError::PaperNotAllowed) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "paper_ticket",
+                "模拟盘工单由系统撮合,不可人工回填",
+            ))
+        }
+        Err(FillError::Validation(msg)) => return Err(ApiError::bad(msg)),
+    };
     Ok(Json(json!({
         "ok": true,
         "status": out.status,
@@ -977,6 +981,95 @@ mod tests {
         let (s, list) = call(&st, "GET", "/api/trade/tickets?view=done", "t1", None).await;
         assert_eq!((s, list.as_array().unwrap().len()), (StatusCode::OK, 1));
         assert_eq!(list[0]["id"], id);
+    }
+
+    #[tokio::test]
+    async fn fill_rejects_paper_ticket_409_and_bad_input_400() {
+        use crate::event::Direction;
+        use crate::trade::model::{Account, AccountScope, NewSignal, Quote, SignalSource};
+        use crate::trade::service::{submit_signal, SubmitContext, SubmitOutcome};
+        let st = state();
+        let uid = seed_user(&st, "u", "t");
+        let now = chrono::Local::now().naive_local();
+        let paper = {
+            let mut c = st.db.lock().unwrap();
+            crate::trade::store::set_capital(&c, uid, Account::Paper, 100_000.0, now).unwrap();
+            let q = Quote {
+                code: "600000".into(),
+                price: 10.0,
+                limit_up: Some(11.0),
+                limit_down: Some(9.0),
+                ts: now,
+            };
+            let sig = NewSignal {
+                user_id: uid,
+                source: SignalSource::Manual,
+                strategy_id: None,
+                code: "600000".into(),
+                name: None,
+                side: Direction::Buy,
+                scope: AccountScope::PaperOnly,
+                ref_price: 10.0,
+                reason: "测试".into(),
+                ai_note: None,
+                dedup_key: "paper-fill".into(),
+                suggest_cash: Some(5_000.0),
+                suggest_qty: None,
+            };
+            match submit_signal(
+                &mut c,
+                &sig,
+                &SubmitContext {
+                    quote: Some(&q),
+                    now,
+                },
+            )
+            .unwrap()
+            {
+                SubmitOutcome::Ticketed {
+                    paper_ticket: Some(id),
+                    ..
+                } => id,
+                other => panic!("{other:?}"),
+            }
+        };
+        let (s, e) = call(
+            &st,
+            "POST",
+            &format!("/api/trade/tickets/{paper}/fill"),
+            "t",
+            Some(serde_json::json!({"price": 10.0, "qty": 100})),
+        )
+        .await;
+        assert_eq!(
+            (s, e["code"].as_str()),
+            (StatusCode::CONFLICT, Some("paper_ticket")),
+            "模拟盘只由系统撮合"
+        );
+
+        let real = pending_ticket(&st, uid, "600001", 10.0);
+        let url = format!("/api/trade/tickets/{real}/fill");
+        let (s, e) = call(
+            &st,
+            "POST",
+            &url,
+            "t",
+            Some(serde_json::json!({"price": 0.0, "qty": 100})),
+        )
+        .await;
+        assert_eq!(
+            (s, e["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("bad_request"))
+        );
+        let (s, _) = call(
+            &st,
+            "POST",
+            &url,
+            "t",
+            Some(serde_json::json!({"price": 10.0, "qty": 100})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "待确认工单不可回填");
     }
 
     #[tokio::test]

@@ -441,7 +441,7 @@ pub fn cancel_unfilled(conn: &Connection, created_before: NaiveDateTime) -> Resu
     )?)
 }
 
-fn round_dec(x: f64, decimals: i32) -> f64 {
+pub(crate) fn round_dec(x: f64, decimals: i32) -> f64 {
     let m = 10f64.powi(decimals);
     (x * m).round() / m
 }
@@ -457,7 +457,24 @@ pub fn record_fill(
     now: NaiveDateTime,
 ) -> Result<FillOutcome> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let t = get_ticket(&tx, ticket_id)?
+    let out = record_fill_in(&tx, user_id, ticket_id, price, qty, source, now)?;
+    tx.commit()?;
+    Ok(out)
+}
+
+/// `record_fill` 的事务内部分:调用方持有事务并负责提交(出错时丢弃事务即回滚)。
+/// 供 `actions::manual_fill` 在同一把写锁内先做业务预校验再落库。
+/// 这里的校验是兜底——人工回填的业务拒绝应在调用方预校验时已给出。
+pub(crate) fn record_fill_in(
+    tx: &Connection,
+    user_id: i64,
+    ticket_id: i64,
+    price: f64,
+    qty: u64,
+    source: &str,
+    now: NaiveDateTime,
+) -> Result<FillOutcome> {
+    let t = get_ticket(tx, ticket_id)?
         .filter(|t| t.user_id == user_id)
         .ok_or_else(|| anyhow!("工单不存在"))?;
     if !matches!(t.status, TicketStatus::Confirmed | TicketStatus::Partial) {
@@ -473,10 +490,10 @@ pub fn record_fill(
         ));
     }
     let today = now.date();
-    let rules = store::get_risk_rules(&tx, user_id)?;
+    let rules = store::get_risk_rules(tx, user_id)?;
     let fee_model = StockFee::a_share();
     let value = price * qty as f64;
-    let pos = store::get_position(&tx, user_id, t.account, &t.code)?;
+    let pos = store::get_position(tx, user_id, t.account, &t.code)?;
 
     let (fee, realized, new_pos, cash_delta) = match t.side {
         Direction::Buy => {
@@ -520,8 +537,8 @@ pub fn record_fill(
         }
     };
 
-    store::add_cash(&tx, user_id, t.account, cash_delta, now)?;
-    store::upsert_position(&tx, &new_pos, now)?;
+    store::add_cash(tx, user_id, t.account, cash_delta, now)?;
+    store::upsert_position(tx, &new_pos, now)?;
     tx.execute(
         "INSERT INTO trade_fills (ticket_id, user_id, account, code, side, price, qty, fee,
            realized_pnl, source, filled_at)
@@ -551,7 +568,6 @@ pub fn record_fill(
         "UPDATE trade_tickets SET filled_qty = ?1, status = ?2 WHERE id = ?3",
         params![filled as i64, status.as_str(), t.id],
     )?;
-    tx.commit()?;
     Ok(FillOutcome {
         fill_id,
         status,

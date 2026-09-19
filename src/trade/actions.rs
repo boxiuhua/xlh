@@ -75,6 +75,61 @@ pub fn confirm_ticket(
     })
 }
 
+/// `manual_fill` 的业务拒绝(数据库等内部错误走外层 `Err`)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum FillError {
+    /// 工单不存在,或不属于该用户(跨用户视为不存在)。
+    NotFound,
+    /// 模拟盘工单只由系统撮合,不允许人工回填(design decision 5)。
+    PaperNotAllowed,
+    /// 输入或状态不合法:价格 / 数量非正、工单非已确认 / 部分成交、超过剩余数量、
+    /// 卖出无持仓或超过可卖数量。
+    Validation(String),
+}
+
+/// 人工回填实盘成交。总开关不限制回填(design decision 4:已发生的事实必须能记)。
+/// 在同一个 `IMMEDIATE` 事务里先读工单与持仓做业务预校验(返回 `FillError`),
+/// 再调用 `ticket::record_fill_in` 落库;此后任何 `Err` 都是内部错误(web 层 500)。
+pub fn manual_fill(
+    conn: &mut Connection,
+    user_id: i64,
+    ticket_id: i64,
+    price: f64,
+    qty: u64,
+    now: NaiveDateTime,
+) -> Result<std::result::Result<ticket::FillOutcome, FillError>> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let Some(t) = ticket::get_ticket(&tx, ticket_id)?.filter(|t| t.user_id == user_id) else {
+        return Ok(Err(FillError::NotFound));
+    };
+    if t.account == Account::Paper {
+        return Ok(Err(FillError::PaperNotAllowed));
+    }
+    let invalid = |msg: String| Ok(Err(FillError::Validation(msg)));
+    if !(price.is_finite() && price > 0.0) || qty == 0 {
+        return invalid("成交价与数量必须为正数".into());
+    }
+    if !matches!(t.status, TicketStatus::Confirmed | TicketStatus::Partial) {
+        return invalid(format!("工单状态为 {},不可回填成交", t.status.as_str()));
+    }
+    let remaining = t.qty - t.filled_qty;
+    if qty > remaining {
+        return invalid(format!("成交数量超过工单剩余数量({remaining})"));
+    }
+    if t.side == crate::event::Direction::Sell {
+        let Some(p) = store::get_position(&tx, user_id, t.account, &t.code)? else {
+            return invalid("无持仓,不可卖出".into());
+        };
+        let sellable = p.sellable(now.date());
+        if qty > sellable {
+            return invalid(format!("卖出数量超过可卖数量 {sellable}(T+1)"));
+        }
+    }
+    let out = ticket::record_fill_in(&tx, user_id, ticket_id, price, qty, "manual", now)?;
+    tx.commit()?;
+    Ok(Ok(out))
+}
+
 /// 止盈止损校验(计划 4a):价格须有限且 > 0;两者都有时止损须低于止盈;
 /// `trailing_pct` 须在 (0, 0.5] 之间。
 pub fn validate_exit_levels(
@@ -552,6 +607,177 @@ mod tests {
         assert!(
             store::list_adjusts(&c, 1, 10).unwrap().is_empty(),
             "失败不留痕"
+        );
+    }
+
+    /// 手动信号出单,返回 (实盘工单, 模拟盘工单)。
+    fn ticket_for(
+        c: &mut Connection,
+        side: Direction,
+        scope: AccountScope,
+        key: &str,
+        now: NaiveDateTime,
+    ) -> (Option<i64>, Option<i64>) {
+        let q = quote(10.0, now);
+        store::upsert_quotes(c, std::slice::from_ref(&q), now).unwrap();
+        let sig = NewSignal {
+            user_id: 1,
+            source: SignalSource::Manual,
+            strategy_id: None,
+            code: "600000".into(),
+            name: None,
+            side,
+            scope,
+            ref_price: 10.0,
+            reason: "t".into(),
+            ai_note: None,
+            dedup_key: key.into(),
+            suggest_cash: Some(5_000.0),
+            suggest_qty: None,
+        };
+        match submit_signal(
+            c,
+            &sig,
+            &SubmitContext {
+                quote: Some(&q),
+                now,
+            },
+        )
+        .unwrap()
+        {
+            SubmitOutcome::Ticketed {
+                real_ticket,
+                paper_ticket,
+                ..
+            } => (real_ticket, paper_ticket),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn validation(r: std::result::Result<ticket::FillOutcome, FillError>) -> bool {
+        matches!(r, Err(FillError::Validation(_)))
+    }
+
+    #[test]
+    fn manual_fill_rejects_paper_foreign_and_bad_input() {
+        let mut c = db();
+        store::set_capital(&c, 1, Account::Paper, 100_000.0, at(9, 0, 0)).unwrap();
+        let (real, paper) = ticket_for(
+            &mut c,
+            Direction::Buy,
+            AccountScope::Both,
+            "both",
+            at(10, 0, 0),
+        );
+        let (real, paper) = (real.unwrap(), paper.unwrap());
+        let now = at(10, 0, 5);
+
+        // 模拟盘工单只由系统撮合(design decision 5)
+        assert_eq!(
+            manual_fill(&mut c, 1, paper, 10.0, 100, now).unwrap(),
+            Err(FillError::PaperNotAllowed)
+        );
+        // 跨用户 / 不存在
+        assert_eq!(
+            manual_fill(&mut c, 2, real, 10.0, 100, now).unwrap(),
+            Err(FillError::NotFound)
+        );
+        assert_eq!(
+            manual_fill(&mut c, 1, 9999, 10.0, 100, now).unwrap(),
+            Err(FillError::NotFound)
+        );
+        // 未确认的工单不可回填
+        assert!(validation(
+            manual_fill(&mut c, 1, real, 10.0, 100, now).unwrap()
+        ));
+        store::upsert_quotes(&c, &[quote(10.0, now)], now).unwrap();
+        assert_eq!(confirm_ticket(&c, 1, real, false, now).unwrap(), Ok(()));
+        // 价格 / 数量非法
+        for (price, qty) in [(0.0, 100), (-1.0, 100), (f64::NAN, 100), (10.0, 0)] {
+            assert!(validation(
+                manual_fill(&mut c, 1, real, price, qty, now).unwrap()
+            ));
+        }
+        let total = ticket::get_ticket(&c, real).unwrap().unwrap().qty;
+        // 超过剩余数量
+        assert!(validation(
+            manual_fill(&mut c, 1, real, 10.0, total + 100, now).unwrap()
+        ));
+        let out = manual_fill(&mut c, 1, real, 10.0, total, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.status, TicketStatus::Filled);
+        // 已成交不可再回填
+        assert!(validation(
+            manual_fill(&mut c, 1, real, 10.0, 100, now).unwrap()
+        ));
+    }
+
+    #[test]
+    fn manual_fill_sell_checks_position_and_sellable() {
+        let mut c = db();
+        calibrate_position(
+            &mut c,
+            1,
+            &Calibration {
+                code: "600000".into(),
+                qty: 1000,
+                avg_cost: 10.0,
+                reason: "对账".into(),
+            },
+            at(9, 30, 0),
+        )
+        .unwrap();
+        let (real, _) = ticket_for(
+            &mut c,
+            Direction::Sell,
+            AccountScope::RealOnly,
+            "sell",
+            at(10, 0, 0),
+        );
+        let real = real.unwrap();
+        let now = at(10, 0, 5);
+        assert_eq!(confirm_ticket(&c, 1, real, false, now).unwrap(), Ok(()));
+        let qty = ticket::get_ticket(&c, real).unwrap().unwrap().qty;
+        assert!(qty > 100, "{qty}");
+
+        // 持仓被校准到 100 → 卖出超过可卖数量
+        calibrate_position(
+            &mut c,
+            1,
+            &Calibration {
+                code: "600000".into(),
+                qty: 100,
+                avg_cost: 10.0,
+                reason: "对账".into(),
+            },
+            now,
+        )
+        .unwrap();
+        assert!(validation(
+            manual_fill(&mut c, 1, real, 10.0, qty, now).unwrap()
+        ));
+        // 持仓被清掉 → 无持仓
+        calibrate_position(
+            &mut c,
+            1,
+            &Calibration {
+                code: "600000".into(),
+                qty: 0,
+                avg_cost: 0.0,
+                reason: "对账".into(),
+            },
+            now,
+        )
+        .unwrap();
+        assert!(validation(
+            manual_fill(&mut c, 1, real, 10.0, 100, now).unwrap()
+        ));
+        assert!(
+            store::get_position(&c, 1, Account::Real, "600000")
+                .unwrap()
+                .is_none(),
+            "被拒的回填不落库"
         );
     }
 
