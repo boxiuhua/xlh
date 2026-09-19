@@ -16,6 +16,7 @@ pub mod plans;
 pub mod quotes;
 pub mod router;
 pub mod service;
+pub mod settings;
 pub mod store;
 pub mod strategy_signal;
 pub mod ticket;

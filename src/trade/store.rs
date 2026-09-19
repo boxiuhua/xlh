@@ -161,6 +161,12 @@ CREATE TABLE IF NOT EXISTS trade_calendar (
   checked_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS trade_settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS trade_strategy_plans (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id      INTEGER NOT NULL,
@@ -296,6 +302,7 @@ pub fn save_risk_rules(
     rules: &RiskRules,
     now: NaiveDateTime,
 ) -> Result<()> {
+    rules.validate()?;
     conn.execute(
         "INSERT INTO trade_risk_rules (user_id, rules_json, updated_at) VALUES (?1, ?2, ?3)
          ON CONFLICT(user_id) DO UPDATE SET rules_json = excluded.rules_json, updated_at = excluded.updated_at",
@@ -1355,7 +1362,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 14);
+        assert_eq!(n, 15);
     }
 
     #[test]

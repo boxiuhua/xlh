@@ -59,7 +59,10 @@ pub fn submit_signal(
 
     let admission = resolve_admission(&tx, sig)?;
 
-    let rules = store::get_risk_rules(&tx, sig.user_id)?;
+    let mut rules = store::get_risk_rules(&tx, sig.user_id)?;
+    if crate::trade::settings::kill_switch(&tx)? {
+        rules.enabled = false;
+    }
     let real_account = store::get_account(&tx, sig.user_id, Account::Real)?;
     let mut paper_account = store::get_account(&tx, sig.user_id, Account::Paper)?;
     if paper_account.is_none() {
@@ -403,5 +406,33 @@ mod tests {
         };
         let t = ticket::get_ticket(&c, real_ticket_id).unwrap().unwrap();
         assert_eq!(t.qty, 200, "卖出上限 = 该策略自己的净买入 200 股");
+    }
+
+    #[test]
+    fn kill_switch_rejects_every_source() {
+        let mut c = db();
+        crate::trade::settings::set_kill_switch(&c, true, now()).unwrap();
+        let q = quote();
+        let ctx = SubmitContext {
+            quote: Some(&q),
+            now: now(),
+        };
+        for (i, src) in [
+            SignalSource::Exit,
+            SignalSource::Manual,
+            SignalSource::Mover,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let s = sig(src, None, &format!("k{i}"));
+            assert!(matches!(
+                submit_signal(&mut c, &s, &ctx).unwrap(),
+                SubmitOutcome::Rejected {
+                    reason: GateReject::TradingDisabled,
+                    ..
+                }
+            ));
+        }
     }
 }
