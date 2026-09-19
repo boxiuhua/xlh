@@ -317,7 +317,7 @@ pub enum CancelOutcome {
     Cancelled,
     /// 运行中的任务已打上取消标记,由 worker 在处理下一只股票前中止。
     Requested,
-    /// 任务已结束(done/failed),不可取消。
+    /// 任务已结束(done/failed),或运行中但不是前推回测,不可取消。
     NotCancellable,
     /// 任务不存在,或不属于该用户。
     NotFound,
@@ -347,6 +347,11 @@ pub fn cancel_job(
             }
             state::fail_cancelled_backtest(conn, user_id, job.strategy_id, now)?;
             Ok(CancelOutcome::Cancelled)
+        }
+        // 只有前推回测会在 `on_code` 里检查取消标记;其它类型的运行中任务打了标记也
+        // 不会被中止,如实返回不可取消,避免前端误以为「已请求取消」。
+        JobStatus::Running if job.kind != EvalKind::WalkForward => {
+            Ok(CancelOutcome::NotCancellable)
         }
         JobStatus::Running => {
             let n = conn.execute(
@@ -901,6 +906,22 @@ mod tests {
             cancel_job(&c, 1, job_id, at(9, 4, 0)).unwrap(),
             CancelOutcome::NotCancellable
         );
+    }
+
+    /// 只有前推回测会检查取消标记;运行中的其它类型任务不可取消,也不打标记。
+    #[test]
+    fn running_non_walk_forward_job_is_not_cancellable() {
+        let c = db();
+        let id = trend_strategy(&c);
+        let job_id = store::enqueue_eval(&c, 1, id, EvalKind::PaperCheck, at(9, 1, 0))
+            .unwrap()
+            .unwrap();
+        store::claim_next_job(&c, at(9, 1, 30)).unwrap().unwrap();
+        assert_eq!(
+            cancel_job(&c, 1, job_id, at(9, 2, 0)).unwrap(),
+            CancelOutcome::NotCancellable
+        );
+        assert!(!store::job_cancel_requested(&c, job_id).unwrap());
     }
 
     /// 入队失败时状态转换一并回滚,策略不会停在「回测中」却没有任务。
