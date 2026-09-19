@@ -234,11 +234,13 @@ fn run_loop(db_path: PathBuf, cfg: TradeCfg) {
                 admission: &cfg.admission,
                 eval: &cfg.eval,
             };
-            // 日线信号需要**今天**的 K 线,与前推回测的 `end`(昨天,见下)不同;
-            // `load_or_fetch` 在缓存不含今天时会联网重抓,K 线还没更新则由
-            // `compute` 判为待重试,按 `retry_minutes` 节奏再来。
+            // 日线信号需要**今天收盘后**的 K 线,与前推回测的 `end`(昨天,见下)不同;
+            // 缓存不含今天、或写于收盘落定之前(盘中别的路径写的,最后一根还是
+            // 半截 K 线)都会联网重抓,K 线还没更新则由 `compute` 判为待重试,
+            // 按 `retry_minutes` 节奏再来。
             let today = now.date();
             let sig_start = today - chrono::Duration::days(cfg.walk_forward.train_days + 30);
+            let fresh_after = crate::trade::daily_signals::kline_fresh_after(today);
             if let Some(r) = crate::trade::daily_signals::run_compute(
                 &conn,
                 &cfg.signals,
@@ -246,11 +248,12 @@ fn run_loop(db_path: PathBuf, cfg: TradeCfg) {
                 &mut signal_state,
                 now,
                 |code| {
-                    crate::stock::data::cache::load_or_fetch(
+                    crate::stock::data::cache::load_or_fetch_fresh(
                         code,
                         std::path::Path::new(".cache/stock"),
                         sig_start,
                         today,
+                        fresh_after,
                     )
                 },
             ) {

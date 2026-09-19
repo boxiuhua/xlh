@@ -31,6 +31,7 @@ pub struct ComputeReport {
 /// 已有今天的行的(策略, 代码)直接跳过,可以随意重跑。
 pub fn compute<F>(
     conn: &Connection,
+    cfg: &SignalCfg,
     now: NaiveDateTime,
     wf: &WalkForwardCfg,
     mut load: F,
@@ -101,7 +102,20 @@ where
                 };
                 // K 线本身就是开市证明:最后一根不是今天就还没更新,留待重试(设计裁决 5)
                 if bars.last().map(|b| b.date) != Some(today) {
-                    r.pending += 1;
+                    // 但今天已被证实开市、又已到傍晚仍没有,基本就是停牌:记 idle 收掉,
+                    // 否则每轮重试都要整段重抓历史,一直抓到截止时刻。
+                    if now.time() >= hm(cfg.no_bar_idle_hour, 0)
+                        && calendar::day_status(conn, today)? == Some(true)
+                    {
+                        plans::insert_plan(
+                            conn,
+                            &base(PlanStatus::Idle, "当日无 K 线(停牌?)".into()),
+                            now,
+                        )?;
+                        r.idle += 1;
+                    } else {
+                        r.pending += 1;
+                    }
                     continue;
                 }
                 match strategy_signal::decide(&s.kind, code, params, &bars, next, wf) {
@@ -135,6 +149,17 @@ where
         }
     }
     Ok(r)
+}
+
+/// 当天 K 线可信的最早写入时刻。A 股 15:00 收盘集合竞价结束,留 5 分钟让行情源
+/// 落定最后一根:K 线缓存是全程序共用的,早于此刻写入的文件可能带着盘中未走完的
+/// 当天 K 线(见 `cache::load_or_fetch_fresh`),收盘后计算不能拿它当收盘价。
+/// 这是交易所的收盘时刻而不是可调阈值,所以是常量而非配置。
+const KLINE_SETTLED_HM: (u32, u32) = (15, 5);
+
+/// 收盘后计算加载 K 线时,缓存文件须写于该时刻之后才可直接使用。
+pub fn kline_fresh_after(day: NaiveDate) -> NaiveDateTime {
+    day.and_time(hm(KLINE_SETTLED_HM.0, KLINE_SETTLED_HM.1))
 }
 
 /// 跨轮次的计算状态。不落库:重启后 `done_for` 为 None 会再跑一轮,
@@ -177,7 +202,7 @@ where
         return None;
     }
     st.last_attempt = Some(now);
-    let r = match compute(conn, now, wf, load) {
+    let r = match compute(conn, cfg, now, wf, load) {
         Ok(r) => r,
         Err(e) => ComputeReport {
             errors: vec![format!("日线信号计算失败: {e:#}")],
@@ -474,14 +499,20 @@ mod tests {
         let sid = running_trend_strategy(&c, &["600000", "600036"], &["600000", "600036"]);
         let today = at(9, 18, 15, 30); // 周五
         let mut loads = 0;
-        let r = compute(&c, today, &WalkForwardCfg::default(), |code| {
-            loads += 1;
-            Ok(if code == "600000" {
-                golden_cross(d(9, 18))
-            } else {
-                bars_until(d(9, 18), &[10.0; 85])
-            })
-        })
+        let r = compute(
+            &c,
+            &SignalCfg::default(),
+            today,
+            &WalkForwardCfg::default(),
+            |code| {
+                loads += 1;
+                Ok(if code == "600000" {
+                    golden_cross(d(9, 18))
+                } else {
+                    bars_until(d(9, 18), &[10.0; 85])
+                })
+            },
+        )
         .unwrap();
         assert_eq!((r.planned, r.idle, r.pending), (1, 1, 0));
         assert!(r.errors.is_empty(), "{:?}", r.errors);
@@ -494,10 +525,16 @@ mod tests {
         assert_eq!(due[0].basis_date, d(9, 18));
         // 再跑一次:已有今天的行,不再加载 K 线
         let before = loads;
-        let r2 = compute(&c, at(9, 18, 15, 40), &WalkForwardCfg::default(), |_| {
-            loads += 1;
-            Ok(Vec::new())
-        })
+        let r2 = compute(
+            &c,
+            &SignalCfg::default(),
+            at(9, 18, 15, 40),
+            &WalkForwardCfg::default(),
+            |_| {
+                loads += 1;
+                Ok(Vec::new())
+            },
+        )
         .unwrap();
         assert_eq!((r2.planned, r2.idle, r2.pending), (0, 0, 0));
         assert_eq!(loads, before);
@@ -507,23 +544,58 @@ mod tests {
     fn stale_kline_is_pending_and_missing_params_is_idle() {
         let c = db();
         running_trend_strategy(&c, &["600000", "600036"], &["600000", "600036"]);
-        let r = compute(&c, at(9, 18, 15, 30), &WalkForwardCfg::default(), |code| {
-            Ok(if code == "600000" {
-                golden_cross(d(9, 17)) // 还没有今天的 K 线
-            } else {
-                golden_cross(d(9, 18))
-            })
-        })
+        let r = compute(
+            &c,
+            &SignalCfg::default(),
+            at(9, 18, 15, 30),
+            &WalkForwardCfg::default(),
+            |code| {
+                Ok(if code == "600000" {
+                    golden_cross(d(9, 17)) // 还没有今天的 K 线
+                } else {
+                    golden_cross(d(9, 18))
+                })
+            },
+        )
         .unwrap();
         assert_eq!(r.pending, 1, "600000 的 K 线未更新,留待重试");
         assert_eq!(r.planned, 1, "600036 有今天的 K 线与实盘参数,当天金叉");
         let c2 = db();
         running_trend_strategy(&c2, &["600000"], &[]);
-        let r = compute(&c2, at(9, 18, 15, 30), &WalkForwardCfg::default(), |_| {
-            Ok(golden_cross(d(9, 18)))
-        })
+        let r = compute(
+            &c2,
+            &SignalCfg::default(),
+            at(9, 18, 15, 30),
+            &WalkForwardCfg::default(),
+            |_| Ok(golden_cross(d(9, 18))),
+        )
         .unwrap();
         assert_eq!(r.idle, 1, "无实盘参数:记 idle(当天算完),不发信号");
+    }
+
+    /// 已证实开市、过了 `no_bar_idle_hour` 仍没有今天的 K 线:多半是停牌,记 idle
+    /// 收掉,不再每 10 分钟整段重抓历史直到截止;未证实开市或未到点仍按待重试。
+    #[test]
+    fn missing_today_bar_on_a_confirmed_open_day_becomes_idle_late_in_the_day() {
+        let wf = WalkForwardCfg::default();
+        let cfg = SignalCfg::default();
+        let stale = |_: &str| Ok(golden_cross(d(9, 17)));
+        // 未证实开市:到了 17:30 也只是待重试
+        let c = db();
+        running_trend_strategy(&c, &["600000"], &["600000"]);
+        let r = compute(&c, &cfg, at(9, 18, 17, 30), &wf, stale).unwrap();
+        assert_eq!((r.idle, r.pending), (0, 1));
+        // 证实开市但未到点:待重试
+        crate::trade::calendar::mark_day(&c, d(9, 18), true, at(9, 18, 9, 31)).unwrap();
+        let r = compute(&c, &cfg, at(9, 18, 16, 59), &wf, stale).unwrap();
+        assert_eq!((r.idle, r.pending), (0, 1));
+        // 证实开市且过了点:记 idle,当日算完
+        let r = compute(&c, &cfg, at(9, 18, 17, 0), &wf, stale).unwrap();
+        assert_eq!((r.idle, r.pending), (1, 0));
+        let reason: String = c
+            .query_row("SELECT reason FROM trade_strategy_plans", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(reason, "当日无 K 线(停牌?)");
     }
 
     #[test]
@@ -531,9 +603,13 @@ mod tests {
         let c = db();
         running_trend_strategy(&c, &["600000"], &["600000"]);
         crate::trade::calendar::mark_day(&c, d(10, 1), false, at(10, 1, 9, 31)).unwrap();
-        let r = compute(&c, at(10, 1, 15, 30), &WalkForwardCfg::default(), |_| {
-            panic!("休市日不应加载")
-        })
+        let r = compute(
+            &c,
+            &SignalCfg::default(),
+            at(10, 1, 15, 30),
+            &WalkForwardCfg::default(),
+            |_| panic!("休市日不应加载"),
+        )
         .unwrap();
         assert!(r.skipped_closed);
         // 草稿策略不参与
@@ -550,11 +626,24 @@ mod tests {
             at(9, 1, 9, 0),
         )
         .unwrap();
-        let r = compute(&c2, at(9, 18, 15, 30), &WalkForwardCfg::default(), |_| {
-            panic!("草稿不应加载")
-        })
+        let r = compute(
+            &c2,
+            &SignalCfg::default(),
+            at(9, 18, 15, 30),
+            &WalkForwardCfg::default(),
+            |_| panic!("草稿不应加载"),
+        )
         .unwrap();
         assert_eq!((r.planned, r.idle, r.pending), (0, 0, 0));
+    }
+
+    #[test]
+    fn kline_is_trusted_only_when_written_after_the_close_settles() {
+        assert_eq!(kline_fresh_after(d(9, 18)), at(9, 18, 15, 5));
+        // 日线计算最早也在收盘之后,新鲜度门槛不能晚于默认开始计算时刻,
+        // 否则 15:30 刚重抓的文件在下一轮还会被判不新鲜
+        let cfg = SignalCfg::default();
+        assert!(kline_fresh_after(d(9, 18)) <= at(9, 18, cfg.compute_hour, cfg.compute_minute));
     }
 
     #[test]
@@ -634,9 +723,13 @@ mod tests {
     fn planned_buy(c: &Connection) -> i64 {
         store::set_capital(c, 1, Account::Real, 1_000_000.0, at(9, 1, 9, 0)).unwrap();
         let sid = running_trend_strategy(c, &["600000"], &["600000"]);
-        let r = compute(c, at(9, 18, 15, 30), &WalkForwardCfg::default(), |_| {
-            Ok(golden_cross(d(9, 18)))
-        })
+        let r = compute(
+            c,
+            &SignalCfg::default(),
+            at(9, 18, 15, 30),
+            &WalkForwardCfg::default(),
+            |_| Ok(golden_cross(d(9, 18))),
+        )
         .unwrap();
         assert_eq!(r.planned, 1);
         sid

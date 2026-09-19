@@ -71,6 +71,7 @@ max_push_per_tick = 5
 # compute_minute = 30
 # cutoff_hour = 21      # 当日计算截止
 # retry_minutes = 10
+# no_bar_idle_hour = 17 # 已证实开市的日子到点仍无当天 K 线:按停牌记无操作,不再重试
 # emit_hour = 9         # 次日发出窗口开始(集合竞价结束后)
 # emit_minute = 25
 # emit_end_hour = 10    # 窗口结束:已证实开市的日子仍未发出的计划作废

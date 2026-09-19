@@ -240,9 +240,13 @@ fn daily_strategy_signal_flows_from_close_to_paper_fill() {
     let friday = NaiveDate::from_ymd_opt(2026, 9, 18).unwrap();
     let mut prices: Vec<f64> = (0..80).map(|i| 20.0 - i as f64 * 0.1).collect();
     prices.extend([12.2, 12.3, 12.4, 12.5, 25.0]);
-    let r = daily_signals::compute(&c, at(18, 15, 30), &WalkForwardCfg::default(), |_| {
-        Ok(bars_until(friday, &prices))
-    })
+    let r = daily_signals::compute(
+        &c,
+        &xlh::trade::config::SignalCfg::default(),
+        at(18, 15, 30),
+        &WalkForwardCfg::default(),
+        |_| Ok(bars_until(friday, &prices)),
+    )
     .unwrap();
     assert!(r.errors.is_empty(), "{:?}", r.errors);
     assert_eq!(r.planned, 1);

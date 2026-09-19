@@ -139,6 +139,9 @@ pub struct SignalCfg {
     pub cutoff_hour: u32,
     /// K 线未更新时的重试间隔(分钟)
     pub retry_minutes: i64,
+    /// 已证实开市的日子,到这个整点仍没有当天 K 线就按停牌记「无操作」,
+    /// 不再每轮整段重抓历史直到截止;不早于截止时刻则等于关闭此规则
+    pub no_bar_idle_hour: u32,
     /// 次日发出窗口 [emit, emit_end)
     pub emit_hour: u32,
     pub emit_minute: u32,
@@ -154,6 +157,7 @@ impl Default for SignalCfg {
             compute_minute: 30,
             cutoff_hour: 21,
             retry_minutes: 10,
+            no_bar_idle_hour: 17,
             emit_hour: 9,
             emit_minute: 25,
             emit_end_hour: 10,
@@ -408,6 +412,15 @@ pub fn from_toml_str(text: &str) -> Result<TradeCfg> {
             s.compute_hour,
             s.compute_minute,
             s.cutoff_hour
+        ));
+    }
+    if s.no_bar_idle_hour > 23 || s.no_bar_idle_hour * 60 <= s.compute_hour * 60 + s.compute_minute
+    {
+        return Err(anyhow!(
+            "[trade.signals] no_bar_idle_hour 须在 0..=23 且晚于开始计算时刻 {:02}:{:02},当前 {}",
+            s.compute_hour,
+            s.compute_minute,
+            s.no_bar_idle_hour
         ));
     }
     if !(1..=120).contains(&s.retry_minutes) {
@@ -694,6 +707,8 @@ mod tests {
             "[trade.signals]\ncutoff_hour = 15", // 截止必须晚于开始
             "[trade.signals]\nretry_minutes = 0",
             "[trade.signals]\nretry_minutes = 121",
+            "[trade.signals]\nno_bar_idle_hour = 15", // 须晚于开始计算
+            "[trade.signals]\nno_bar_idle_hour = 24",
             "[trade.signals]\nemit_end_hour = 9\nemit_end_minute = 25", // 窗口为空
             "[trade.signals]\nemit_hour = 8",                           // 早于集合竞价结束
             "[trade.signals]\nemit_end_minute = 31",                    // 晚于实盘工单 10:30 过期
