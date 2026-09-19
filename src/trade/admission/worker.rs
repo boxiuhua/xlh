@@ -63,7 +63,15 @@ where
                 ) {
                     eprintln!("[trade] 任务 {job_id} 进度写入失败: {e:#}");
                 }
-                true
+                // 取消标记(design decision 7):读失败按未取消处理,只记日志,不中断评估。
+                match store::job_cancel_requested(conn, job_id) {
+                    Ok(true) => false,
+                    Ok(false) => true,
+                    Err(e) => {
+                        eprintln!("[trade] 任务 {job_id} 读取取消标记失败: {e:#}");
+                        true
+                    }
+                }
             };
             let mut progress = PoolProgress {
                 on_code: &mut on_code,
@@ -71,6 +79,19 @@ where
             let outcome =
                 walk_forward::run_pool(&s.kind, &s.pool, &grid, ctx.wf, load, Some(&mut progress))?;
             if outcome.cancelled {
+                // 被取消的首次回测不能滞留 Backtesting(design decision 7);月度重跑
+                // (已在 Paper/Admitted)被取消则维持原状,不影响已准入 / 观察期的策略。
+                if s.status == StrategyStatus::Backtesting {
+                    state::update_status(
+                        conn,
+                        job.user_id,
+                        job.strategy_id,
+                        StrategyStatus::Backtesting,
+                        StrategyStatus::Failed,
+                        "用户取消前推回测",
+                        ctx.now,
+                    )?;
+                }
                 return Ok("已取消".to_string());
             }
             // 月度重跑与首次回测对「数据不足」的处理必须不同:首次回测(仍在
@@ -819,6 +840,71 @@ mod tests {
         assert_eq!(
             store::get_strategy(&c, 1, id).unwrap().unwrap().status,
             StrategyStatus::Admitted
+        );
+    }
+
+    /// design decision 7:排队中的任务直接判失败;运行中的任务打 `cancel_requested`,
+    /// `on_code` 闭包在处理下一只股票前检查到标记就中止。两只股票的池,领取任务后
+    /// 立刻置位取消标记(模拟并发的 `cancel_job` 调用),`run_job` 应当只处理完第一只
+    /// 就停手:加载闭包只被调用一次,策略从 Backtesting 回退到 Failed,不写 oos 评估。
+    #[test]
+    fn walk_forward_stops_at_the_next_code_when_cancel_is_requested() {
+        let mut c = db();
+        let id = store::create_strategy(
+            &c,
+            &NewStrategy {
+                user_id: 1,
+                name: "S".into(),
+                kind: "trend".into(),
+                grid_toml: "short_window = [3, 5]\nlong_window = [10]\namount = [20000.0]".into(),
+                pool: vec!["600000".into(), "000001".into()],
+            },
+            at(15, 9, 0),
+        )
+        .unwrap();
+        state::submit_for_backtest(&c, 1, id, at(16, 9, 0)).unwrap();
+        let j = job(&c, id, EvalKind::WalkForward);
+        // 模拟并发的 cancel_job(&c, 1, j.id, ..) 在任务运行期间打上取消标记。
+        c.execute(
+            "UPDATE trade_eval_jobs SET cancel_requested = 1 WHERE id = ?1",
+            rusqlite::params![j.id],
+        )
+        .unwrap();
+        let mut load_calls = 0;
+        let (wf, adm) = ctx(at(16, 9, 2));
+        let note = run_job(
+            &mut c,
+            &j,
+            &JobContext {
+                wf: &wf,
+                admission: &adm,
+                now: at(16, 9, 2),
+            },
+            |_| {
+                load_calls += 1;
+                Ok(wave_bars(190))
+            },
+        )
+        .unwrap();
+        assert!(note.contains("已取消"), "{note}");
+        assert_eq!(load_calls, 1, "处理完第一只后即中止,不再加载第二只");
+        let got = store::get_strategy(&c, 1, id).unwrap().unwrap();
+        assert_eq!(
+            got.status,
+            StrategyStatus::Failed,
+            "被取消的首次回测不滞留 Backtesting"
+        );
+        assert!(
+            got.status_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("用户取消"),
+            "{:?}",
+            got.status_reason
+        );
+        assert!(
+            store::latest_eval(&c, id, 1, "oos").unwrap().is_none(),
+            "取消不应落库 oos 评估"
         );
     }
 }

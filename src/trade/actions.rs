@@ -2,13 +2,16 @@
 //! Web 层不含业务规则(design decision 1):偏离保护、行情延迟、总开关、
 //! 持仓校准留痕都在这里实现并单测;handler 只调用。
 
-use crate::trade::model::{Account, Position, TicketStatus};
+use crate::trade::admission::state;
+use crate::trade::model::{
+    fmt_ts, Account, EvalKind, JobStatus, Position, StrategyStatus, TicketStatus,
+};
 use crate::trade::settings;
 use crate::trade::store;
 use crate::trade::ticket::{self, Transition};
 use anyhow::{anyhow, Result};
 use chrono::NaiveDateTime;
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
 /// 行情缓存超过此秒数视为陈旧(design decision 2)。
 pub const QUOTE_MAX_AGE_SECS: i64 = 60;
@@ -128,6 +131,118 @@ pub fn calibrate_position(
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// `submit_strategy` 的结果(计划 4a §5:策略提交与评估取消)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubmitStrategyOutcome {
+    /// 已入队前推回测评估任务。
+    Queued { job_id: i64 },
+    /// 异动类没有历史分时,直接进入观察期。
+    Paper,
+    /// 状态不允许提交(过期点击 / 并发重复提交)。
+    AlreadyHandled,
+    /// 策略不存在,或不属于该用户。
+    NotFound,
+}
+
+/// 提交策略评估:草稿 / 未通过 / 已暂停 → 排队前推回测;异动类直接进观察期。
+/// 跨用户或不存在一律 `NotFound`,不泄露存在性。
+pub fn submit_strategy(
+    conn: &Connection,
+    user_id: i64,
+    id: i64,
+    now: NaiveDateTime,
+) -> Result<SubmitStrategyOutcome> {
+    let Some(s) = store::get_strategy(conn, user_id, id)? else {
+        return Ok(SubmitStrategyOutcome::NotFound);
+    };
+    match state::submit_for_backtest(conn, user_id, id, now)? {
+        Transition::AlreadyHandled => Ok(SubmitStrategyOutcome::AlreadyHandled),
+        Transition::Applied => {
+            if s.kind == "mover" {
+                return Ok(SubmitStrategyOutcome::Paper);
+            }
+            match store::enqueue_eval(conn, user_id, id, EvalKind::WalkForward, now)? {
+                Some(job_id) => Ok(SubmitStrategyOutcome::Queued { job_id }),
+                None => {
+                    // F5 去重命中:已有同策略同类型的排队/运行中任务,取其任务号。
+                    let existing = store::list_jobs(conn, user_id, i64::MAX as usize)?
+                        .into_iter()
+                        .find(|j| {
+                            j.strategy_id == id
+                                && j.kind == EvalKind::WalkForward
+                                && matches!(j.status, JobStatus::Queued | JobStatus::Running)
+                        })
+                        .ok_or_else(|| anyhow!("入队去重命中但查不到既有任务(策略 {id})"))?;
+                    Ok(SubmitStrategyOutcome::Queued {
+                        job_id: existing.id,
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// `cancel_job` 的结果(计划 4a §5,design decision 7)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CancelOutcome {
+    /// 排队中的任务已直接结束为失败。
+    Cancelled,
+    /// 运行中的任务已打上取消标记,由 worker 在处理下一只股票前中止。
+    Requested,
+    /// 任务已结束(done/failed),不可取消。
+    NotCancellable,
+    /// 任务不存在,或不属于该用户。
+    NotFound,
+}
+
+/// 取消评估任务(design decision 7):排队中的直接判失败,不让前推回测滞留;
+/// 运行中的只打标记,真正的中止发生在 `worker.rs` 的 `on_code` 闭包里。
+pub fn cancel_job(
+    conn: &Connection,
+    user_id: i64,
+    job_id: i64,
+    now: NaiveDateTime,
+) -> Result<CancelOutcome> {
+    let Some(job) = store::get_job(conn, user_id, job_id)? else {
+        return Ok(CancelOutcome::NotFound);
+    };
+    match job.status {
+        JobStatus::Queued => {
+            let n = conn.execute(
+                "UPDATE trade_eval_jobs SET status = 'failed', error = '用户取消', finished_at = ?1
+                 WHERE id = ?2 AND status = 'queued'",
+                params![fmt_ts(now), job_id],
+            )?;
+            if n == 0 {
+                // 并发:在我们判断状态之后、更新之前被领走了。
+                return Ok(CancelOutcome::NotCancellable);
+            }
+            if let Some(s) = store::get_strategy(conn, user_id, job.strategy_id)? {
+                if s.status == StrategyStatus::Backtesting {
+                    state::update_status(
+                        conn,
+                        user_id,
+                        job.strategy_id,
+                        StrategyStatus::Backtesting,
+                        StrategyStatus::Failed,
+                        "用户取消前推回测",
+                        now,
+                    )?;
+                }
+            }
+            Ok(CancelOutcome::Cancelled)
+        }
+        JobStatus::Running => {
+            conn.execute(
+                "UPDATE trade_eval_jobs SET cancel_requested = 1 WHERE id = ?1",
+                params![job_id],
+            )?;
+            Ok(CancelOutcome::Requested)
+        }
+        JobStatus::Done | JobStatus::Failed => Ok(CancelOutcome::NotCancellable),
+    }
 }
 
 #[cfg(test)]
@@ -322,5 +437,74 @@ mod tests {
             store::list_adjusts(&c, 1, 10).unwrap().is_empty(),
             "失败不留痕"
         );
+    }
+
+    fn trend_strategy(c: &Connection) -> i64 {
+        store::create_strategy(
+            c,
+            &crate::trade::model::NewStrategy {
+                user_id: 1,
+                name: "趋势".into(),
+                kind: "trend".into(),
+                grid_toml: "short_window = [5]\nlong_window = [20]".into(),
+                pool: vec!["600000".into()],
+            },
+            at(9, 0, 0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn submit_queues_walk_forward_once_and_cancel_fails_the_strategy() {
+        let c = db();
+        let id = trend_strategy(&c);
+        let SubmitStrategyOutcome::Queued { job_id } =
+            submit_strategy(&c, 1, id, at(9, 1, 0)).unwrap()
+        else {
+            panic!("应入队前推回测");
+        };
+        assert_eq!(
+            submit_strategy(&c, 1, id, at(9, 2, 0)).unwrap(),
+            SubmitStrategyOutcome::AlreadyHandled
+        );
+        assert_eq!(
+            submit_strategy(&c, 2, id, at(9, 2, 0)).unwrap(),
+            SubmitStrategyOutcome::NotFound
+        );
+        assert_eq!(
+            cancel_job(&c, 2, job_id, at(9, 3, 0)).unwrap(),
+            CancelOutcome::NotFound
+        );
+        assert_eq!(
+            cancel_job(&c, 1, job_id, at(9, 3, 0)).unwrap(),
+            CancelOutcome::Cancelled
+        );
+        let s = store::get_strategy(&c, 1, id).unwrap().unwrap();
+        assert_eq!(
+            s.status,
+            crate::trade::model::StrategyStatus::Failed,
+            "不滞留回测中"
+        );
+        assert_eq!(
+            cancel_job(&c, 1, job_id, at(9, 4, 0)).unwrap(),
+            CancelOutcome::NotCancellable
+        );
+    }
+
+    #[test]
+    fn cancelling_a_running_job_only_sets_the_flag() {
+        let c = db();
+        let id = trend_strategy(&c);
+        let SubmitStrategyOutcome::Queued { job_id } =
+            submit_strategy(&c, 1, id, at(9, 1, 0)).unwrap()
+        else {
+            panic!()
+        };
+        store::claim_next_job(&c, at(9, 1, 30)).unwrap().unwrap();
+        assert_eq!(
+            cancel_job(&c, 1, job_id, at(9, 2, 0)).unwrap(),
+            CancelOutcome::Requested
+        );
+        assert!(store::job_cancel_requested(&c, job_id).unwrap());
     }
 }

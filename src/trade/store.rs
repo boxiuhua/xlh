@@ -228,6 +228,13 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'both'",
     )
     .context("补建 trade_signals.scope 失败")?;
+    ensure_column(
+        conn,
+        "trade_eval_jobs",
+        "cancel_requested",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .context("补建 trade_eval_jobs.cancel_requested 失败")?;
     Ok(())
 }
 
@@ -1296,6 +1303,17 @@ pub fn list_jobs(conn: &Connection, user_id: i64, limit: usize) -> Result<Vec<Ev
         .query_map(params![user_id, limit as i64], read_job)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     raws.into_iter().map(to_job).collect()
+}
+
+/// 任务是否被标记为待取消(评估取消,design decision 7)。不按 user_id 隔离:
+/// 只供 worker 的 `on_code` 闭包高频轮询,归属校验已在 `cancel_job` 写入时做过。
+pub fn job_cancel_requested(conn: &Connection, job_id: i64) -> Result<bool> {
+    let flag: i64 = conn.query_row(
+        "SELECT cancel_requested FROM trade_eval_jobs WHERE id = ?1",
+        params![job_id],
+        |r| r.get(0),
+    )?;
+    Ok(flag != 0)
 }
 
 #[cfg(test)]
