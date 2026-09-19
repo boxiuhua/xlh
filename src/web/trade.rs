@@ -285,6 +285,21 @@ async fn list_tickets(
 struct ConfirmBody {
     #[serde(default)]
     ack_deviation: bool,
+    /// 页面确认时按钮上显示的偏离(比例);服务端据此判断用户看到的是否仍是当前偏离(4b 终审 I1)。
+    #[serde(default)]
+    ack_max_deviation: Option<f64>,
+}
+
+impl ConfirmBody {
+    /// 校验后的 `ack_max_deviation`:须有限且 ≥ 0,否则 400。
+    fn ack_max(&self) -> Result<Option<f64>, ApiError> {
+        match self.ack_max_deviation {
+            Some(v) if !(v.is_finite() && v >= 0.0) => {
+                Err(ApiError::bad("ack_max_deviation 须为不小于 0 的数"))
+            }
+            v => Ok(v),
+        }
+    }
 }
 
 /// `ConfirmError` → HTTP 响应,供登录态确认与签名链接确认共用(避免映射逻辑重复)。
@@ -330,9 +345,10 @@ async fn confirm(
 ) -> ApiResult<serde_json::Value> {
     let Path(id) = id?;
     let Json(body) = body?;
+    let ack_max = body.ack_max()?;
     let res = {
         let conn = st.db.lock().unwrap();
-        actions::confirm_ticket(&conn, user.id, id, body.ack_deviation, now())?
+        actions::confirm_ticket(&conn, user.id, id, body.ack_deviation, ack_max, now())?
     };
     confirm_response(res)
 }
@@ -428,11 +444,12 @@ async fn signed_confirm(
     let Path(id) = id?;
     let Query(q) = q?;
     let Json(body) = body?;
+    let ack_max = body.ack_max()?;
     let now = now();
     let res = {
         let conn = st.db.lock().unwrap();
         let t = signed_ticket(&conn, &st.cfg, id, q.sig.as_deref(), now)?;
-        actions::confirm_ticket(&conn, t.user_id, t.id, body.ack_deviation, now)?
+        actions::confirm_ticket(&conn, t.user_id, t.id, body.ack_deviation, ack_max, now)?
     };
     confirm_response(res)
 }
@@ -1573,6 +1590,47 @@ mod tests {
             (StatusCode::CONFLICT, Some("already_handled")),
             "链接重放"
         );
+    }
+
+    #[tokio::test]
+    async fn confirm_ack_is_bound_to_shown_deviation_and_validated() {
+        let st = state();
+        let uid = seed_user(&st, "u", "t");
+        let id = pending_ticket(&st, uid, "600000", 10.3); // 偏离 3%
+        let sig = {
+            let c = st.db.lock().unwrap();
+            let secret = crate::trade::settings::link_secret(&c).unwrap();
+            let t = crate::trade::ticket::get_ticket(&c, id).unwrap().unwrap();
+            crate::trade::link::sign(&secret, &t)
+        };
+        let urls = [
+            (format!("/api/trade/tickets/{id}/confirm"), "t"),
+            (format!("/api/trade/t/{id}/confirm?sig={sig}"), ""),
+        ];
+        for (url, tok) in &urls {
+            for bad in [serde_json::json!(-0.01), serde_json::json!(-1)] {
+                let body = serde_json::json!({"ack_deviation": true, "ack_max_deviation": bad});
+                let (s, e) = call(&st, "POST", url, tok, Some(body)).await;
+                assert_eq!(
+                    (s, e["code"].as_str()),
+                    (StatusCode::BAD_REQUEST, Some("bad_request")),
+                    "{url} {e}"
+                );
+            }
+            // 用户只看到 1% → 现价 3% 超出容差 → 409 deviation,带当前偏离
+            let body = serde_json::json!({"ack_deviation": true, "ack_max_deviation": 0.01});
+            let (s, e) = call(&st, "POST", url, tok, Some(body)).await;
+            assert_eq!(
+                (s, e["code"].as_str()),
+                (StatusCode::CONFLICT, Some("deviation")),
+                "{url} {e}"
+            );
+            assert!((e["deviation"].as_f64().unwrap() - 0.03).abs() < 1e-6);
+        }
+        // 按当前偏离确认 → 通过
+        let body = serde_json::json!({"ack_deviation": true, "ack_max_deviation": 0.03});
+        let (s, e) = call(&st, "POST", &urls[1].0, "", Some(body)).await;
+        assert_eq!(s, StatusCode::OK, "{e}");
     }
 
     #[tokio::test]

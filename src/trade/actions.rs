@@ -34,17 +34,27 @@ pub enum ConfirmError {
     KillSwitch,
     /// `trade_quotes` 无该代码,或行情距今超过 `QUOTE_MAX_AGE_SECS`。
     StaleQuote,
-    /// 现价相对建议价的偏离超过工单的 `deviation_th`,且未 `ack_deviation`。
+    /// 现价相对建议价的偏离超过工单的 `deviation_th`,且未 `ack_deviation`,
+    /// 或确认时的偏离已超过用户看到的 `ack_max_deviation` + `ACK_DEVIATION_TOLERANCE`。
     Deviation { price: f64, deviation: f64 },
 }
 
+/// 偏离确认的容差(比例):用户看到并确认的偏离之后,现价允许再走 0.5 个百分点。
+pub const ACK_DEVIATION_TOLERANCE: f64 = 0.005;
+
 /// 受保护的工单确认(spec §8,design decision 1 + 2):规则按序——
 /// 不存在/跨用户 → 总开关 → 状态/过期 → 模拟盘无需确认 → 行情陈旧 → 价格偏离 → 落库确认。
+///
+/// 偏离确认绑定到用户看到的数值(4b 终审 I1):`ack_max_deviation` 是页面按钮上显示的偏离;
+/// 当前偏离超过它 + `ACK_DEVIATION_TOLERANCE` 时仍返回 `Deviation`(带当前偏离),
+/// 让页面按新值再确认一次。`None` 为旧客户端,`ack_deviation` 即放行。
+/// 调用方负责保证 `ack_max_deviation` 有限且 ≥ 0(web 层校验,非法 → 400)。
 pub fn confirm_ticket(
     conn: &Connection,
     user_id: i64,
     ticket_id: i64,
     ack_deviation: bool,
+    ack_max_deviation: Option<f64>,
     now: NaiveDateTime,
 ) -> Result<std::result::Result<(), ConfirmError>> {
     let Some(t) = ticket::get_ticket(conn, ticket_id)?.filter(|t| t.user_id == user_id) else {
@@ -63,7 +73,9 @@ pub fn confirm_ticket(
         return Ok(Err(ConfirmError::StaleQuote));
     };
     let dev = deviation(q.price, t.suggest_price);
-    if dev > t.deviation_th + 1e-12 && !ack_deviation {
+    let acked = ack_deviation
+        && ack_max_deviation.is_none_or(|shown| dev <= shown + ACK_DEVIATION_TOLERANCE + 1e-12);
+    if dev > t.deviation_th + 1e-12 && !acked {
         return Ok(Err(ConfirmError::Deviation {
             price: q.price,
             deviation: dev,
@@ -453,26 +465,71 @@ mod tests {
         let id = pending_ticket(&mut c);
         // 行情 61 秒前 → 延迟
         assert_eq!(
-            confirm_ticket(&c, 1, id, false, at(10, 1, 1)).unwrap(),
+            confirm_ticket(&c, 1, id, false, None, at(10, 1, 1)).unwrap(),
             Err(ConfirmError::StaleQuote)
         );
         // 新鲜但偏离 3%(阈值 1.5%)→ 需确认
         store::upsert_quotes(&c, &[quote(10.3, at(10, 1, 0))], at(10, 1, 0)).unwrap();
         assert!(matches!(
-            confirm_ticket(&c, 1, id, false, at(10, 1, 5)).unwrap(),
+            confirm_ticket(&c, 1, id, false, None, at(10, 1, 5)).unwrap(),
             Err(ConfirmError::Deviation { .. })
         ));
         assert_eq!(status(&c, id), TicketStatus::Pending);
         // 带 ack 通过
         assert_eq!(
-            confirm_ticket(&c, 1, id, true, at(10, 1, 5)).unwrap(),
+            confirm_ticket(&c, 1, id, true, None, at(10, 1, 5)).unwrap(),
             Ok(())
         );
         assert_eq!(status(&c, id), TicketStatus::Confirmed);
         // 重复点击
         assert_eq!(
-            confirm_ticket(&c, 1, id, true, at(10, 1, 6)).unwrap(),
+            confirm_ticket(&c, 1, id, true, None, at(10, 1, 6)).unwrap(),
             Err(ConfirmError::AlreadyHandled)
+        );
+    }
+
+    #[test]
+    fn confirm_ack_is_bound_to_the_deviation_shown() {
+        let mut c = db();
+        let id = pending_ticket(&mut c);
+        // 现价偏离 3%;用户只看到并确认过 2% → 超出容差 0.5%,要求按新偏离重新确认
+        store::upsert_quotes(&c, &[quote(10.3, at(10, 1, 0))], at(10, 1, 0)).unwrap();
+        match confirm_ticket(&c, 1, id, true, Some(0.02), at(10, 1, 5)).unwrap() {
+            Err(ConfirmError::Deviation { price, deviation }) => {
+                assert_eq!(price, 10.3);
+                assert!((deviation - 0.03).abs() < 1e-9, "{deviation}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(status(&c, id), TicketStatus::Pending);
+        // 确认过 2.6%:3% ≤ 2.6% + 0.5% 容差 → 通过
+        assert_eq!(
+            confirm_ticket(&c, 1, id, true, Some(0.026), at(10, 1, 5)).unwrap(),
+            Ok(())
+        );
+        assert_eq!(status(&c, id), TicketStatus::Confirmed);
+    }
+
+    #[test]
+    fn confirm_ack_without_shown_value_is_legacy_accept() {
+        let mut c = db();
+        let id = pending_ticket(&mut c);
+        store::upsert_quotes(&c, &[quote(10.5, at(10, 1, 0))], at(10, 1, 0)).unwrap();
+        assert_eq!(
+            confirm_ticket(&c, 1, id, true, None, at(10, 1, 5)).unwrap(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn confirm_ack_max_is_ignored_when_within_threshold() {
+        let mut c = db();
+        let id = pending_ticket(&mut c);
+        // 偏离 1%(阈值 1.5%)→ 无需 ack,ack_max 过小也不拦
+        store::upsert_quotes(&c, &[quote(10.1, at(10, 1, 0))], at(10, 1, 0)).unwrap();
+        assert_eq!(
+            confirm_ticket(&c, 1, id, false, Some(0.0), at(10, 1, 5)).unwrap(),
+            Ok(())
         );
     }
 
@@ -481,12 +538,12 @@ mod tests {
         let mut c = db();
         let id = pending_ticket(&mut c);
         assert_eq!(
-            confirm_ticket(&c, 2, id, true, at(10, 0, 5)).unwrap(),
+            confirm_ticket(&c, 2, id, true, None, at(10, 0, 5)).unwrap(),
             Err(ConfirmError::NotFound)
         );
         crate::trade::settings::set_kill_switch(&c, true, None, at(10, 0, 0)).unwrap();
         assert_eq!(
-            confirm_ticket(&c, 1, id, true, at(10, 0, 5)).unwrap(),
+            confirm_ticket(&c, 1, id, true, None, at(10, 0, 5)).unwrap(),
             Err(ConfirmError::KillSwitch)
         );
     }
@@ -770,7 +827,10 @@ mod tests {
             manual_fill(&mut c, 1, real, 10.0, 100, now).unwrap()
         ));
         store::upsert_quotes(&c, &[quote(10.0, now)], now).unwrap();
-        assert_eq!(confirm_ticket(&c, 1, real, false, now).unwrap(), Ok(()));
+        assert_eq!(
+            confirm_ticket(&c, 1, real, false, None, now).unwrap(),
+            Ok(())
+        );
         // 价格 / 数量非法
         for (price, qty) in [(0.0, 100), (-1.0, 100), (f64::NAN, 100), (10.0, 0)] {
             assert!(validation(
@@ -816,7 +876,10 @@ mod tests {
         );
         let real = real.unwrap();
         let now = at(10, 0, 5);
-        assert_eq!(confirm_ticket(&c, 1, real, false, now).unwrap(), Ok(()));
+        assert_eq!(
+            confirm_ticket(&c, 1, real, false, None, now).unwrap(),
+            Ok(())
+        );
         let qty = ticket::get_ticket(&c, real).unwrap().unwrap().qty;
         assert!(qty > 100, "{qty}");
 
