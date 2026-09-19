@@ -154,6 +154,32 @@ CREATE INDEX IF NOT EXISTS idx_trade_eval_jobs_status ON trade_eval_jobs(status,
 -- SELECT 判重会有竞态,真正兜底的是这条唯一索引;上面的 SELECT 只是快路径。
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_eval_jobs_pending
   ON trade_eval_jobs(user_id, strategy_id, kind) WHERE status IN ('queued', 'running');
+
+CREATE TABLE IF NOT EXISTS trade_calendar (
+  day        TEXT PRIMARY KEY,
+  is_open    INTEGER NOT NULL,
+  checked_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS trade_strategy_plans (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id      INTEGER NOT NULL,
+  strategy_id  INTEGER NOT NULL,
+  version_hash TEXT NOT NULL,
+  code         TEXT NOT NULL,
+  side         TEXT,
+  cash         REAL,
+  basis_date   TEXT NOT NULL,
+  reason       TEXT NOT NULL,
+  status       TEXT NOT NULL,
+  note         TEXT,
+  created_at   TEXT NOT NULL,
+  settled_at   TEXT
+);
+-- 每个策略每只股票每个基准日只算一次:重启、重试都靠它幂等
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_strategy_plans_key
+  ON trade_strategy_plans(strategy_id, code, basis_date);
+CREATE INDEX IF NOT EXISTS idx_trade_strategy_plans_status ON trade_strategy_plans(status, basis_date);
 "#;
 
 /// 表已存在但缺列时补建:`CREATE TABLE IF NOT EXISTS` 对已存在的旧表是空操作,
@@ -728,6 +754,55 @@ pub fn list_strategies(conn: &Connection, user_id: i64) -> Result<Vec<StrategyDe
     raws.into_iter().map(to_strategy).collect()
 }
 
+/// 该用户观察期 / 已准入、且股票池含 `code` 的异动策略;已准入优先,同状态取 id 最小。
+pub fn active_mover_strategy(
+    conn: &Connection,
+    user_id: i64,
+    code: &str,
+) -> Result<Option<StrategyDef>> {
+    let mut best: Option<StrategyDef> = None;
+    for s in list_strategies(conn, user_id)? {
+        if s.kind != "mover" || !s.pool.iter().any(|c| c == code) {
+            continue;
+        }
+        let rank = match s.status {
+            StrategyStatus::Admitted => 0,
+            StrategyStatus::Paper => 1,
+            _ => continue,
+        };
+        let better = match &best {
+            None => true,
+            Some(b) => {
+                let b_rank = if b.status == StrategyStatus::Admitted {
+                    0
+                } else {
+                    1
+                };
+                (rank, s.id) < (b_rank, b.id)
+            }
+        };
+        if better {
+            best = Some(s);
+        }
+    }
+    Ok(best)
+}
+
+/// 该用户观察期 / 已准入的异动策略股票池并集(去重、排序)。
+pub fn active_mover_pools(conn: &Connection, user_id: i64) -> Result<Vec<String>> {
+    let mut codes: Vec<String> = list_strategies(conn, user_id)?
+        .into_iter()
+        .filter(|s| {
+            s.kind == "mover"
+                && matches!(s.status, StrategyStatus::Paper | StrategyStatus::Admitted)
+        })
+        .flat_map(|s| s.pool)
+        .collect();
+    codes.sort();
+    codes.dedup();
+    Ok(codes)
+}
+
 /// `update_definition` 的结果(spec §10.1 + F11):区分「无变化」「仅改名」
 /// 「换版本」「策略不存在 / 不属于该用户」,调用方据此决定是否需要重新提交回测。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1280,7 +1355,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 12);
+        assert_eq!(n, 14);
     }
 
     #[test]

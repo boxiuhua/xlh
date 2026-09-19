@@ -1,10 +1,11 @@
 use crate::broker::Broker;
 use crate::data::DataHandler;
-use crate::event::Event;
+use crate::event::{Event, MarketEvent, SignalEvent};
 use crate::execution::{CloseExecution, ExecutionModel, RejectedOrder};
 use crate::portfolio::Portfolio;
 use crate::result::{DailyRecord, TradeRecord};
 use crate::strategy::{Strategy, StrategyContext};
+use chrono::NaiveDate;
 use std::collections::VecDeque;
 
 pub struct Engine<D: DataHandler, S: Strategy> {
@@ -143,6 +144,29 @@ impl<D: DataHandler, S: Strategy> Engine<D, S> {
     /// Immutable access to the portfolio after run().
     pub fn portfolio(&self) -> &Portfolio {
         &self.portfolio
+    }
+
+    /// 回放结束后追问策略:以 `next` 为决策日、`history`(全部已收盘 bar,截止 `next` 的前一交易日)
+    /// 为上下文,会发出什么信号。只保留回测里会变成订单的信号(如空仓时的卖出会被丢弃),
+    /// 与 `run()` 的口径一致。不推进数据、不成交、不记账;策略内部状态会被推进(如定投的
+    /// 当期已触发),因此同一引擎对同一 `next` 只应追问一次。
+    pub fn decide_next(&mut self, next: NaiveDate, history: &[MarketEvent]) -> Vec<SignalEvent> {
+        let Some(last) = history.last() else {
+            return Vec::new();
+        };
+        let pos = self.broker.position();
+        let ctx = StrategyContext {
+            today: next,
+            history,
+            shares: pos.shares,
+            avg_cost: pos.avg_cost,
+            cash: self.portfolio.cash,
+        };
+        self.strategy
+            .on_market(&ctx)
+            .into_iter()
+            .filter(|s| self.portfolio.on_signal(s, &pos, last).is_some())
+            .collect()
     }
 }
 
@@ -402,5 +426,46 @@ mod tests {
         assert_eq!(format!("{:?}", a.trades()), format!("{:?}", b.trades()));
         assert!(a.rejected().is_empty() && b.rejected().is_empty());
         assert_eq!(a.execution_name(), "close");
+    }
+
+    #[test]
+    fn decide_next_sees_all_closed_bars_and_only_keeps_orderable_signals() {
+        // 月定投:1/1、2/1 各买一次;追问 3/2 —— 已跨月,应再给出买入
+        let points = vec![
+            NavPoint {
+                date: d(2024, 1, 1),
+                nav: 1.0,
+                acc_nav: 1.0,
+            },
+            NavPoint {
+                date: d(2024, 2, 1),
+                nav: 1.0,
+                acc_nav: 1.0,
+            },
+            NavPoint {
+                date: d(2024, 2, 15),
+                nav: 2.0,
+                acc_nav: 2.0,
+            },
+        ];
+        let history: Vec<MarketEvent> = points
+            .iter()
+            .map(|p| MarketEvent {
+                date: p.date,
+                nav: p.nav,
+                adj_nav: p.acc_nav,
+            })
+            .collect();
+        let data = InMemoryData::new(points);
+        let strat = Dca::new(Period::Monthly, 1, 1000.0);
+        let mut engine = Engine::new(data, strat, Broker::new(no_fee()), Portfolio::new(0.0));
+        engine.run();
+        let sigs = engine.decide_next(d(2024, 3, 2), &history);
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].direction, Direction::Buy);
+        // 同月再问一次:定投已触发,不应再买
+        assert!(engine.decide_next(d(2024, 3, 5), &history).is_empty());
+        // 空历史不决策
+        assert!(engine.decide_next(d(2024, 3, 6), &[]).is_empty());
     }
 }

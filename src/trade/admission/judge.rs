@@ -244,6 +244,9 @@ mod tests {
                 buy_hold_return: 0.05,
                 trade_baseline: TradeBaseline::default(),
                 window_details: Vec::new(),
+                data_from: None,
+                data_to: None,
+                live_params: None,
             }],
             oos_return: ret,
             oos_sharpe: sharpe,
@@ -259,6 +262,8 @@ mod tests {
             // 单只股票、全部可评估:覆盖率关不应在这些通用夹具里被触发。
             requested: 1,
             skipped: Vec::new(),
+            data_from: None,
+            data_to: None,
         }
     }
 
@@ -348,6 +353,9 @@ mod tests {
                 buy_hold_return: 0.05,
                 trade_baseline: TradeBaseline::default(),
                 window_details: Vec::new(),
+                data_from: None,
+                data_to: None,
+                live_params: None,
             })
             .collect();
         let m = crate::trade::admission::walk_forward::aggregate(codes);

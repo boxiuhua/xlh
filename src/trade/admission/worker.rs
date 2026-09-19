@@ -91,7 +91,9 @@ where
                 }
             }
             let verdict = judge::judge_backtest(&outcome.metrics, ctx.admission);
-            let (from, to) = (ctx.now.date(), ctx.now.date());
+            // 评估记录的数据跨度用真实 K 线区间;全池都没评估出来时退回评估当天。
+            let from = outcome.metrics.data_from.unwrap_or(ctx.now.date());
+            let to = outcome.metrics.data_to.unwrap_or(ctx.now.date());
             let transition = if s.status == StrategyStatus::Backtesting {
                 state::apply_backtest_verdict(
                     conn,

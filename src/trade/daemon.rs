@@ -78,6 +78,21 @@ pub fn due_daily_window(
     due_daily(now, start.0, start.1, last_run) && now.time() < end_at
 }
 
+/// 交易日历自证探针出错后的重试间隔(分钟)。
+const PROBE_RETRY_MINUTES: i64 = 5;
+
+/// 交易日历自证是否到点:工作日 09:31 起、当日尚无结论;上次出错后
+/// `PROBE_RETRY_MINUTES` 分钟内不再试——网络不好时每轮都搭上一次最长 20 秒的
+/// 快照抓取,只会拖慢同一线程里的止盈止损。
+pub fn probe_due(
+    now: NaiveDateTime,
+    last_probe: Option<NaiveDate>,
+    last_failure: Option<NaiveDateTime>,
+) -> bool {
+    due_daily(now, 9, 31, last_probe)
+        && last_failure.is_none_or(|f| (now - f).num_minutes() >= PROBE_RETRY_MINUTES)
+}
+
 /// 推送本轮新建的实盘工单,返回成功推送条数;单条失败只记日志。
 pub fn notify_new_tickets(conn: &Connection, notifier: &dyn Notifier, ticket_ids: &[i64]) -> usize {
     let mut sent = 0;
@@ -195,6 +210,8 @@ fn run_loop(
     let mut backoff = Backoff::default();
     let mut last_cancel: Option<NaiveDate> = None;
     let mut last_remind: Option<NaiveDate> = None;
+    let mut last_probe: Option<NaiveDate> = None;
+    let mut last_probe_failure: Option<NaiveDateTime> = None;
 
     loop {
         // 心跳、异动转发、每日任务用这个较早的时刻;真正拉报价前再重新取一次(见下),
@@ -241,6 +258,7 @@ fn run_loop(
                     Err(e) => eprintln!("[trade] 撤销未回填工单失败: {e:#}"),
                 }
             }
+
             // 只在 15:05–16:00 窗口内跑;过了 16:00 才轮到的话说明这一轮严重滞后,
             // 「即将撤单」提醒已无意义,不该在深夜甚至次日凌晨补发。
             if due_daily_window(now, (15, 5), (16, 0), last_remind) {
@@ -253,7 +271,7 @@ fn run_loop(
             // 异动转发与日终任务耗时不确定;拉报价前重新取时刻,让止盈止损判定与
             // 退避计时都基于「实际发起本轮监听」的时间,而非循环开始时的时间。
             let tick_now = chrono::Local::now().naive_local();
-            match monitor::run_tick(&mut conn, &source, tick_now) {
+            let delay = match monitor::run_tick(&mut conn, &source, tick_now) {
                 Ok(report) => {
                     if backoff.on_success() {
                         println!("[trade] 行情恢复,监听继续");
@@ -280,7 +298,49 @@ fn run_loop(
                     }
                     backoff.delay_secs(cfg.monitor_interval_secs)
                 }
+            };
+
+            // 日历自证与日线信号发出都要联网拉快照(各自最长 20 秒超时),放在止盈止损
+            // 之后:网络不好时它们只会推迟下一轮,而不会挡在本轮止损前面。
+            // 止盈止损可能耗时,这里重新取时刻。
+            let now = chrono::Local::now().naive_local();
+            // 交易日历自证:每个工作日开盘后探一次,直到得出结论(见 trade::calendar)。
+            if probe_due(now, last_probe, last_probe_failure) {
+                match crate::trade::calendar::probe(&conn, &source, now) {
+                    Ok(Some(open)) => {
+                        last_probe = Some(now.date());
+                        if !open {
+                            println!("[trade] {} 休市(开盘后行情仍非今日)", now.date());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        last_probe_failure = Some(now);
+                        eprintln!("[trade] 交易日历自证失败: {e:#}");
+                    }
+                }
             }
+
+            // 日线策略信号:窗口内每轮都尝试(无可发计划时只是一次本地查询)。
+            match crate::trade::daily_signals::emit_due(&mut conn, &source, &cfg.signals, now) {
+                Ok(r) => {
+                    notify_new_tickets(&conn, notifier.as_ref(), &r.new_real_tickets);
+                    for e in &r.errors {
+                        eprintln!("[trade] 日线信号发出: {e}");
+                    }
+                    if r.submitted + r.dropped > 0 {
+                        println!(
+                            "[trade] 日线信号:发出 {} 条、作废 {} 条",
+                            r.submitted, r.dropped
+                        );
+                    }
+                }
+                Err(e) => eprintln!("[trade] 日线信号发出失败: {e:#}"),
+            }
+            if let Err(e) = crate::trade::daily_signals::drop_unsent(&conn, &cfg.signals, now) {
+                eprintln!("[trade] 作废过期信号计划失败: {e:#}");
+            }
+            delay
         }))
         .unwrap_or_else(|_| {
             eprintln!("[trade] 监听本轮 panic,已恢复");
@@ -339,6 +399,23 @@ mod tests {
             Some(NaiveDate::from_ymd_opt(2026, 9, 16).unwrap())
         ));
         assert!(!due_daily(at(19, 9, 5), 9, 0, None), "周六不跑");
+    }
+
+    #[test]
+    fn calendar_probe_runs_after_0931_until_concluded_and_backs_off_after_errors() {
+        let day = NaiveDate::from_ymd_opt(2026, 9, 16).unwrap();
+        assert!(!probe_due(at(16, 9, 30), None, None), "开盘自证从 09:31 起");
+        assert!(probe_due(at(16, 9, 31), None, None));
+        assert!(!probe_due(at(16, 10, 0), Some(day), None), "当日已有结论");
+        assert!(!probe_due(at(19, 9, 31), None, None), "周六不探");
+        // 出错后 5 分钟内不重试,免得每 15 秒一轮都搭上一次 20 秒超时的抓取
+        let failed = Some(at(16, 9, 31));
+        assert!(!probe_due(at(16, 9, 35), None, failed));
+        assert!(probe_due(at(16, 9, 36), None, failed));
+        assert!(
+            probe_due(at(17, 9, 31), None, Some(at(16, 14, 58))),
+            "昨天的失败不拦今天"
+        );
     }
 
     #[test]

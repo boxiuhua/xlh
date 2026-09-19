@@ -9,7 +9,7 @@ use crate::event::Direction;
 use crate::trade::admission::judge::{PaperStats, WatchdogStats};
 use crate::trade::model::{fmt_ts, parse_side, parse_ts, Account};
 use anyhow::Result;
-use chrono::{Datelike, NaiveDate, NaiveDateTime, Weekday};
+use chrono::NaiveDateTime;
 use rusqlite::{params, Connection, Row};
 use std::collections::BTreeMap;
 
@@ -289,24 +289,13 @@ pub fn realized_drawdown(fills: &[FillRow]) -> f64 {
     drawdown_of_equity(&curve)
 }
 
-/// 含首尾的工作日数;`to` 早于 `from` 返回 0。
-pub fn workdays_between(from: NaiveDate, to: NaiveDate) -> i64 {
-    let mut day = from;
-    let mut n = 0;
-    while day <= to {
-        if !matches!(day.weekday(), Weekday::Sat | Weekday::Sun) {
-            n += 1;
-        }
-        day += chrono::Duration::days(1);
-    }
-    n
-}
-
 fn max_streak_by_code(units: &[TradeUnit]) -> usize {
     let mut by_code: BTreeMap<&str, usize> = BTreeMap::new();
     let mut cur: BTreeMap<&str, usize> = BTreeMap::new();
     for u in units.iter().filter(|u| u.side == Direction::Sell) {
-        let pnl = u.realized_pnl.unwrap_or(0.0);
+        // 无盈亏的成交(如未来 qmt 导入)与 sell_pnls / trade_returns 一样跳过,
+        // 不能按亏损计——否则会静默拉长连亏、误触 watchdog。
+        let Some(pnl) = u.realized_pnl else { continue };
         let c = cur.entry(u.code.as_str()).or_insert(0);
         if pnl <= 0.0 {
             *c += 1;
@@ -319,7 +308,7 @@ fn max_streak_by_code(units: &[TradeUnit]) -> usize {
     by_code.values().copied().max().unwrap_or(0)
 }
 
-/// 观察期统计:天数按工作日计,笔数为卖出成交数。
+/// 观察期统计:天数按交易日历计(未证实的工作日按开市),笔数为卖出成交数。
 pub fn paper_stats(
     conn: &Connection,
     user_id: i64,
@@ -336,7 +325,7 @@ pub fn paper_stats(
         returns.iter().sum::<f64>() / returns.len() as f64
     };
     Ok(PaperStats {
-        days: workdays_between(since.date(), now.date()),
+        days: crate::trade::calendar::trading_days_between(conn, since.date(), now.date())?,
         trades: units.iter().filter(|u| u.side == Direction::Sell).count(),
         avg_trade_return: avg,
         max_drawdown: realized_drawdown(&fills),
@@ -615,6 +604,19 @@ mod tests {
         assert_eq!(max_streak_by_code(&sep_units), 3);
     }
 
+    /// 计划 3c 遗留项:无盈亏的成交(如未来 qmt 导入)不能按亏损计,否则会静默拉长
+    /// 连亏、误触 watchdog——也不能打断连亏(它本来就不该被计入这条流水)。
+    #[test]
+    fn fills_without_realized_pnl_do_not_extend_a_losing_streak() {
+        // 卖出序列:亏、无盈亏(qmt 导入)、亏 —— 连亏应是 2,中间的 NULL 不打断也不计入
+        let units = trade_units(&[
+            raw(1, Direction::Sell, 11.0, 1000, 10.61, Some(-1.0)),
+            raw(2, Direction::Sell, 11.0, 1000, 10.61, None),
+            raw(3, Direction::Sell, 11.0, 1000, 10.61, Some(-2.0)),
+        ]);
+        assert_eq!(max_streak_by_code(&units), 2);
+    }
+
     /// 裁决 1:回撤的分母是投入资金(与回测 `metrics.rs::max_drawdown` 同口径),
     /// 不是峰值利润。原 `drawdown_of_cumulative_pnl` 的两条意图(峰值守卫、空输入)保留。
     #[test]
@@ -741,33 +743,6 @@ mod tests {
             units[0].cost
         );
         assert!((trade_returns(&units)[0] - (-10.0 / 10_999.39)).abs() < 1e-12);
-    }
-
-    #[test]
-    fn workdays_skip_weekends() {
-        // 2026-09-14(周一)到 2026-09-18(周五)= 5 个工作日;跨周末仍是 5 + 1
-        assert_eq!(
-            workdays_between(
-                NaiveDate::from_ymd_opt(2026, 9, 14).unwrap(),
-                NaiveDate::from_ymd_opt(2026, 9, 18).unwrap()
-            ),
-            5
-        );
-        assert_eq!(
-            workdays_between(
-                NaiveDate::from_ymd_opt(2026, 9, 14).unwrap(),
-                NaiveDate::from_ymd_opt(2026, 9, 21).unwrap()
-            ),
-            6
-        );
-        assert_eq!(
-            workdays_between(
-                NaiveDate::from_ymd_opt(2026, 9, 21).unwrap(),
-                NaiveDate::from_ymd_opt(2026, 9, 14).unwrap()
-            ),
-            0,
-            "倒序为 0"
-        );
     }
 
     #[test]

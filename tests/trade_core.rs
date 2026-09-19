@@ -1,9 +1,10 @@
 use chrono::{NaiveDate, NaiveDateTime};
 use rusqlite::Connection;
 use xlh::event::Direction;
-use xlh::trade::gate::{Admission, GateReject};
+use xlh::trade::admission::state;
+use xlh::trade::gate::GateReject;
 use xlh::trade::model::{
-    Account, AccountScope, NewSignal, Position, Quote, SignalSource, TicketStatus,
+    Account, AccountScope, NewSignal, NewStrategy, Position, Quote, SignalSource, TicketStatus,
 };
 use xlh::trade::service::{submit_signal, SubmitContext, SubmitOutcome};
 use xlh::trade::{store, ticket};
@@ -57,7 +58,6 @@ fn manual_buy_confirm_fill_then_exit_sell_next_day() {
     let buy = signal(SignalSource::Manual, Direction::Buy, "manual-1");
     let ctx = SubmitContext {
         quote: Some(&q),
-        admission: Admission::NotRequired,
         now: at(15, 10, 0),
     };
 
@@ -115,7 +115,6 @@ fn manual_buy_confirm_fill_then_exit_sell_next_day() {
     );
     let ctx2 = SubmitContext {
         quote: Some(&q2),
-        admission: Admission::NotRequired,
         now: at(15, 14, 0),
     };
     assert!(matches!(
@@ -135,7 +134,6 @@ fn manual_buy_confirm_fill_then_exit_sell_next_day() {
     );
     let ctx3 = SubmitContext {
         quote: Some(&q3),
-        admission: Admission::NotRequired,
         now: at(16, 9, 35),
     };
     let SubmitOutcome::Ticketed {
@@ -180,7 +178,6 @@ fn stop_loss_rejected_at_limit_down_refires_same_day() {
     let q1 = quote(9.0, Some(11.0), Some(9.0), at(16, 9, 35));
     let ctx1 = SubmitContext {
         quote: Some(&q1),
-        admission: Admission::NotRequired,
         now: at(16, 9, 35),
     };
     let SubmitOutcome::Rejected {
@@ -194,7 +191,6 @@ fn stop_loss_rejected_at_limit_down_refires_same_day() {
     let q2 = quote(9.2, Some(11.0), Some(9.0), at(16, 10, 5));
     let ctx2 = SubmitContext {
         quote: Some(&q2),
-        admission: Admission::NotRequired,
         now: at(16, 10, 5),
     };
     let SubmitOutcome::Ticketed {
@@ -219,10 +215,24 @@ fn strategy_admission_controls_accounts() {
     let mut c = db();
     let q = quote(10.0, Some(11.0), Some(9.0), at(15, 10, 0));
 
-    let probation = signal(SignalSource::Strategy, Direction::Buy, "strategy-probation");
+    let strategy_id = store::create_strategy(
+        &c,
+        &NewStrategy {
+            user_id: 1,
+            name: "S".into(),
+            kind: "mover".into(),
+            grid_toml: "x = [1]".into(),
+            pool: vec!["600000".into()],
+        },
+        at(15, 10, 0),
+    )
+    .unwrap();
+    state::submit_for_backtest(&c, 1, strategy_id, at(15, 10, 0)).unwrap();
+
+    let mut probation = signal(SignalSource::Strategy, Direction::Buy, "strategy-probation");
+    probation.strategy_id = Some(strategy_id);
     let ctx = SubmitContext {
         quote: Some(&q),
-        admission: Admission::Probation,
         now: at(15, 10, 0),
     };
     assert!(matches!(
@@ -242,7 +252,6 @@ fn strategy_admission_controls_accounts() {
     };
     let ctx_blocked = SubmitContext {
         quote: Some(&q_other),
-        admission: Admission::Blocked,
         now: at(15, 10, 0),
     };
     let SubmitOutcome::Rejected { signal_id, reason } =
