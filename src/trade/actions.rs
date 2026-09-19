@@ -75,6 +75,33 @@ pub fn confirm_ticket(
     })
 }
 
+/// 止盈止损校验(计划 4a):价格须有限且 > 0;两者都有时止损须低于止盈;
+/// `trailing_pct` 须在 (0, 0.5] 之间。
+pub fn validate_exit_levels(
+    stop_loss: Option<f64>,
+    take_profit: Option<f64>,
+    trailing_pct: Option<f64>,
+) -> Result<()> {
+    for (name, v) in [("止损", stop_loss), ("止盈", take_profit)] {
+        if let Some(v) = v {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(anyhow!("{name}价格必须为正数: {v}"));
+            }
+        }
+    }
+    if let (Some(sl), Some(tp)) = (stop_loss, take_profit) {
+        if sl >= tp {
+            return Err(anyhow!("止损须低于止盈: stop_loss={sl}, take_profit={tp}"));
+        }
+    }
+    if let Some(t) = trailing_pct {
+        if !(t.is_finite() && t > 0.0 && t <= 0.5) {
+            return Err(anyhow!("移动止损比例须在 (0, 0.5] 之间: {t}"));
+        }
+    }
+    Ok(())
+}
+
 /// 实盘持仓校准的目标状态(design decision 5:只作用于实盘账户)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Calibration {
@@ -361,6 +388,37 @@ mod tests {
         assert_eq!(
             confirm_ticket(&c, 1, id, true, at(10, 0, 5)).unwrap(),
             Err(ConfirmError::KillSwitch)
+        );
+    }
+
+    #[test]
+    fn validate_exit_levels_rejects_bad_input() {
+        assert!(validate_exit_levels(Some(9.0), Some(12.0), None).is_ok());
+        assert!(validate_exit_levels(None, None, None).is_ok());
+        assert!(
+            validate_exit_levels(Some(0.0), None, None).is_err(),
+            "止损须为正数"
+        );
+        assert!(
+            validate_exit_levels(None, Some(f64::NAN), None).is_err(),
+            "止盈须有限"
+        );
+        assert!(
+            validate_exit_levels(Some(12.0), Some(9.0), None).is_err(),
+            "止损须低于止盈"
+        );
+        assert!(
+            validate_exit_levels(Some(10.0), Some(10.0), None).is_err(),
+            "相等也不行"
+        );
+        assert!(validate_exit_levels(None, None, Some(0.5)).is_ok());
+        assert!(
+            validate_exit_levels(None, None, Some(0.0)).is_err(),
+            "trailing_pct 须 > 0"
+        );
+        assert!(
+            validate_exit_levels(None, None, Some(0.51)).is_err(),
+            "trailing_pct 须 <= 0.5"
         );
     }
 

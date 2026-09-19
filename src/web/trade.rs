@@ -7,13 +7,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::trade::actions::{self, ConfirmError};
-use crate::trade::model::{Account, SignalSource, Ticket, TicketStatus};
+use crate::trade::model::{Account, Position, RiskRules, SignalSource, Ticket, TicketStatus};
 use crate::trade::ticket::{self as tk, Transition};
 use crate::trade::{notify, settings, store};
 use crate::web::auth::{AuthState, CurrentUser};
@@ -111,6 +111,12 @@ pub fn routes() -> Router<AuthState> {
         .route("/api/trade/tickets/:id/ignore", post(ignore))
         .route("/api/trade/tickets/:id/fill", post(fill))
         .route("/api/trade/signals/rejected", get(rejected_signals))
+        .route("/api/trade/risk", get(get_risk).post(post_risk))
+        .route("/api/trade/capital", post(set_capital))
+        .route("/api/trade/positions", get(positions))
+        .route("/api/trade/positions/exit-levels", post(exit_levels))
+        .route("/api/trade/positions/calibrate", post(calibrate))
+        .route("/api/trade/positions/adjusts", get(adjusts))
 }
 
 // ===== 概览 =====
@@ -367,6 +373,172 @@ async fn rejected_signals(
     let limit = q.limit.unwrap_or(REJECTED_DEFAULT).clamp(1, REJECTED_MAX);
     let conn = st.db.lock().unwrap();
     Ok(Json(store::list_rejected_signals(&conn, user.id, limit)?))
+}
+
+// ===== 资金、风控设置、持仓、止盈止损与持仓校准 =====
+
+async fn get_risk(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+) -> ApiResult<RiskRules> {
+    let conn = st.db.lock().unwrap();
+    Ok(Json(store::get_risk_rules(&conn, user.id)?))
+}
+
+async fn post_risk(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<RiskRules>, JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    let Json(rules) = body?;
+    let conn = st.db.lock().unwrap();
+    store::save_risk_rules(&conn, user.id, &rules, now())
+        .map_err(|e| ApiError::bad(e.to_string()))?;
+    Ok(ok())
+}
+
+#[derive(Deserialize)]
+struct CapitalBody {
+    account: String,
+    total: f64,
+}
+
+async fn set_capital(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<CapitalBody>, JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    let Json(body) = body?;
+    let account = Account::parse(&body.account).map_err(|e| ApiError::bad(e.to_string()))?;
+    let conn = st.db.lock().unwrap();
+    store::set_capital(&conn, user.id, account, body.total, now())
+        .map_err(|e| ApiError::bad(e.to_string()))?;
+    Ok(ok())
+}
+
+#[derive(Serialize)]
+struct PositionView {
+    #[serde(flatten)]
+    position: Position,
+    sellable: u64,
+    quote: Option<QuoteView>,
+    market_value: Option<f64>,
+    pnl_pct: Option<f64>,
+}
+
+fn position_view(
+    conn: &Connection,
+    p: Position,
+    today: NaiveDate,
+    now: NaiveDateTime,
+) -> anyhow::Result<PositionView> {
+    let sellable = p.sellable(today);
+    let q = store::get_quote(conn, &p.code)?;
+    let quote = q.as_ref().map(|q| QuoteView {
+        price: q.price,
+        ts: q.ts,
+        stale: actions::quote_is_stale(q.ts, now),
+    });
+    let market_value = q.as_ref().map(|q| q.price * p.qty as f64);
+    let pnl_pct = q.as_ref().map(|q| q.price / p.avg_cost - 1.0);
+    Ok(PositionView {
+        position: p,
+        sellable,
+        quote,
+        market_value,
+        pnl_pct,
+    })
+}
+
+async fn positions(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+) -> ApiResult<serde_json::Value> {
+    let now = now();
+    let today = now.date();
+    let conn = st.db.lock().unwrap();
+    let views = |account: Account| -> anyhow::Result<Vec<PositionView>> {
+        store::list_positions(&conn, user.id, account)?
+            .into_iter()
+            .map(|p| position_view(&conn, p, today, now))
+            .collect()
+    };
+    let real = views(Account::Real)?;
+    let paper = views(Account::Paper)?;
+    Ok(Json(json!({ "real": real, "paper": paper })))
+}
+
+#[derive(Deserialize)]
+struct ExitLevelsBody {
+    account: String,
+    code: String,
+    stop_loss: Option<f64>,
+    take_profit: Option<f64>,
+    trailing_pct: Option<f64>,
+}
+
+async fn exit_levels(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<ExitLevelsBody>, JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    let Json(body) = body?;
+    let account = Account::parse(&body.account).map_err(|e| ApiError::bad(e.to_string()))?;
+    actions::validate_exit_levels(body.stop_loss, body.take_profit, body.trailing_pct)
+        .map_err(|e| ApiError::bad(e.to_string()))?;
+    let conn = st.db.lock().unwrap();
+    let found = store::set_exit_levels(
+        &conn,
+        user.id,
+        account,
+        &body.code,
+        body.stop_loss,
+        body.take_profit,
+        body.trailing_pct,
+        now(),
+    )?;
+    if !found {
+        return Err(ApiError::not_found());
+    }
+    Ok(ok())
+}
+
+#[derive(Deserialize)]
+struct CalibrateBody {
+    code: String,
+    qty: u64,
+    avg_cost: f64,
+    reason: String,
+}
+
+async fn calibrate(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<CalibrateBody>, JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    let Json(body) = body?;
+    let mut conn = st.db.lock().unwrap();
+    actions::calibrate_position(
+        &mut conn,
+        user.id,
+        &actions::Calibration {
+            code: body.code,
+            qty: body.qty,
+            avg_cost: body.avg_cost,
+            reason: body.reason,
+        },
+        now(),
+    )
+    .map_err(|e| ApiError::bad(e.to_string()))?;
+    Ok(ok())
+}
+
+async fn adjusts(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+) -> ApiResult<Vec<store::PositionAdjust>> {
+    let conn = st.db.lock().unwrap();
+    Ok(Json(store::list_adjusts(&conn, user.id, DONE_LIMIT)?))
 }
 
 #[cfg(test)]
@@ -677,6 +849,69 @@ mod tests {
             (s, e["code"].as_str()),
             (StatusCode::CONFLICT, Some("kill_switch"))
         );
+    }
+
+    #[tokio::test]
+    async fn risk_rules_roundtrip_and_validation() {
+        let st = state();
+        seed_user(&st, "u", "t");
+        let (s, mut r) = call(&st, "GET", "/api/trade/risk", "t", None).await;
+        assert_eq!(s, StatusCode::OK);
+        r["max_order_amount"] = serde_json::json!(20000.0);
+        let (s, _) = call(&st, "POST", "/api/trade/risk", "t", Some(r.clone())).await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, back) = call(&st, "GET", "/api/trade/risk", "t", None).await;
+        assert_eq!(back["max_order_amount"], 20000.0);
+        r["max_position_pct"] = serde_json::json!(2.0);
+        let (s, e) = call(&st, "POST", "/api/trade/risk", "t", Some(r)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+    }
+
+    #[tokio::test]
+    async fn capital_positions_calibration_and_exit_levels() {
+        let st = state();
+        seed_user(&st, "u", "t");
+        let (s, _) = call(
+            &st,
+            "POST",
+            "/api/trade/capital",
+            "t",
+            Some(serde_json::json!({"account": "real", "total": 200000.0})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(&st, "POST", "/api/trade/positions/calibrate", "t",
+            Some(serde_json::json!({"code": "600000", "qty": 1000, "avg_cost": 10.0, "reason": "对账"}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, p) = call(&st, "GET", "/api/trade/positions", "t", None).await;
+        assert_eq!(p["real"].as_array().unwrap().len(), 1);
+        assert_eq!(p["real"][0]["qty"], 1000);
+        let (s, _) = call(&st, "POST", "/api/trade/positions/exit-levels", "t",
+            Some(serde_json::json!({"account": "real", "code": "600000", "stop_loss": 9.0, "take_profit": 12.0}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(&st, "POST", "/api/trade/positions/exit-levels", "t",
+            Some(serde_json::json!({"account": "real", "code": "600000", "stop_loss": 12.0, "take_profit": 9.0}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "止损须低于止盈");
+        let (s, _) = call(
+            &st,
+            "POST",
+            "/api/trade/positions/exit-levels",
+            "t",
+            Some(serde_json::json!({"account": "real", "code": "000001", "stop_loss": 9.0})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (_, log) = call(&st, "GET", "/api/trade/positions/adjusts", "t", None).await;
+        assert_eq!(log.as_array().unwrap().len(), 1);
+        let (s, _) = call(
+            &st,
+            "POST",
+            "/api/trade/capital",
+            "t",
+            Some(serde_json::json!({"account": "real", "total": -1.0})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
