@@ -9,6 +9,7 @@ use crate::trade::notify::{
     PushNotifier, QueuedPushNotifier,
 };
 use crate::trade::quotes::TencentQuotes;
+use crate::trade::report::{build_daily_report, render_daily_report};
 use crate::trade::{link, monitor, movers, settings, store, ticket};
 use anyhow::Result;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
@@ -149,6 +150,36 @@ pub fn send_fill_reminders(conn: &Connection, notifier: &dyn Notifier) -> Result
     Ok(sent)
 }
 
+/// 收盘后按交易日推送交易日报,返回推送用户数(设计裁决 1、3)。
+/// 用户集合 = 有实盘账户 ∪ 有策略 ∪ 有持仓(去重、升序);当日无任何活动且无持仓的用户
+/// `build_daily_report` 返回 `None`,不推送(不刷屏)。单个用户推送失败只记日志、继续下一个。
+pub fn send_daily_reports(
+    conn: &Connection,
+    notifier: &dyn Notifier,
+    date: NaiveDate,
+) -> Result<usize> {
+    let mut users: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    users.extend(store::users_with_real_account(conn)?);
+    users.extend(store::users_with_strategies(conn)?);
+    users.extend(store::users_with_positions(conn)?);
+
+    let mut sent = 0;
+    for uid in users {
+        match build_daily_report(conn, uid, date) {
+            Ok(Some(report)) => {
+                let (title, md) = render_daily_report(&report);
+                match notifier.notify(conn, uid, &title, &md) {
+                    Ok(()) => sent += 1,
+                    Err(e) => eprintln!("[trade] 用户 {uid} 日报推送失败: {e:#}"),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("[trade] 用户 {uid} 日报生成失败: {e:#}"),
+        }
+    }
+    Ok(sent)
+}
+
 /// 监听中断告警:推送给所有持有实盘仓位的用户(模拟盘持仓无需线下操作),返回推送用户数。
 pub fn alert_holders(conn: &Connection, notifier: &dyn Notifier, minutes: i64) -> Result<usize> {
     let (title, md) = render_monitor_down(minutes);
@@ -232,6 +263,13 @@ fn run_loop(
     let mut last_remind: Option<NaiveDate> = None;
     let mut last_probe: Option<NaiveDate> = None;
     let mut last_probe_failure: Option<NaiveDateTime> = None;
+    let mut last_report = match store::last_beat(&conn, "trade-daily-report") {
+        Ok(t) => t.map(|t| t.date()),
+        Err(e) => {
+            eprintln!("[trade] 日报心跳读取失败,按未发过处理: {e:#}");
+            None
+        }
+    };
 
     loop {
         // 心跳、异动转发、每日任务用这个较早的时刻;真正拉报价前再重新取一次(见下),
@@ -370,6 +408,30 @@ fn run_loop(
             if let Err(e) = crate::trade::daily_signals::drop_unsent(&conn, &cfg.signals, now) {
                 eprintln!("[trade] 作废过期信号计划失败: {e:#}");
             }
+
+            if cfg.daily_report
+                && due_daily_window(
+                    now,
+                    (cfg.daily_report_hour, cfg.daily_report_minute),
+                    (18, 0),
+                    last_report,
+                )
+            {
+                match crate::trade::calendar::is_trading_day(&conn, now.date()) {
+                    Ok(false) => last_report = Some(now.date()), // 休市日不发,当日不再判断
+                    Ok(true) => match send_daily_reports(&conn, notifier.as_ref(), now.date()) {
+                        Ok(n) => {
+                            println!("[trade] 已推送交易日报 {n} 份");
+                            last_report = Some(now.date());
+                            if let Err(e) = store::beat(&conn, "trade-daily-report", now) {
+                                eprintln!("[trade] 日报标记写入失败: {e:#}");
+                            }
+                        }
+                        Err(e) => eprintln!("[trade] 交易日报失败: {e:#}"),
+                    },
+                    Err(e) => eprintln!("[trade] 交易日历读取失败: {e:#}"),
+                }
+            }
             delay
         }))
         .unwrap_or_else(|_| {
@@ -383,7 +445,13 @@ fn run_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Direction;
+    use crate::trade::model::{
+        Account, AccountScope, NewSignal, Position, SignalSource, TicketStatus,
+    };
+    use crate::trade::ticket::NewTicket;
     use chrono::NaiveDate;
+    use std::cell::RefCell;
 
     fn at(d: u32, h: u32, m: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(2026, 9, d)
@@ -471,5 +539,101 @@ mod tests {
             ),
             "当日已跑过"
         );
+    }
+
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        store::migrate(&c).unwrap();
+        c
+    }
+
+    /// Recorder 形式的 Notifier 桩(仿 tests/trade_runtime.rs 的 Recorder):记录成功推送的
+    /// 用户,可指定某个用户 id 让 `notify` 返回 Err,验证单个用户失败不影响其它用户。
+    #[derive(Default)]
+    struct FailingRecorder {
+        calls: RefCell<Vec<i64>>,
+        fail_for: Option<i64>,
+    }
+
+    impl Notifier for FailingRecorder {
+        fn notify(&self, _conn: &Connection, user_id: i64, _title: &str, _md: &str) -> Result<()> {
+            if Some(user_id) == self.fail_for {
+                anyhow::bail!("推送失败(用户 {user_id})");
+            }
+            self.calls.borrow_mut().push(user_id);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn daily_reports_go_to_active_users_only_and_survive_one_failure() {
+        let c = db();
+        let today = NaiveDate::from_ymd_opt(2026, 9, 23).unwrap();
+
+        // 三个用户都开了实盘账户(空账户、当日无活动、无持仓的用户不该被推送)。
+        for uid in [1, 2, 3] {
+            store::set_capital(&c, uid, Account::Real, 100_000.0, at(20, 9, 0)).unwrap();
+        }
+
+        // 用户 1:当日一笔实盘成交。
+        let sig = NewSignal {
+            user_id: 1,
+            source: SignalSource::Manual,
+            strategy_id: None,
+            code: "600001".into(),
+            name: None,
+            side: Direction::Buy,
+            scope: AccountScope::Both,
+            ref_price: 10.0,
+            reason: "测试".into(),
+            ai_note: None,
+            dedup_key: "u1".into(),
+            suggest_cash: None,
+            suggest_qty: None,
+        };
+        let sid = ticket::insert_signal(&c, &sig, at(23, 9, 30))
+            .unwrap()
+            .unwrap();
+        ticket::mark_signal(&c, sid, "ticketed", None).unwrap();
+        let tid = ticket::create_ticket(
+            &c,
+            &NewTicket {
+                user_id: 1,
+                signal_id: sid,
+                account: Account::Real,
+                code: "600001".into(),
+                side: Direction::Buy,
+                suggest_price: 10.0,
+                qty: 100,
+                expires_at: at(23, 10, 0),
+                deviation_th: 0.015,
+                status: TicketStatus::Filled,
+                urgency: 0,
+                created_at: at(23, 9, 30),
+            },
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO trade_fills (ticket_id, user_id, account, code, side, price, qty, fee, realized_pnl, source, filled_at)
+             VALUES (?1, 1, 'real', '600001', 'buy', 10.0, 100, 5.0, NULL, 'manual', ?2)",
+            rusqlite::params![tid, crate::trade::model::fmt_ts(at(23, 9, 35))],
+        )
+        .unwrap();
+
+        // 用户 2:只有持仓,当日无其它活动。
+        let mut pos = Position::empty(2, Account::Real, "600002");
+        pos.qty = 100;
+        pos.avg_cost = 10.0;
+        store::upsert_position(&c, &pos, at(20, 9, 0)).unwrap();
+
+        // 用户 3:只有空账户,当日无活动、无持仓 —— 不应被推送。
+
+        let notifier = FailingRecorder {
+            fail_for: Some(1),
+            ..Default::default()
+        };
+        let sent = send_daily_reports(&c, &notifier, today).unwrap();
+        assert_eq!(sent, 1, "用户 1 推送失败;用户 2 成功;用户 3 无活动不发");
+        assert_eq!(*notifier.calls.borrow(), vec![2]);
     }
 }
