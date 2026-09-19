@@ -15,12 +15,15 @@ use serde_json::json;
 use crate::broker::Fee;
 use crate::event::Direction;
 use crate::stock::fee::StockFee;
-use crate::trade::actions::{self, CancelOutcome, ConfirmError, FillError, SubmitStrategyOutcome};
+use crate::trade::actions::{
+    self, CancelOutcome, ConfirmError, FillError, ManualOutcome, SubmitStrategyOutcome,
+};
 use crate::trade::admission::scorecard::{self, Scorecard};
 use crate::trade::model::{
     Account, EvalJob, NewStrategy, Position, RiskRules, SignalSource, StrategyDef, StrategyStatus,
     Ticket, TicketStatus,
 };
+use crate::trade::quotes::{QuoteSource, TencentQuotes};
 use crate::trade::ticket::{self as tk, Transition};
 use crate::trade::{settings, store};
 use crate::web::auth::config::AuthCfg;
@@ -120,6 +123,7 @@ pub fn routes() -> Router<AuthState> {
         .route("/api/trade/tickets/:id/confirm", post(confirm))
         .route("/api/trade/tickets/:id/ignore", post(ignore))
         .route("/api/trade/tickets/:id/fill", post(fill))
+        .route("/api/trade/manual", post(manual_ticket))
         .route("/api/trade/signals/rejected", get(rejected_signals))
         .route("/api/trade/risk", get(get_risk).post(post_risk))
         .route("/api/trade/capital", post(set_capital))
@@ -497,6 +501,65 @@ async fn fill(
         "fee": out.fee,
         "realized_pnl": out.realized_pnl,
     })))
+}
+
+// ===== 手动 / AI 工单(计划 4c) =====
+
+/// 手动 / AI 建议下单入口(design decision 1-3):与自动信号同一闸门,只在有今日行情
+/// 时放行。先用缓存(≤60s)报价,锁外补拉腾讯今日快照,失败按无行情处理(不把网络
+/// 错误变成 500)。
+async fn manual_ticket(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<actions::ManualOrder>, JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    let Json(o) = body?;
+    actions::validate_manual(&o).map_err(|e| ApiError::bad(e.to_string()))?;
+    let now = now();
+    // 1) 先看缓存(≤60s),命中则不联网。
+    let cached = {
+        let conn = st.db.lock().unwrap();
+        store::fresh_quote(&conn, &o.code, now, actions::QUOTE_MAX_AGE_SECS)?
+    };
+    // 2) 未命中:锁外拉腾讯快照;失败按无行情处理。
+    let quote = match cached {
+        Some(q) => Some(q),
+        None => {
+            let code = o.code.clone();
+            tokio::task::spawn_blocking(move || TencentQuotes.fetch(&[code]))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .and_then(|qs| qs.into_iter().find(|q| q.ts.date() == now.date()))
+        }
+    };
+    // 3) 持锁提交;新鲜报价顺手写入缓存。
+    let mut conn = st.db.lock().unwrap();
+    if let Some(q) = &quote {
+        store::upsert_quotes(&conn, std::slice::from_ref(q), now)?;
+    }
+    let outcome = actions::submit_manual(&mut conn, user.id, &o, quote.as_ref(), now)?;
+    Ok(Json(match outcome {
+        ManualOutcome::Ticketed {
+            real_ticket,
+            paper_ticket,
+        } => {
+            json!({ "result": "ticketed", "real_ticket": real_ticket, "paper_ticket": paper_ticket })
+        }
+        ManualOutcome::Duplicate => json!({ "result": "duplicate" }),
+        ManualOutcome::Rejected(r) => {
+            let mut e = ApiError::new(StatusCode::CONFLICT, "rejected", r.label_zh());
+            e.extra = Some(json!({ "reason": r.as_str() }));
+            return Err(e);
+        }
+        ManualOutcome::NoQuote => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "no_quote",
+                "暂无今日行情(盘前、休市或停牌),无法生成工单",
+            ))
+        }
+    }))
 }
 
 // ===== 被拦信号 =====
@@ -1741,5 +1804,91 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{r}");
         let (_, r) = call(&st, "GET", "/api/admin/trade/kill-switch", "ta", None).await;
         assert_eq!(r["on"], false);
+    }
+
+    /// 手动 / AI 工单 API(计划 4c):报价缓存命中,不走联网分支;不要为联网分支写测试。
+    #[tokio::test]
+    async fn manual_ticket_api_creates_dedupes_rejects_and_validates() {
+        let st = state();
+        let uid = seed_user(&st, "u", "t");
+        {
+            let c = st.db.lock().unwrap();
+            let now = chrono::Local::now().naive_local();
+            crate::trade::store::set_capital(
+                &c,
+                uid,
+                crate::trade::model::Account::Real,
+                100_000.0,
+                now,
+            )
+            .unwrap();
+            crate::trade::store::upsert_quotes(
+                &c,
+                &[crate::trade::model::Quote {
+                    code: "600000".into(),
+                    price: 10.0,
+                    limit_up: Some(11.0),
+                    limit_down: Some(9.0),
+                    ts: now,
+                }],
+                now,
+            )
+            .unwrap();
+        }
+        let body = serde_json::json!({
+            "request_id": "abc-1", "code": "600000", "name": "浦发银行", "side": "buy",
+            "amount": 5000.0, "reason": "看好", "ai_note": null
+        });
+        let (s, r) = call(&st, "POST", "/api/trade/manual", "t", Some(body.clone())).await;
+        assert_eq!(
+            (s, r["result"].as_str()),
+            (StatusCode::OK, Some("ticketed")),
+            "{r}"
+        );
+        assert!(r["real_ticket"].is_i64());
+        let (s, r) = call(&st, "POST", "/api/trade/manual", "t", Some(body.clone())).await;
+        assert_eq!(
+            (s, r["result"].as_str()),
+            (StatusCode::OK, Some("duplicate"))
+        );
+
+        let mut sell = body.clone();
+        sell["request_id"] = serde_json::json!("abc-2");
+        sell["side"] = serde_json::json!("sell");
+        sell["amount"] = serde_json::Value::Null;
+        let (s, r) = call(&st, "POST", "/api/trade/manual", "t", Some(sell)).await;
+        assert_eq!(
+            (s, r["code"].as_str(), r["reason"].as_str()),
+            (
+                StatusCode::CONFLICT,
+                Some("rejected"),
+                Some("nothing_sellable")
+            )
+        );
+
+        let mut bad = body.clone();
+        bad["request_id"] = serde_json::json!("abc-3");
+        bad["reason"] = serde_json::json!(" ");
+        let (s, _) = call(&st, "POST", "/api/trade/manual", "t", Some(bad)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        let (s, _) = call(&st, "POST", "/api/trade/manual", "", Some(body)).await;
+        assert_ne!(s, StatusCode::OK, "需登录");
+    }
+
+    /// 拦截原因中文文案一致性(计划 4c):`GateReject::label_zh` 与 `TRADE_HTML` 里
+    /// `REJECT_REASONS` 的文案须逐一一致,不允许两处悄悄走样。
+    #[test]
+    fn gate_reject_label_zh_matches_trade_html_reject_reasons() {
+        use crate::trade::gate::GateReject;
+        let html = crate::web::trade_page::TRADE_HTML;
+        for r in GateReject::ALL {
+            assert!(
+                html.contains(r.label_zh()),
+                "TRADE_HTML 缺少 {:?} 的中文文案 {}",
+                r,
+                r.label_zh()
+            );
+        }
     }
 }
