@@ -1,7 +1,7 @@
 //! 评估任务的自动入队。只负责写队列,执行在 `thread.rs`:
 //! 入队与执行分离,重启、崩溃与手动触发三条路径才能共用同一套执行逻辑。
 
-use crate::trade::model::{EvalKind, StrategyStatus};
+use crate::trade::model::{EvalKind, StrategyDef, StrategyStatus};
 use crate::trade::store;
 use anyhow::Result;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
@@ -21,12 +21,12 @@ pub struct Enqueued {
 fn enqueue_by_status(
     conn: &Connection,
     now: NaiveDateTime,
-    pick: impl Fn(StrategyStatus) -> Option<EvalKind>,
+    pick: impl Fn(&StrategyDef) -> Option<EvalKind>,
 ) -> Result<Enqueued> {
     let mut out = Enqueued::default();
     for user_id in store::users_with_strategies(conn)? {
         for s in store::list_strategies(conn, user_id)? {
-            let Some(kind) = pick(s.status) else { continue };
+            let Some(kind) = pick(&s) else { continue };
             match store::enqueue_eval(conn, user_id, s.id, kind, now) {
                 Ok(Some(_)) => match kind {
                     EvalKind::PaperCheck => out.paper += 1,
@@ -44,7 +44,7 @@ fn enqueue_by_status(
 
 /// 每日:观察期策略查是否达标,已准入策略查实盘是否失控。
 pub fn enqueue_daily(conn: &Connection, now: NaiveDateTime) -> Result<Enqueued> {
-    enqueue_by_status(conn, now, |st| match st {
+    enqueue_by_status(conn, now, |s| match s.status {
         StrategyStatus::Paper => Some(EvalKind::PaperCheck),
         StrategyStatus::Admitted => Some(EvalKind::Watchdog),
         _ => None,
@@ -52,9 +52,10 @@ pub fn enqueue_daily(conn: &Connection, now: NaiveDateTime) -> Result<Enqueued> 
 }
 
 /// 每月:对还在用的策略重跑前推回测(计划 3c 的 `apply_monthly_verdict` 负责裁决)。
+/// 异动类没有历史分时、不可回测(spec §10.2),跳过——否则每月都会失败一次并留下噪音。
 pub fn enqueue_monthly(conn: &Connection, now: NaiveDateTime) -> Result<Enqueued> {
-    enqueue_by_status(conn, now, |st| {
-        matches!(st, StrategyStatus::Paper | StrategyStatus::Admitted)
+    enqueue_by_status(conn, now, |s| {
+        (s.kind != "mover" && matches!(s.status, StrategyStatus::Paper | StrategyStatus::Admitted))
             .then_some(EvalKind::WalkForward)
     })
 }
@@ -130,6 +131,54 @@ mod tests {
         id
     }
 
+    /// 建一个指定状态的非 mover(trend)策略:观察期要走一次通过的前推回测裁决,
+    /// Admitted 再从 Paper 转一次。
+    fn trend_strategy_at(c: &Connection, user_id: i64, status: StrategyStatus) -> i64 {
+        let id = store::create_strategy(
+            c,
+            &NewStrategy {
+                user_id,
+                name: "T".into(),
+                kind: "trend".into(),
+                grid_toml: "x = [1]".into(),
+                pool: vec!["600000".into()],
+            },
+            at(16, 9, 0),
+        )
+        .unwrap();
+        if status == StrategyStatus::Draft {
+            return id;
+        }
+        state::submit_for_backtest(c, user_id, id, at(16, 9, 1)).unwrap(); // → Backtesting
+        state::apply_backtest_verdict(
+            c,
+            user_id,
+            id,
+            &crate::trade::admission::walk_forward::aggregate(Vec::new()),
+            &crate::trade::admission::judge::Verdict {
+                passed: true,
+                reasons: vec![],
+            },
+            NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
+            at(16, 9, 1),
+        )
+        .unwrap();
+        if status == StrategyStatus::Admitted {
+            state::update_status(
+                c,
+                user_id,
+                id,
+                StrategyStatus::Paper,
+                StrategyStatus::Admitted,
+                "准入",
+                at(16, 9, 2),
+            )
+            .unwrap();
+        }
+        id
+    }
+
     fn queued_kinds(c: &Connection) -> Vec<(i64, EvalKind)> {
         let mut out = Vec::new();
         while let Some(j) = store::claim_next_job(c, at(16, 17, 0)).unwrap() {
@@ -174,15 +223,29 @@ mod tests {
 
     #[test]
     fn monthly_enqueues_walk_forward_for_paper_and_admitted() {
+        // 异动(mover)策略每月重跑跳过(见 monthly_rerun_skips_mover_strategies),
+        // 这里用非 mover(trend)策略来测「Paper/Admitted 都入队、Draft 不入队」。
         let c = db();
-        strategy_at(&c, 1, StrategyStatus::Paper);
-        strategy_at(&c, 1, StrategyStatus::Admitted);
-        strategy_at(&c, 1, StrategyStatus::Draft);
+        trend_strategy_at(&c, 1, StrategyStatus::Paper);
+        trend_strategy_at(&c, 1, StrategyStatus::Admitted);
+        trend_strategy_at(&c, 1, StrategyStatus::Draft);
         let r = enqueue_monthly(&c, at(16, 17, 0)).unwrap();
         assert_eq!(r.walk_forward, 2);
         assert!(queued_kinds(&c)
             .iter()
             .all(|(_, k)| *k == EvalKind::WalkForward));
+    }
+
+    /// 计划 3c 遗留项:异动类没有历史分时、不可回测(spec §10.2),每月重跑不该把它排进去,
+    /// 否则每月都会失败一次并留下噪音。
+    #[test]
+    fn monthly_rerun_skips_mover_strategies() {
+        let c = db();
+        strategy_at(&c, 1, StrategyStatus::Paper); // kind=mover 的观察期策略
+        trend_strategy_at(&c, 1, StrategyStatus::Paper); // kind=trend 的观察期策略
+
+        let r = enqueue_monthly(&c, at(16, 17, 0)).unwrap();
+        assert_eq!(r.walk_forward, 1, "异动策略跳过,只有 trend 入队");
     }
 
     #[test]

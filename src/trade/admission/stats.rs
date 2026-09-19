@@ -293,7 +293,9 @@ fn max_streak_by_code(units: &[TradeUnit]) -> usize {
     let mut by_code: BTreeMap<&str, usize> = BTreeMap::new();
     let mut cur: BTreeMap<&str, usize> = BTreeMap::new();
     for u in units.iter().filter(|u| u.side == Direction::Sell) {
-        let pnl = u.realized_pnl.unwrap_or(0.0);
+        // 无盈亏的成交(如未来 qmt 导入)与 sell_pnls / trade_returns 一样跳过,
+        // 不能按亏损计——否则会静默拉长连亏、误触 watchdog。
+        let Some(pnl) = u.realized_pnl else { continue };
         let c = cur.entry(u.code.as_str()).or_insert(0);
         if pnl <= 0.0 {
             *c += 1;
@@ -600,6 +602,19 @@ mod tests {
         let sep_units = trade_units(&separate);
         assert_eq!(sep_units.len(), 3);
         assert_eq!(max_streak_by_code(&sep_units), 3);
+    }
+
+    /// 计划 3c 遗留项:无盈亏的成交(如未来 qmt 导入)不能按亏损计,否则会静默拉长
+    /// 连亏、误触 watchdog——也不能打断连亏(它本来就不该被计入这条流水)。
+    #[test]
+    fn fills_without_realized_pnl_do_not_extend_a_losing_streak() {
+        // 卖出序列:亏、无盈亏(qmt 导入)、亏 —— 连亏应是 2,中间的 NULL 不打断也不计入
+        let units = trade_units(&[
+            raw(1, Direction::Sell, 11.0, 1000, 10.61, Some(-1.0)),
+            raw(2, Direction::Sell, 11.0, 1000, 10.61, None),
+            raw(3, Direction::Sell, 11.0, 1000, 10.61, Some(-2.0)),
+        ]);
+        assert_eq!(max_streak_by_code(&units), 2);
     }
 
     /// 裁决 1:回撤的分母是投入资金(与回测 `metrics.rs::max_drawdown` 同口径),

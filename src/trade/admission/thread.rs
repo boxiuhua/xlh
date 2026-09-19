@@ -336,6 +336,39 @@ mod tests {
         id
     }
 
+    /// 非 mover(如 trend)的观察期策略:提交前推回测后再走一次通过的裁决。
+    /// 计划 3c 遗留项修复后,月度重跑只认非 mover 策略,需要这种策略来触发它。
+    fn trend_paper_strategy(c: &Connection) -> i64 {
+        let id = store::create_strategy(
+            c,
+            &NewStrategy {
+                user_id: 1,
+                name: "T".into(),
+                kind: "trend".into(),
+                grid_toml: "x = [1]".into(),
+                pool: vec!["600000".into()],
+            },
+            at(16, 9, 0),
+        )
+        .unwrap();
+        state::submit_for_backtest(c, 1, id, at(16, 9, 1)).unwrap();
+        state::apply_backtest_verdict(
+            c,
+            1,
+            id,
+            &crate::trade::admission::walk_forward::aggregate(Vec::new()),
+            &crate::trade::admission::judge::Verdict {
+                passed: true,
+                reasons: vec![],
+            },
+            NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
+            at(16, 9, 2),
+        )
+        .unwrap();
+        id
+    }
+
     fn deps() -> (WalkForwardCfg, AdmissionCfg, EvalCfg) {
         (
             WalkForwardCfg::default(),
@@ -387,7 +420,7 @@ mod tests {
     #[test]
     fn tick_persists_daily_and_monthly_markers_for_seed_tick_state_to_use_after_restart() {
         let mut c = db();
-        paper_strategy(&c); // mover → Paper:daily(PaperCheck)与 monthly(WalkForward)都会命中
+        trend_paper_strategy(&c); // 非 mover → Paper:daily(PaperCheck)与 monthly(WalkForward)都会命中
         let (wf, adm, ev) = deps();
         let d = EvalDeps {
             wf: &wf,
