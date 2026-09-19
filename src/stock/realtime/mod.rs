@@ -28,6 +28,7 @@ pub mod flow;
 pub mod job;
 pub mod limit_board;
 pub mod movers;
+pub mod outcomes;
 pub mod snapshot;
 pub mod store;
 

@@ -32,7 +32,7 @@ XLH_STATE_DIR=/srv/xlh-state scripts/deploy.sh user@your-server
 | `/opt/xlh/data/xlh.db` | 用户、授权码、会话、推送配置、建议历史 | **不可再生。全没了。** |
 | `/opt/xlh/cache/` | 净值 / K线 / 财报 / 估值缓存 | 可再生，但全量重抓要很久 |
 | `/opt/xlh/output/` | 回测报告 HTML | 无所谓 |
-| `/opt/xlh/backups/` | 自动备份（每次部署前一份，留最近 10 份） | — |
+| `/opt/xlh/backups/` | 自动备份（每次部署前一份，永久保留） | — |
 
 ### 放在部署目录里安全吗
 
@@ -92,7 +92,7 @@ scripts/backup.sh --list user@host       # 看服务器上有哪些备份
 scripts/backup.sh --restore user@host xlh-20260712-1930.db
 ```
 
-`deploy.sh` 每次部署前会自动备份一次（保留最近 10 份），并在部署后**比对用户数** ——
+`deploy.sh` 每次部署前会自动备份一次（永久保留），并在部署后**比对用户数** ——
 数据少了会立刻报错退出，而不是等你哪天登录时才发现。
 
 建议再加一条 crontab：

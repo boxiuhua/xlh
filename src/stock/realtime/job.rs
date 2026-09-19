@@ -477,26 +477,7 @@ pub fn close_summary(conn: &Connection, day: NaiveDate) -> Result<String> {
 }
 
 fn backfill_close(conn: &Connection, day: NaiveDate) -> Result<()> {
-    let cache = std::path::Path::new(".cache/stock");
-    for s in store::signals_missing_close(conn, day)? {
-        let ret = (|| {
-            let bars = crate::stock::data::cache::load_or_fetch(
-                &s.code,
-                cache,
-                day - chrono::Duration::days(10),
-                day,
-            )
-            .ok()?;
-            let close = bars.iter().find(|b| b.date == day)?.close;
-            if s.trigger_price <= 0.0 {
-                return None;
-            }
-            Some((close - s.trigger_price) / s.trigger_price)
-        })();
-        // ret 为 None 时写 NULL 而非 0：日线还没同步到 / 该股当日停牌，
-        // 都属于「没数据」，与「零收益」是两回事
-        store::backfill_outcome(conn, s.id, store::Outcome::Close, ret)?;
-    }
+    super::outcomes::repair(conn, day)?;
     Ok(())
 }
 

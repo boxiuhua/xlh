@@ -7,3 +7,13 @@ scripts
 *.md
 push.toml
 regime_check.json
+data
+backups
+state
+.env
+*.db
+*.db-wal
+*.db-shm
+*.tar
+*.tar.gz
+*.zip

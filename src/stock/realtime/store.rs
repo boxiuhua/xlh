@@ -3,15 +3,13 @@
 //! # 为什么独立于 data/xlh.db
 //!
 //! 盘中每 10 分钟写 5400 行，不应与登录会话争同一 WAL 锁；且此库是纯派生
-//! 数据，损坏可直接删除重建，不涉及用户资产。
+//! 数据，历史采集记录应独立备份，不涉及用户资产。
 //!
-//! # 分层保留：ticks 10 天，signals 永久
+//! # 默认永久保留 ticks 与 signals
 //!
-//! 两者性质完全不同：
-//!
-//! - `ticks` 108 万行滚动，只为算异动与量能基准。10 天足够，再多是浪费 ——
-//!   其中 99.9% 是「未触发任何信号的普通股票的普通快照」，写完永不再读。
-//! - `signals` 每天几十行、一年约 1 万行。它是**验证阈值有效性的唯一依据**。
+//! `ticks` 用于异动检测、量能基准及长期预测验证，默认不执行过期删除。
+//! `retain_days = 0` 表示永久保留，只有显式配置正数才滚动清理 ticks。
+//! `signals` 永久保留，用于验证信号阈值。
 //!
 //! `signals` 的保留期刻意不做成配置项：不给「一改配置就把验证依据清掉」
 //! 留任何路径。若它随 ticks 一起滚动删除，就永久失去了回答「这套阈值到底
@@ -233,10 +231,14 @@ pub fn same_slot_deltas(
     Ok(out)
 }
 
-/// 删除 retain_days 之前的 ticks，并回收文件空间。
+/// retain_days = 0 时不删除数据；正数时删除过期 ticks 并回收文件空间。
 ///
 /// **只动 ticks**。signals 永久保留 —— 它是验证阈值的唯一依据。
 pub fn prune(conn: &Connection, now: NaiveDateTime, retain_days: i64) -> Result<usize> {
+    anyhow::ensure!(retain_days >= 0, "retain_days 不能为负数");
+    if retain_days == 0 {
+        return Ok(0);
+    }
     let cutoff = (now - chrono::Duration::days(retain_days))
         .and_utc()
         .timestamp();
@@ -550,6 +552,23 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM ticks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "同一 (code, ts) 只应有一行");
+    }
+
+    #[test]
+    fn unlimited_retention_keeps_old_ticks() {
+        let mut c = db();
+        let now = dt(2026, 7, 16, 15, 0);
+        insert_ticks(
+            &mut c,
+            &[tick("old", now - chrono::Duration::days(3650), 10.0, 100.0)],
+        )
+        .unwrap();
+        assert_eq!(prune(&c, now, 0).unwrap(), 0);
+        assert!(prune(&c, now, -1).is_err());
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM ticks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

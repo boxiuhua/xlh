@@ -5,6 +5,7 @@ pub mod diagnose;
 pub mod evidence;
 pub mod fee;
 pub mod forecast;
+pub mod forecast_log;
 pub mod indicators;
 pub mod realtime;
 pub mod recommend;

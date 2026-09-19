@@ -160,14 +160,18 @@ mod tests {
     }
     #[test]
     fn enabled_config_requires_key() {
-        let mut c = AiConfig::default();
-        c.enabled = true;
+        let c = AiConfig {
+            enabled: true,
+            ..Default::default()
+        };
         assert!(validate_config(&c).is_err());
     }
     #[test]
     fn rejects_non_https_endpoint() {
-        let mut c = AiConfig::default();
-        c.base_url = "http://127.0.0.1:11434/v1".into();
+        let c = AiConfig {
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            ..Default::default()
+        };
         assert!(validate_config(&c).is_err());
     }
 }

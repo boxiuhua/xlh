@@ -24,7 +24,6 @@ set -euo pipefail
 STATE_DIR="${XLH_STATE_DIR:-/opt/xlh}"
 DB="$STATE_DIR/data/xlh.db"
 BACKUP_DIR="$STATE_DIR/backups"
-KEEP=20
 # 容器里装了 sqlite3；宿主机不一定有。优先借容器的用。
 CONTAINER="${XLH_CONTAINER:-xlh-web}"
 
@@ -106,7 +105,7 @@ case "$MODE" in
         echo \"✓ 备份完成: \$OUT（含 -wal/-shm；未校验，建议装 sqlite3）\"
       fi
 
-      ls -1t '$BACKUP_DIR'/xlh-*.db 2>/dev/null | tail -n +\$(($KEEP + 1)) | xargs -r rm -f"
+      :"
 
     # 远程备份顺手拉回本机 —— 备份和数据在同一台机器上，机器没了就一起没了
     if [[ -n "$TARGET" ]]; then

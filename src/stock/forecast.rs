@@ -152,7 +152,7 @@ pub fn forecast_with_market(
         evidence_5d: evidence(&prices, market_ref, 5, p5 >= 0.5),
         evidence_20d: evidence(&prices, market_ref, 20, p20 >= 0.5),
         rationale: format!("5日模型分数 {s5:+.1}；20日模型分数 {s20:+.1}。趋势以均线、动量和 MACD 为主；震荡时提高 RSI 与布林位置权重{}。", if market_ref.is_some() { "，并叠加市场趋势与相对强弱" } else { "" }),
-        caveat: "概率为规则模型的方向倾向，不是收益或价格预测；命中率仅统计最后 30% 样本外区间的同方向信号，并与该区间无模型方向基准比较。样本少于 10 次不显示。".into(),
+        caveat: "概率是未经校准的规则模型方向倾向；此处命中率为历史回放末30%区间的同方向信号，与无模型方向基准比较，不能替代实际登记后的前瞻验证。样本少于10次不显示。实际预测表现请看单独的跟踪记录。".into(),
     })
 }
 

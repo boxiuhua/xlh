@@ -43,7 +43,7 @@ out_dir = "output"
 
 [realtime]
 db_path = "data/realtime.db"
-retain_days = 10
+retain_days = 0 # 永久保留采集数据，不自动删除；正数才启用按天清理
 baseline_days = 10
 price_jump_pct = 0.02
 volume_surge_x = 3.0

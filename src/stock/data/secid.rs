@@ -60,9 +60,10 @@ pub fn resolve_offline(input: &str) -> Result<Resolved> {
     }
     // 美股显式前缀 "us."（带点，避免与 USB 等 ticker 冲突）
     if let Some(rest) = lower.strip_prefix("us.") {
-        if !rest.is_empty() {
+        if valid_ticker(rest) {
             return Ok(Resolved::NeedSearch(rest.to_ascii_uppercase()));
         }
+        return Err(anyhow!("非法美股代码: {s}"));
     }
 
     // 纯数字
@@ -86,8 +87,21 @@ pub fn resolve_offline(input: &str) -> Result<Resolved> {
         };
     }
 
-    // 其余含字母者视为美股 ticker
-    Ok(Resolved::NeedSearch(s.to_ascii_uppercase()))
+    if valid_ticker(s) {
+        Ok(Resolved::NeedSearch(s.to_ascii_uppercase()))
+    } else {
+        Err(anyhow!("非法股票代码: {s}"))
+    }
+}
+
+fn valid_ticker(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 16
+        && s.as_bytes()[0].is_ascii_alphabetic()
+        && s.as_bytes()[s.len() - 1].is_ascii_alphanumeric()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && !s.contains("..")
 }
 
 #[cfg(test)]
@@ -205,6 +219,13 @@ mod tests {
     fn rejects_overlong_or_empty() {
         assert!(resolve_offline("").is_err());
         assert!(resolve_offline("1234567").is_err());
+        for invalid in ["us.", "../AAPL", "AAPL/../../x", "AAPL?", "A..B"] {
+            assert!(resolve_offline(invalid).is_err(), "{invalid}");
+        }
+        assert!(matches!(
+            resolve_offline("BRK.B"),
+            Ok(Resolved::NeedSearch(_))
+        ));
     }
 
     #[test]

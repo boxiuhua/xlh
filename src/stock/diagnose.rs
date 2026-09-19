@@ -5,18 +5,13 @@ use serde::Serialize;
 
 /// 面向调用方的标准动作。`signal` 保留中文强弱文案，`action` 则方便 Web、
 /// 推送和其他接口稳定地消费买入/卖出/观望三种状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TradeAction {
     Buy,
     Sell,
+    #[default]
     Hold,
-}
-
-impl Default for TradeAction {
-    fn default() -> Self {
-        Self::Hold
-    }
 }
 
 pub struct DiagnoseParams {
@@ -52,9 +47,26 @@ impl Default for DiagnoseParams {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct PricePoint {
+    pub date: String,
+    pub close: f64,
+    pub adj_close: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct StockDiagnosis {
     pub code: String,
     pub name: String,
+    pub currency: String,
+    pub market: String,
+    pub market_note: String,
+    pub price_basis: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<PricePoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracking: Option<super::forecast_log::TrackingReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracking_error: Option<String>,
     pub date: String,
     pub price: f64,
     pub adj_price: f64,
@@ -207,9 +219,45 @@ pub fn diagnose(
     }
     .to_string();
 
+    let market = match crate::stock::data::secid::resolve_offline(&code) {
+        Ok(crate::stock::data::secid::Resolved::Ready(s)) => s.market,
+        Ok(crate::stock::data::secid::Resolved::NeedSearch(_)) => 105,
+        Err(_) => u16::MAX,
+    };
+    let currency = match market {
+        0 | 1 => "CNY",
+        116 => "HKD",
+        105..=107 => "USD",
+        _ => "",
+    }
+    .to_string();
+    let market_label = match market {
+        0 => "沪深 · 深市",
+        1 => "沪深 · 沪市",
+        116 => "港股",
+        105..=107 => "美股",
+        _ => "未知市场",
+    }
+    .to_string();
+    let market_note = if (105..=107).contains(&market) {
+        "美股日线分析 · 价格以美元计，日期为行情源交易日；非实时或盘前盘后报价。暂未接入美股基本面筛选和盘中异动监控。"
+    } else { "" }.to_string();
+    let price_basis = if bars.iter().any(|b| (b.adj_close - b.close).abs() > 1e-8) {
+        "数据源复权价"
+    } else {
+        "与原价一致（未确认复权，拆股或分红可能影响指标与回测）"
+    }
+    .to_string();
     Ok(StockDiagnosis {
         code,
         name,
+        currency,
+        market: market_label,
+        market_note,
+        price_basis,
+        history: Vec::new(),
+        tracking: None,
+        tracking_error: None,
         date: last.date.to_string(),
         price: last.close,
         adj_price: price_adj,

@@ -28,12 +28,15 @@ const STOCK_POOL: &[&str] = &[
 
 fn validate_stock_code(code: &str) -> Result<()> {
     let c = code.trim();
-    if c.is_empty() || c.len() > 16 || !c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '.')
+    if c.is_empty()
+        || c.len() > 19
+        || !c
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-')
     {
-        return Err(anyhow!(
-            "股票代码非法: {code}（仅允许字母/数字/点，1-16 位）"
-        ));
+        return Err(anyhow!("股票代码非法: {code}（仅允许字母/数字/点/连字符）"));
     }
+    data::secid::resolve_offline(c)?;
     Ok(())
 }
 
@@ -58,6 +61,7 @@ pub async fn search_handler(Query(q): Query<SearchQuery>) -> Json<Vec<search::St
 #[derive(Debug, Deserialize)]
 pub struct DiagnoseQuery {
     pub code: String,
+    pub market: Option<String>,
 }
 
 pub async fn diagnose_handler(
@@ -71,10 +75,14 @@ pub async fn diagnose_handler(
 
 fn diagnose_blocking(q: DiagnoseQuery) -> Result<StockDiagnosis> {
     validate_stock_code(&q.code)?;
+    validate_selected_market(&q.code, q.market.as_deref())?;
     let end = chrono::Local::now().date_naive();
     let start = end - chrono::Duration::days(800);
-    let bars = cache::load_or_fetch(&q.code, stock_cache(), start, end)
+    let secid = data::resolve_secid(&q.code)?;
+    let fetched = cache::load_resolved(&secid, stock_cache(), start, end)
         .map_err(|e| anyhow!("加载行情失败: {e}"))?;
+    let now = chrono::Utc::now();
+    let bars = crate::stock::forecast_log::completed_bars(&fetched, now);
     let (market, market_name) = match market_benchmark(&q.code) {
         Some((code, name)) => {
             let raw = cache::load_or_fetch(code, stock_cache(), start, end).ok();
@@ -83,29 +91,79 @@ fn diagnose_blocking(q: DiagnoseQuery) -> Result<StockDiagnosis> {
         None => (None, None),
     };
     // 对外展示必须带证据：给了「买入」就得说清这个信号到底有没有用
-    diagnose::diagnose_with_evidence_and_market(
+    let mut result = diagnose::diagnose_with_evidence_and_market(
         q.code.clone(),
         q.code.clone(),
         &bars,
         market.as_deref(),
         market_name,
         &DiagnoseParams::default(),
-    )
+    )?;
+    result.history = bars
+        .iter()
+        .filter(|b| {
+            b.close.is_finite() && b.close > 0.0 && b.adj_close.is_finite() && b.adj_close > 0.0
+        })
+        .map(|b| diagnose::PricePoint {
+            date: b.date.to_string(),
+            close: b.close,
+            adj_close: b.adj_close,
+        })
+        .collect();
+    if let Some(forecast) = result.forecast.as_ref() {
+        let track = (|| -> Result<_> {
+            use crate::stock::forecast_log as log;
+            let mut conn = log::open(&log::default_path())?;
+            log::verify(&mut conn, &secid, &bars, now)?;
+            let version = log::record(&mut conn, &secid, &bars, forecast, now)?;
+            log::report(&conn, &secid, &version, now)
+        })();
+        match track {
+            Ok(report) => result.tracking = Some(report),
+            Err(e) => result.tracking_error = Some(format!("预测记录/核验失败：{e}")),
+        }
+    }
+    result
+        .market_note
+        .push_str(" 预测仅采用日期早于当前UTC日期的日线，保守延迟展示，避免使用未收盘行情。");
+    Ok(result)
 }
 
 /// AI 只使用这份既有诊断结果作为上下文，避免浏览器自行拼装或传入无关数据。
 pub fn ai_context(code: &str) -> Result<serde_json::Value> {
     let diagnosis = diagnose_blocking(DiagnoseQuery {
         code: code.trim().to_string(),
+        market: None,
     })?;
     serde_json::to_value(diagnosis).map_err(Into::into)
 }
 
+fn validate_selected_market(code: &str, selected: Option<&str>) -> Result<()> {
+    let Some(selected) = selected else {
+        return Ok(());
+    };
+    let actual = match data::secid::resolve_offline(code)? {
+        data::secid::Resolved::Ready(s) if s.market == 0 || s.market == 1 => "cn",
+        data::secid::Resolved::Ready(s) if s.market == 116 => "hk",
+        data::secid::Resolved::NeedSearch(_) => "us",
+        _ => "unknown",
+    };
+    if !["cn", "us", "hk"].contains(&selected) {
+        return Err(anyhow!("不支持的市场: {selected}"));
+    }
+    if selected != actual {
+        return Err(anyhow!(
+            "股票代码与所选市场不一致，请切换沪深、美股或港股分类"
+        ));
+    }
+    Ok(())
+}
+
 /// 显式市场前缀让指数与同名个股（如 000001）不会混淆。
 fn market_benchmark(code: &str) -> Option<(&'static str, &'static str)> {
-    match code.trim().chars().next()? {
-        '6' | '5' | '9' => Some(("sh000001", "上证指数")),
-        '0' | '3' => Some(("sz399001", "深证成指")),
+    match data::secid::resolve_offline(code).ok()? {
+        data::secid::Resolved::Ready(s) if s.market == 1 => Some(("sh000001", "上证指数")),
+        data::secid::Resolved::Ready(s) if s.market == 0 => Some(("sz399001", "深证成指")),
         _ => None,
     }
 }
@@ -126,6 +184,7 @@ fn align_market(
 #[derive(Debug, Deserialize)]
 pub struct StockRunQuery {
     pub code: String,
+    pub market: Option<String>,
     pub start: NaiveDate,
     pub end: NaiveDate,
     pub strategy: String,
@@ -166,6 +225,7 @@ pub async fn run_handler(
 
 fn run_blocking(q: StockRunQuery) -> Result<StockRunOutcome> {
     validate_stock_code(&q.code)?;
+    validate_selected_market(&q.code, q.market.as_deref())?;
     if q.start >= q.end {
         return Err(anyhow!(
             "回测区间错误: start ({}) 必须早于 end ({})",
@@ -514,6 +574,32 @@ mod tests {
         for c in STOCK_POOL {
             assert!(validate_stock_code(c).is_ok(), "池内代码应合法: {c}");
         }
+    }
+
+    #[test]
+    fn benchmarks_follow_market_instead_of_first_character() {
+        assert_eq!(market_benchmark("sh600519"), Some(("sh000001", "上证指数")));
+        assert_eq!(market_benchmark("sz000001"), Some(("sz399001", "深证成指")));
+        for code in ["00700", "hk700", "AAPL", "us.TSLA"] {
+            assert_eq!(market_benchmark(code), None);
+        }
+    }
+
+    #[test]
+    fn selected_market_rejects_cross_market_codes() {
+        for (code, market) in [
+            ("600519", "cn"),
+            ("sz000001", "cn"),
+            ("us.AAPL", "us"),
+            ("00700", "hk"),
+        ] {
+            assert!(validate_selected_market(code, Some(market)).is_ok());
+        }
+        assert!(validate_selected_market("AAPL", Some("cn")).is_err());
+        assert!(validate_selected_market("600519", Some("us")).is_err());
+        assert!(validate_selected_market("00700", Some("cn")).is_err());
+        assert!(validate_selected_market("AAPL", Some("invalid")).is_err());
+        assert!(validate_selected_market("AAPL", None).is_ok());
     }
 
     #[test]

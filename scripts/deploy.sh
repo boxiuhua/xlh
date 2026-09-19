@@ -148,10 +148,8 @@ if [[ "$BEFORE" != "-1" ]]; then
       [ -f \"\$db-shm\" ] && cp \"\$db-shm\" \"\$out-shm\"
     fi
     echo \"    已备份到 \$out\"
-    # 只留最近 10 份（含其 -wal/-shm）
-    ls -1t '$STATE_DIR/backups'/xlh-*.db 2>/dev/null | tail -n +11 | while read -r old; do
-      rm -f \"\$old\" \"\$old-wal\" \"\$old-shm\"
-    done"
+    # 历史备份全部保留，不自动清理
+    :"
 else
   echo "==> 3/7 无既有数据，跳过备份"
 fi
@@ -248,6 +246,6 @@ if [[ "$STATE_DIR" == "$REMOTE_DIR" || "$STATE_DIR" == "$REMOTE_DIR"/* ]]; then
 else
   echo "             （在部署目录之外，任何部署动作都碰不到）"
 fi
-echo "   备份    ：$STATE_DIR/backups/（每次部署前自动备份，保留最近 10 份）"
+echo "   备份    ：$STATE_DIR/backups/（每次部署前自动备份，永久保留）"
 echo "   日志    ：ssh $TARGET 'cd $REMOTE_DIR && docker compose -f docker-compose.prod.yml logs -f'"
 echo "   Web 绑在 127.0.0.1:8080，请在其前面配 Nginx/Caddy 反代 + HTTPS 后再对外访问。"

@@ -21,6 +21,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// 使用库内收盘快照修复收益标签；原值及依据永久写入审计表
+    RepairOutcomes {
+        #[arg(long)]
+        db: PathBuf,
+        /// 最后一个已结束的采集交易日 YYYY-MM-DD
+        #[arg(long)]
+        through: String,
+    },
     /// 启动本地 Web 界面
     Serve {
         /// 监听端口
@@ -110,6 +118,14 @@ enum UserCmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Some(Commands::RepairOutcomes { db, through }) => {
+            anyhow::ensure!(db.is_file(), "数据库不存在: {}", db.display());
+            let conn = xlh::stock::realtime::store::open(&db)?;
+            let day = chrono::NaiveDate::parse_from_str(&through, "%Y-%m-%d")?;
+            let report = xlh::stock::realtime::outcomes::repair(&conn, day)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
         Some(Commands::Serve { port }) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(xlh::web::serve(cli.config.clone(), port))?;

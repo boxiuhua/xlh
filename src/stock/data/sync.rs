@@ -44,6 +44,7 @@ fn sync_one(display: &str, secid: &Secid, cache_dir: &Path) -> SyncOutcome {
             }
         }
     };
+    let fresh_for_verification = fresh.clone();
     let (merged, added) = merge_incremental(&cached, fresh);
     if let Err(e) = super::cache::write_csv(&path, &merged) {
         return SyncOutcome {
@@ -55,12 +56,16 @@ fn sync_one(display: &str, secid: &Secid, cache_dir: &Path) -> SyncOutcome {
         };
     }
     let latest = merged.last().map(|b| b.date.to_string());
+    let verification_error =
+        crate::stock::forecast_log::verify_default(secid, &fresh_for_verification)
+            .err()
+            .map(|e| format!("行情已保存，但预测核验失败: {e}"));
     SyncOutcome {
         code: display.to_string(),
         added,
         total: merged.len(),
         latest,
-        error: None,
+        error: verification_error,
     }
 }
 

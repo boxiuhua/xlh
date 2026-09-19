@@ -54,25 +54,34 @@ pub fn load_or_fetch(
     end: NaiveDate,
 ) -> Result<Vec<StockBar>> {
     let secid = super::resolve_secid(input)?;
+    load_resolved(&secid, cache_dir, start, end)
+}
+
+pub fn load_resolved(
+    secid: &super::secid::Secid,
+    cache_dir: &Path,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> Result<Vec<StockBar>> {
     let path = cache_dir.join(format!("{}.csv", secid.cache_key()));
     let mut bars = if path.exists() {
         let cached = read_csv(&path)?;
         if covers(&cached, start, end) {
             cached
         } else {
-            let fresh = super::kline::fetch(&secid)?;
+            let fresh = super::kline::fetch(secid)?;
             write_csv(&path, &fresh)?;
             fresh
         }
     } else {
-        let fresh = super::kline::fetch(&secid)?;
+        let fresh = super::kline::fetch(secid)?;
         write_csv(&path, &fresh)?;
         fresh
     };
     bars.retain(|b| b.date >= start && b.date <= end);
     bars.sort_by_key(|b| b.date);
     if bars.is_empty() {
-        return Err(anyhow!("股票 {input} 在 {start}~{end} 无数据"));
+        return Err(anyhow!("股票 {} 在 {start}~{end} 无数据", secid.param()));
     }
     Ok(bars)
 }

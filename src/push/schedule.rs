@@ -116,10 +116,15 @@ fn realtime_init() -> Option<(crate::stock::realtime::job::Daemon, Connection)> 
     let cfg = crate::stock::realtime::config::get().clone();
     match crate::stock::realtime::store::open(&cfg.db_path) {
         Ok(c) => {
+            let retention = if cfg.retain_days == 0 {
+                "永久保留".to_string()
+            } else {
+                format!("保留 {} 天", cfg.retain_days)
+            };
             println!(
-                "实时抓取已启用（库 {}，ticks 保留 {} 天）",
+                "实时抓取已启用（库 {}，ticks {}）",
                 cfg.db_path.display(),
-                cfg.retain_days
+                retention
             );
             Some((crate::stock::realtime::job::Daemon::new(cfg), c))
         }

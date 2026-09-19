@@ -271,7 +271,12 @@ fn full_day_flow_from_detection_to_summary() {
     let all = vec![strong.clone(), weak.clone(), diverging.clone()];
     let pushable = job::select_pushable(&all, &Default::default(), &cfg());
 
-    assert_eq!(pushable.len(), 2, "弱信号须被挡在推送外，只进库");
+    assert_eq!(pushable.len(), 1, "只推送强且有明确动作的背离信号");
+    assert_eq!(pushable[0].code, "600013");
+    assert!(
+        !pushable.iter().any(|m| m.code == "600011"),
+        "强度达标但动作为观望时只进库"
+    );
     assert!(!pushable.iter().any(|m| m.code == "600012"));
     assert_eq!(
         diverging.divergence,
@@ -286,7 +291,7 @@ fn full_day_flow_from_detection_to_summary() {
 
     // 限流状态来自库：守护重启后同一只股票当日仍不会重推
     let already = store::pushed_today(&c, d(2026, 7, 16)).unwrap();
-    assert_eq!(already.len(), 2);
+    assert_eq!(already.len(), 1);
     assert!(
         job::select_pushable(&all, &already, &cfg()).is_empty(),
         "已推过的当日不得重推 —— 且这个状态跨重启有效"

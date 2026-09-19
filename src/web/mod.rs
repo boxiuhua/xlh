@@ -548,6 +548,18 @@ pub async fn serve(config_path: std::path::PathBuf, port: u16) -> Result<()> {
         .await
         .with_context(|| format!("绑定 {addr} 失败"))?;
     println!("回测界面已启动：http://{addr}  (Ctrl+C 退出)");
+    // Independent from push delivery: verify existing predictions every six hours.
+    tokio::spawn(async {
+        loop {
+            match tokio::task::spawn_blocking(crate::stock::forecast_log::refresh_pending).await {
+                Ok(Ok(n)) if n > 0 => println!("预测到期核验完成：{n} 条"),
+                Ok(Err(e)) => eprintln!("预测到期核验失败（保留待验证记录）：{e}"),
+                Err(e) => eprintln!("预测核验任务异常：{e}"),
+                _ => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+        }
+    });
     axum::serve(listener, router(state))
         .await
         .context("服务运行失败")?;

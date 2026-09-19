@@ -57,12 +57,11 @@ pub fn parse_suggest(body: &str) -> Result<Vec<StockInfo>> {
     Ok(out)
 }
 
-/// 从搜索结果里挑出美股 secid：优先 code 精确匹配(忽略大小写)且在美股市场，退而取首个美股结果。
+/// 仅接受代码精确匹配（忽略大小写）的美股，避免把无效代码诊断成其他股票。
 pub fn pick_us(items: &[StockInfo], ticker: &str) -> Option<Secid> {
     items
         .iter()
         .find(|i| i.code.eq_ignore_ascii_case(ticker) && US_MARKETS.contains(&i.secid.market))
-        .or_else(|| items.iter().find(|i| US_MARKETS.contains(&i.secid.market)))
         .map(|i| i.secid.clone())
 }
 
@@ -153,6 +152,13 @@ mod tests {
                 code: "AAPL".into()
             })
         );
+    }
+
+    #[test]
+    fn pick_us_does_not_substitute_a_different_ticker() {
+        let items = parse_suggest(SAMPLE).unwrap();
+        assert_eq!(pick_us(&items, "AAPL_UNKNOWN"), None);
+        assert_eq!(pick_us(&items, "MSFT"), None);
     }
 
     #[test]

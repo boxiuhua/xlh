@@ -11,13 +11,14 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RealtimeCfg {
     /// 实时库路径。与账号库 data/xlh.db 物理隔离：盘中每 10 分钟写 5400 行，
-    /// 不应与登录会话争同一 WAL 锁；且此库是纯派生数据，损坏可直接删除重建。
+    /// 不应与登录会话争同一 WAL 锁；历史采集数据应独立备份。
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
-    /// ticks 保留天数（自然日）。仅作用于 ticks —— signals 永久保留，刻意无对应开关。
+    /// ticks 保留天数（自然日）。0 表示永久保留（默认），正数才启用过期清理。
+    /// 仅作用于 ticks；signals 永久保留。
     #[serde(default = "default_retain_days")]
     pub retain_days: i64,
-    /// 量能基准回看窗口（自然日）。须 ≤ retain_days。
+    /// 量能基准回看窗口（自然日）。启用过期清理时须 ≤ retain_days。
     ///
     /// 与 retain_days 解耦是有意的：前者是磁盘决策，后者是统计决策。窗口拉长
     /// 中位数更稳，但也更迟钝 —— 刚进入活跃期的股票，其「正常量」已抬升，
@@ -45,7 +46,7 @@ fn default_db_path() -> PathBuf {
     PathBuf::from("data/realtime.db")
 }
 fn default_retain_days() -> i64 {
-    10
+    0
 }
 fn default_baseline_days() -> i64 {
     10
@@ -129,12 +130,12 @@ pub fn from_toml_str(text: &str) -> Result<RealtimeCfg> {
     Ok(cfg)
 }
 
-/// 校验配置。`baseline_days > retain_days` 必须报错退出而非静默降级 ——
+/// 校验配置。启用过期清理时，`baseline_days > retain_days` 必须报错而非静默降级 ——
 /// 否则基准会偷偷只用实际存在的数据，行为与配置不符，且无人察觉。
 pub fn validate(c: &RealtimeCfg) -> Result<()> {
-    if c.retain_days < 1 {
+    if c.retain_days < 0 {
         return Err(anyhow!(
-            "[realtime] retain_days 须 ≥ 1，当前 {}",
+            "[realtime] retain_days 须 ≥ 0（0 表示永久保留），当前 {}",
             c.retain_days
         ));
     }
@@ -144,7 +145,7 @@ pub fn validate(c: &RealtimeCfg) -> Result<()> {
             c.baseline_days
         ));
     }
-    if c.baseline_days > c.retain_days {
+    if c.retain_days > 0 && c.baseline_days > c.retain_days {
         return Err(anyhow!(
             "[realtime] baseline_days({}) 不得大于 retain_days({}) —— 基准回看不到已被清理的数据",
             c.baseline_days,
@@ -185,6 +186,15 @@ mod tests {
     #[test]
     fn defaults_pass_validation() {
         validate(&RealtimeCfg::default()).unwrap();
+        assert_eq!(RealtimeCfg::default().retain_days, 0);
+    }
+
+    #[test]
+    fn unlimited_retention_allows_long_baseline_and_rejects_negative_retention() {
+        let c = from_toml_str("[realtime]\nretain_days = 0\nbaseline_days = 120").unwrap();
+        assert_eq!(c.retain_days, 0);
+        assert_eq!(c.baseline_days, 120);
+        assert!(from_toml_str("[realtime]\nretain_days = -1").is_err());
     }
 
     #[test]
@@ -204,7 +214,7 @@ mod tests {
 
     #[test]
     fn baseline_equal_to_retain_is_allowed() {
-        // 默认即此情形：用满保留窗口
+        // 显式启用清理时允许用满保留窗口
         let c = RealtimeCfg {
             baseline_days: 10,
             retain_days: 10,
@@ -266,6 +276,6 @@ mod tests {
         // 只覆盖一个字段，其余保持默认 —— 用户不必抄全量配置
         let c: RealtimeCfg = toml::from_str("price_jump_pct = 0.03").unwrap();
         assert!((c.price_jump_pct - 0.03).abs() < 1e-9);
-        assert_eq!(c.retain_days, 10, "未指定的字段应保持默认");
+        assert_eq!(c.retain_days, 0, "未指定时应永久保留");
     }
 }

@@ -1,0 +1,14 @@
+const fs=require('node:fs'), assert=require('node:assert/strict');
+const source=fs.readFileSync('src/web/page.rs','utf8');
+for(const s of source.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))new Function(s[1]);
+const start=source.indexOf('function trackingHtml('),end=source.indexOf('function forecastHtml(',start);
+const render=new Function('esc',source.slice(start,end)+';return trackingHtml;')(v=>String(v).replaceAll('<','&lt;').replaceAll('>','&gt;'));
+const report={model_version:'rules/v1',window_days:180,note:'test',recent:[],horizons:[{horizon:5,pending:1,excluded:0,provisional:0,samples:0,origin_dates:0,calibration:[]}]};
+const empty=render(report);
+assert(empty.includes('尚无到期'));assert(empty.includes('命中率 —'));assert(!empty.includes('命中率 0.0%'));
+report.horizons[0]={...report.horizons[0],samples:2,origin_dates:2,hit_rate:.5,baseline_hit_rate:1,brier:.2,calibration:[{lower:.6,upper:.8,samples:2,mean_probability:.7,actual_up_rate:.5}]};
+report.recent=[{created_at:'2026-09-07T12:00:00Z',as_of:'2026-09-04',horizon:5,probability:.7,status:'pending',note:'<invalid>'}];
+const html=render(report);
+assert(html.includes('70.0%'));assert(html.includes('50.0%'));assert(html.includes('不同起点日期少于30个'));assert(html.includes('&lt;invalid&gt;'));
+assert(render(null,'disk full').includes('未确认成功登记'));assert.equal(render(null), '');
+console.log('PASS: forward-tracking UI unknown metrics, bins, sample warning, escaping, and persistence errors.');
