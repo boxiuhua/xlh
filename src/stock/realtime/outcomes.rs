@@ -26,6 +26,18 @@ const CLOSE_TICK_SQL: &str =
 const SESSION_PROBE_SQL: &str =
     "SELECT 1 FROM ticks WHERE ts BETWEEN ?1 AND ?2 AND price>0 LIMIT 1";
 
+/// 某股某日是否有任何快照(信号当日数据是否还在)。走主键 (code, ts)。
+const HAS_TICKS_SQL: &str = "SELECT 1 FROM ticks WHERE code=?1 AND ts BETWEEN ?2 AND ?3 LIMIT 1";
+
+/// 日常路径(收盘汇总)只看信号日在 `through` 前这么多自然日内的信号;
+/// 更早的留给 CLI `repair-outcomes`(`repair_all`)。
+pub const DAILY_LOOKBACK_DAYS: i64 = 30;
+/// 日 K 回退只针对 `through` 前这么多自然日内的目标日,避免停牌股每天联网重试。
+pub const FALLBACK_WINDOW_DAYS: i64 = 10;
+/// 从信号日数到 T+N 途中,相邻已观测交易日间隔超过这么多自然日即视为
+/// 历史有缺口(采集中断/已清理),不计算 T+N,免得把几个月后的价格当 T+1。
+pub const MAX_SESSION_GAP_DAYS: i64 = 7;
+
 fn epoch(day: NaiveDate, h: u32, m: u32, s: u32) -> i64 {
     day.and_hms_opt(h, m, s)
         .expect("valid time")
@@ -84,18 +96,25 @@ struct SignalRow {
     old: [Option<f64>; 3],
 }
 
-/// `through` 当日及之前的信号;`all = false` 时只取仍有标签为空的。走 idx_signals_ts。
-fn load_signals(conn: &Connection, through: NaiveDate, all: bool) -> Result<Vec<SignalRow>> {
+/// `through` 当日及之前(且给了 `since` 时不早于该日)的信号;`all = false` 时
+/// 只取仍有标签为空的。走 idx_signals_ts。
+fn load_signals(
+    conn: &Connection,
+    through: NaiveDate,
+    all: bool,
+    since: Option<NaiveDate>,
+) -> Result<Vec<SignalRow>> {
     let end = epoch(through.succ_opt().expect("date in range"), 0, 0, 0);
+    let start = since.map_or(i64::MIN, |d| epoch(d, 0, 0, 0));
     let filter = if all {
         ""
     } else {
         " AND (close_ret IS NULL OR ret_t1 IS NULL OR ret_t5 IS NULL)"
     };
     let mut stmt = conn.prepare(&format!(
-        "SELECT id,code,ts,trigger_price,close_ret,ret_t1,ret_t5 FROM signals WHERE ts<?1{filter} ORDER BY ts"
+        "SELECT id,code,ts,trigger_price,close_ret,ret_t1,ret_t5 FROM signals WHERE ts>=?1 AND ts<?2{filter} ORDER BY ts"
     ))?;
-    let rows = stmt.query_map([end], |r| {
+    let rows = stmt.query_map([start, end], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
@@ -127,29 +146,54 @@ fn load_signals(conn: &Connection, through: NaiveDate, all: bool) -> Result<Vec<
     Ok(out)
 }
 
+/// `day` 之后、相邻间隔都不超过 [`MAX_SESSION_GAP_DAYS`] 的已观测交易日
+/// (最多 5 个,即到 T+5)。遇到更大的缺口即截断:缺口后的交易日不能当 T+N。
+fn sessions_after(days: &[NaiveDate], day: NaiveDate) -> Vec<NaiveDate> {
+    let mut chain = Vec::new();
+    let mut prev = day;
+    for d in days.iter().copied().filter(|d| *d > day) {
+        if chain.len() == 5 || (d - prev).num_days() > MAX_SESSION_GAP_DAYS {
+            break;
+        }
+        chain.push(d);
+        prev = d;
+    }
+    chain
+}
+
 const HORIZONS: [(usize, usize, &str); 3] =
     [(0, 0, "close_ret"), (1, 1, "ret_t1"), (2, 5, "ret_t5")];
 
-/// 日常修复:只处理仍有标签为空的信号。
+/// 日常修复:只处理仍有标签为空、且信号日在 `through` 前
+/// [`DAILY_LOOKBACK_DAYS`] 个自然日内的信号。
 ///
 /// Use only snapshots near 15:00. Never replace an unknown outcome with zero.
 /// T+1/T+5 refer to subsequent observed market sessions, not calendar days.
 /// 被处理的信号上已有的值若与快照不一致,照旧纠正并写审计。
 pub fn repair(conn: &Connection, through: NaiveDate) -> Result<RepairReport> {
-    run_repair(conn, through, false)
+    run_repair(conn, through, false, Some(lookback_start(through)))
+}
+
+fn lookback_start(through: NaiveDate) -> NaiveDate {
+    through - chrono::Duration::days(DAILY_LOOKBACK_DAYS)
 }
 
 /// 全量审计:连三个标签都已填的信号也重新核对(CLI `repair-outcomes` 用)。
 /// 开销随历史增长,不应放进每日例行任务。
 pub fn repair_all(conn: &Connection, through: NaiveDate) -> Result<RepairReport> {
-    run_repair(conn, through, true)
+    run_repair(conn, through, true, None)
 }
 
-fn run_repair(conn: &Connection, through: NaiveDate, all: bool) -> Result<RepairReport> {
+fn run_repair(
+    conn: &Connection,
+    through: NaiveDate,
+    all: bool,
+    since: Option<NaiveDate>,
+) -> Result<RepairReport> {
     ensure_audit_table(conn)?;
     let tx = conn.unchecked_transaction()?;
     let mut report = RepairReport::default();
-    let signals = load_signals(&tx, through, all)?;
+    let signals = load_signals(&tx, through, all, since)?;
     let Some(first) = signals.iter().map(|s| s.day).min() else {
         return Ok(report);
     };
@@ -170,10 +214,10 @@ fn run_repair(conn: &Connection, through: NaiveDate, all: bool) -> Result<Repair
             report.skipped += 1;
             continue;
         }
-        let Ok(origin) = days.binary_search(&s.day) else {
+        if days.binary_search(&s.day).is_err() {
             report.skipped += 1;
             continue;
-        };
+        }
         let Some((close_ts, _)) = lookup(&s.code, s.day)? else {
             report.skipped += 1;
             continue;
@@ -182,11 +226,17 @@ fn run_repair(conn: &Connection, through: NaiveDate, all: bool) -> Result<Repair
             report.skipped += 1;
             continue;
         }
+        let chain = sessions_after(&days, s.day);
         for (slot, horizon, column) in HORIZONS {
-            let Some(target_day) = days.get(origin + horizon) else {
-                continue;
+            let target_day = if horizon == 0 {
+                s.day
+            } else {
+                match chain.get(horizon - 1) {
+                    Some(d) => *d,
+                    None => continue,
+                }
             };
-            let Some((ts, price)) = lookup(&s.code, *target_day)? else {
+            let Some((ts, price)) = lookup(&s.code, target_day)? else {
                 continue;
             };
             let ret = price / s.trigger - 1.0;
@@ -224,93 +274,129 @@ fn run_repair(conn: &Connection, through: NaiveDate, all: bool) -> Result<Repair
 /// 回退值的审计口径:未复权日 K 收盘价。
 pub const DAILY_CLOSE_METHOD: &str = "daily_close";
 
-/// 补填 `repair` 之后仍为空的标签,在它之后调用。
+/// 补填 `repair` 之后仍为空的标签,在它之后调用(日常收盘路径)。
 ///
-/// 目标交易日:收盘为信号当日;T+N 为信号当日之后第 N 个已观测交易日
-/// (与 `repair` 同口径;信号当天全市场都没有收盘快照时也能往后数)。
-/// 取价:目标日有收盘快照就用快照(同源优先,即便 `repair` 因信号当日无
-/// 快照而跳过了该信号);没有快照且该日严格早于 `through`(已收盘、永远
-/// 不会再有快照)时,回退到 `daily_close(code, start, end)` 给出的未复权
-/// 日收盘价,审计 method 记 `daily_close`。日线也没有该日时留空,绝不写 0。
+/// 只看信号日在 `through` 前 [`DAILY_LOOKBACK_DAYS`] 个自然日内的信号。
+/// 目标交易日:收盘为信号当日;T+N 为信号当日之后第 N 个已观测交易日。
+/// T+N 仅在本股信号当日仍有快照(历史未被清理)、且信号日到目标日之间
+/// 相邻交易日间隔都不超过 [`MAX_SESSION_GAP_DAYS`] 时才计算——否则历史
+/// 缺口会把 T+N 挪到几个月后。
+/// 取价:目标日有收盘快照就用快照(同源优先);没有快照、该日严格早于
+/// `through` 且在其前 [`FALLBACK_WINDOW_DAYS`] 个自然日内时,回退到
+/// `daily_close(code, start, end)` 给出的未复权日收盘价,审计 method 记
+/// `daily_close`。日线也没有该日时留空,绝不写 0。
 ///
-/// `daily_close` 按股票最多调用一次,仅在确有需要回退时调用;返回 None
-/// 视为无数据。只填空值,从不改已有值。
+/// 先只读地定出计划,再在事务外调用 `daily_close`(按股票最多一次,只取
+/// 需要回退的日期区间;返回 None 视为无数据),最后开事务写入。只填空值,
+/// 从不改已有值。
 pub fn fill_missing(
     conn: &Connection,
     through: NaiveDate,
     mut daily_close: impl FnMut(&str, NaiveDate, NaiveDate) -> Option<Vec<(NaiveDate, f64)>>,
 ) -> Result<RepairReport> {
     ensure_audit_table(conn)?;
-    let tx = conn.unchecked_transaction()?;
     let mut report = RepairReport::default();
-    let signals = load_signals(&tx, through, false)?;
+    let signals = load_signals(conn, through, false, Some(lookback_start(through)))?;
     let Some(first) = signals.iter().map(|s| s.day).min() else {
         return Ok(report);
     };
-    let days = sessions(&tx, first, through)?;
-    let last_finished = through.pred_opt().expect("date in range");
-    let mut first_day_of: HashMap<&str, NaiveDate> = HashMap::new();
-    for s in &signals {
-        let e = first_day_of.entry(s.code.as_str()).or_insert(s.day);
-        *e = (*e).min(s.day);
+    let days = sessions(conn, first, through)?;
+    let fallback_from = through - chrono::Duration::days(FALLBACK_WINDOW_DAYS);
+
+    // 1) 只读定计划
+    struct Plan<'a> {
+        id: i64,
+        code: &'a str,
+        horizon: usize,
+        column: &'static str,
+        trigger: f64,
+        day: NaiveDate,
+        tick: Option<(i64, f64)>,
     }
-    let mut bars: HashMap<String, HashMap<NaiveDate, f64>> = HashMap::new();
-    let mut writes = Vec::new();
-    for s in &signals {
-        if !s.trigger.is_finite() || s.trigger <= 0.0 {
-            report.skipped += 1;
-            continue;
-        }
-        // 当日有收盘快照却早于触发时刻:与 repair 一致,整条跳过
-        if close_tick(&tx, &s.code, s.day)?.is_some_and(|(ts, _)| ts < s.ts) {
-            report.skipped += 1;
-            continue;
-        }
-        let later: Vec<NaiveDate> = days.iter().copied().filter(|d| *d > s.day).collect();
-        for (slot, horizon, column) in HORIZONS {
-            if s.old[slot].is_some() {
+    let mut plans = Vec::new();
+    let mut need: HashMap<&str, (NaiveDate, NaiveDate)> = HashMap::new();
+    {
+        let mut has_ticks = conn.prepare(HAS_TICKS_SQL)?;
+        for s in &signals {
+            if !s.trigger.is_finite() || s.trigger <= 0.0 {
+                report.skipped += 1;
                 continue;
             }
-            let target_day = if horizon == 0 {
-                s.day
-            } else {
-                match later.get(horizon - 1) {
-                    Some(d) => *d,
-                    None => continue,
-                }
-            };
-            let (price, ts, method) =
-                if let Some((ts, price)) = close_tick(&tx, &s.code, target_day)? {
-                    (price, ts, TICKS_METHOD)
-                } else if target_day < through {
-                    let closes = bars.entry(s.code.clone()).or_insert_with(|| {
-                        let start = first_day_of[s.code.as_str()];
-                        daily_close(&s.code, start, last_finished)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .collect()
-                    });
-                    match closes.get(&target_day) {
-                        Some(p) if p.is_finite() && *p > 0.0 => {
-                            let (ts, _) = close_window(target_day);
-                            (*p, ts, DAILY_CLOSE_METHOD)
-                        }
-                        _ => continue,
-                    }
-                } else {
+            // 当日有收盘快照却早于触发时刻:与 repair 一致,整条跳过
+            if close_tick(conn, &s.code, s.day)?.is_some_and(|(ts, _)| ts < s.ts) {
+                report.skipped += 1;
+                continue;
+            }
+            let (lo, hi) = (epoch(s.day, 0, 0, 0), epoch(s.day, 23, 59, 59));
+            let day_intact = has_ticks.exists(params![s.code, lo, hi])?;
+            // 从信号日往后、相邻间隔不超限的已观测交易日链(最多到 T+5)
+            let chain = sessions_after(&days, s.day);
+            for (slot, horizon, column) in HORIZONS {
+                if s.old[slot].is_some() {
                     continue;
+                }
+                let target = if horizon == 0 {
+                    s.day
+                } else if !day_intact {
+                    continue;
+                } else {
+                    match chain.get(horizon - 1) {
+                        Some(d) => *d,
+                        None => continue,
+                    }
                 };
-            let ret = price / s.trigger - 1.0;
-            writes.push((s.id, horizon, column, ret, s.trigger, price, ts, method));
+                let tick = close_tick(conn, &s.code, target)?;
+                if tick.is_none() {
+                    if target >= through || target < fallback_from {
+                        continue;
+                    }
+                    let e = need.entry(s.code.as_str()).or_insert((target, target));
+                    e.0 = e.0.min(target);
+                    e.1 = e.1.max(target);
+                }
+                plans.push(Plan {
+                    id: s.id,
+                    code: &s.code,
+                    horizon,
+                    column,
+                    trigger: s.trigger,
+                    day: target,
+                    tick,
+                });
+            }
         }
     }
-    for (id, horizon, column, ret, trigger, price, ts, method) in writes {
-        tx.execute("INSERT INTO signal_outcome_audit(signal_id,horizon,old_return,new_return,trigger_price,target_price,target_ts,repaired_at,method) VALUES (?1,?2,NULL,?3,?4,?5,?6,?7,?8)",params![id,horizon as i64,ret,trigger,price,ts,chrono::Utc::now().to_rfc3339(),method])?;
-        tx.execute(
+
+    // 2) 事务外取日线(可能联网)
+    let mut bars: HashMap<&str, HashMap<NaiveDate, f64>> = HashMap::new();
+    for (code, (start, end)) in need {
+        let closes = daily_close(code, start, end).unwrap_or_default();
+        bars.insert(code, closes.into_iter().collect());
+    }
+
+    // 3) 写入
+    let tx = conn.unchecked_transaction()?;
+    for p in plans {
+        let (price, ts, method) = match p.tick {
+            Some((ts, price)) => (price, ts, TICKS_METHOD),
+            None => match bars.get(p.code).and_then(|m| m.get(&p.day)) {
+                Some(c) if c.is_finite() && *c > 0.0 => {
+                    (*c, close_window(p.day).0, DAILY_CLOSE_METHOD)
+                }
+                _ => continue,
+            },
+        };
+        let ret = price / p.trigger - 1.0;
+        let column = p.column;
+        let changed = tx.execute(
             &format!("UPDATE signals SET {column}=?1 WHERE id=?2 AND {column} IS NULL"),
-            params![ret, id],
+            params![ret, p.id],
         )?;
-        match horizon {
+        if changed == 0 {
+            continue;
+        }
+        tx.execute("INSERT INTO signal_outcome_audit(signal_id,horizon,old_return,new_return,trigger_price,target_price,target_ts,repaired_at,method) VALUES (?1,?2,NULL,?3,?4,?5,?6,?7,?8)",params![p.id,p.horizon as i64,ret,p.trigger,price,ts,chrono::Utc::now().to_rfc3339(),method])?;
+        match p.horizon {
             0 => report.close += 1,
             1 => report.t1 += 1,
             _ => report.t5 += 1,
@@ -421,9 +507,10 @@ mod tests {
     fn tick_lookups_use_indexes() {
         let c = store::open_in_memory().unwrap();
         let code = "600519".to_string();
-        let cases: [(&str, Vec<&dyn rusqlite::ToSql>); 2] = [
+        let cases: [(&str, Vec<&dyn rusqlite::ToSql>); 3] = [
             (CLOSE_TICK_SQL, vec![&code, &0i64, &0i64]),
             (SESSION_PROBE_SQL, vec![&0i64, &0i64]),
+            (HAS_TICKS_SQL, vec![&code, &0i64, &0i64]),
         ];
         for (sql, args) in cases {
             let plan: Vec<String> = c
@@ -461,13 +548,19 @@ mod tests {
         for (i, day) in days.iter().enumerate().skip(2).take(3) {
             tick(&c, "600519", ts(*day, 15, 0, 0), 11.0 + i as f64);
         }
+        // 触发信号的那笔盘中快照还在(信号当日历史完整)
+        tick(&c, "600519", ts(days[0], 10, 0, 0), 10.0);
         let id = signal(&c, "600519", ts(days[0], 10, 0, 0), 10.0, [None; 3]);
         assert_eq!(repair(&c, through).unwrap().skipped, 1);
         let mut calls = 0;
         let r = fill_missing(&c, through, |code, start, end| {
             calls += 1;
             assert_eq!(code, "600519");
-            assert_eq!((start, end), (days[0], days[4]), "只取已结束的交易日");
+            assert_eq!(
+                (start, end),
+                (days[0], days[1]),
+                "只取需要回退的已结束交易日"
+            );
             // 第 1 日无日线(停牌),第 5 日 = through 当天的盘中价不得使用
             Some(vec![(days[0], 20.0), (days[2], 99.0), (days[5], 30.0)])
         })
@@ -493,6 +586,7 @@ mod tests {
         for (i, day) in days.iter().enumerate().skip(1) {
             tick(&c, "600519", ts(*day, 15, 0, 0), 11.0 + i as f64);
         }
+        tick(&c, "600519", ts(days[0], 10, 0, 0), 10.0);
         let id = signal(&c, "600519", ts(days[0], 10, 0, 0), 10.0, [None; 3]);
         repair(&c, days[5]).unwrap();
         assert_eq!(labels(&c, id), [None; 3]);
@@ -520,5 +614,101 @@ mod tests {
         .unwrap();
         assert_eq!((r.close, r.t1, r.t5), (0, 0, 0));
         assert_eq!(labels(&c, id), [None; 3]);
+    }
+
+    /// 每个工作日 15:00 一笔快照,[from, to] 闭区间。
+    fn weekday_closes(c: &Connection, code: &str, from: NaiveDate, to: NaiveDate, price: f64) {
+        let mut day = from;
+        while day <= to {
+            if !crate::stock::realtime::calendar::is_weekend(day) {
+                tick(c, code, ts(day, 15, 0, 0), price);
+            }
+            day = day.succ_opt().unwrap();
+        }
+    }
+
+    #[test]
+    fn pruned_history_signal_gets_no_t_plus_n() {
+        let c = store::open_in_memory().unwrap();
+        // 信号当日的快照已被清理(旧库 retain_days=10),之后的快照都在
+        let sig_day = d(9, 7);
+        let through = d(9, 16);
+        weekday_closes(&c, "600519", d(9, 8), through, 12.0);
+        let id = signal(&c, "600519", ts(sig_day, 10, 0, 0), 10.0, [None; 3]);
+        repair(&c, through).unwrap();
+        let r = fill_missing(&c, through, |_, _, _| Some(vec![(sig_day, 11.0)])).unwrap();
+        assert_eq!((r.close, r.t1, r.t5), (1, 0, 0));
+        let [close, t1, t5] = labels(&c, id);
+        assert!((close.unwrap() - 0.1).abs() < 1e-10, "当日收盘仍可回退日线");
+        assert!(t1.is_none() && t5.is_none(), "信号当日无快照,不得数 T+N");
+    }
+
+    #[test]
+    fn session_gap_after_signal_blocks_t_plus_n() {
+        let c = store::open_in_memory().unwrap();
+        let sig_day = d(8, 3);
+        // 信号当日完整,但之后采集中断 3 周
+        tick(&c, "600519", ts(sig_day, 10, 0, 0), 10.0);
+        tick(&c, "600519", ts(sig_day, 15, 0, 0), 11.0);
+        weekday_closes(&c, "600519", d(8, 24), d(8, 31), 20.0);
+        let id = signal(&c, "600519", ts(sig_day, 10, 0, 0), 10.0, [None; 3]);
+        let through = d(8, 31);
+        repair(&c, through).unwrap();
+        fill_missing(&c, through, |_, _, _| -> Option<Vec<(NaiveDate, f64)>> {
+            panic!("无需回退")
+        })
+        .unwrap();
+        let [close, t1, t5] = labels(&c, id);
+        assert!((close.unwrap() - 0.1).abs() < 1e-10);
+        assert!(t1.is_none() && t5.is_none(), "缺口后的交易日不能当 T+N");
+        // 全量审计同样不跨缺口
+        repair_all(&c, through).unwrap();
+        assert!(labels(&c, id)[1].is_none());
+    }
+
+    #[test]
+    fn daily_path_ignores_signals_older_than_lookback() {
+        let c = store::open_in_memory().unwrap();
+        let through = d(9, 16);
+        // 早于回看窗口的一个工作日(8 月 12 日,周三)
+        let old_day = through - chrono::Duration::days(DAILY_LOOKBACK_DAYS + 5);
+        weekday_closes(&c, "600519", old_day, through, 11.0);
+        let id = signal(&c, "600519", ts(old_day, 10, 0, 0), 10.0, [None; 3]);
+        let r = repair(&c, through).unwrap();
+        assert_eq!((r.close, r.t1, r.t5, r.skipped), (0, 0, 0, 0));
+        let r = fill_missing(&c, through, |_, _, _| -> Option<Vec<(NaiveDate, f64)>> {
+            panic!("超出回看窗口的信号不应触发日线回退")
+        })
+        .unwrap();
+        assert_eq!((r.close, r.t1, r.t5, r.skipped), (0, 0, 0, 0));
+        assert_eq!(labels(&c, id), [None; 3]);
+        // 更早的交给 CLI 全量审计
+        let r = repair_all(&c, through).unwrap();
+        assert_eq!((r.close, r.t1, r.t5), (1, 1, 1));
+    }
+
+    #[test]
+    fn daily_close_fallback_only_for_recent_targets() {
+        let c = store::open_in_memory().unwrap();
+        let through = d(9, 18);
+        // recent = 9 月 8 日(周二),stale = 9 月 7 日(周一)
+        let recent = through - chrono::Duration::days(FALLBACK_WINDOW_DAYS);
+        let stale = recent - chrono::Duration::days(1);
+        // 两只股票信号当日盘中有快照、收盘快照缺失;之后每天收盘快照齐全
+        tick(&c, "600519", ts(stale, 10, 0, 0), 10.0);
+        tick(&c, "600036", ts(recent, 10, 0, 0), 10.0);
+        weekday_closes(&c, "600519", recent, through, 11.0);
+        weekday_closes(&c, "600036", recent.succ_opt().unwrap(), through, 11.0);
+        let old = signal(&c, "600519", ts(stale, 10, 0, 0), 10.0, [None; 3]);
+        let new = signal(&c, "600036", ts(recent, 10, 0, 0), 10.0, [None; 3]);
+        let mut asked = Vec::new();
+        fill_missing(&c, through, |code, start, end| {
+            asked.push((code.to_string(), start, end));
+            Some(vec![(recent, 12.0)])
+        })
+        .unwrap();
+        assert_eq!(asked, vec![("600036".to_string(), recent, recent)]);
+        assert!(labels(&c, old)[0].is_none(), "超出回退窗口的目标日不联网");
+        assert!((labels(&c, new)[0].unwrap() - 0.2).abs() < 1e-10);
     }
 }

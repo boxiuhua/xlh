@@ -470,6 +470,8 @@ fn classify_one(code: &str, today: NaiveDate) -> Horizon {
 
 /// 收盘回填结局并汇总。以库内 15:00–15:05 收盘快照为准（同源）；
 /// 已结束的交易日缺快照时回退到未复权日 K 收盘价（见 `outcomes::fill_missing`）。
+/// 只看最近 30 个自然日的信号、最近 10 个自然日的回退目标日，避免停牌股
+/// 每天收盘都在单线程推送循环里联网重试；更早的交给 CLI `repair-outcomes`。
 pub fn close_summary(conn: &Connection, day: NaiveDate) -> Result<String> {
     backfill_close(conn, day)?;
     let rows = store::signals_on(conn, day)?;
