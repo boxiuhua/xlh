@@ -428,6 +428,16 @@ pub fn from_toml_str(text: &str) -> Result<TradeCfg> {
     if s.emit_end_hour * 60 + s.emit_end_minute <= emit {
         return Err(anyhow!("[trade.signals] 发出窗口结束须晚于开始"));
     }
+    // 策略实盘工单固定在 10:30 过期(`ticket::default_expiry`,spec §5 的 09:30–10:30
+    // 开盘窗口);窗口再往后开,10:30 之后发出的工单只能落到「发出后 60 分钟」的
+    // 兜底期限,与「T 日开盘成交」的口径也不再相符。
+    if s.emit_end_hour * 60 + s.emit_end_minute > 10 * 60 + 30 {
+        return Err(anyhow!(
+            "[trade.signals] 发出窗口结束须不晚于 10:30(策略实盘工单 10:30 过期),当前 {:02}:{:02}",
+            s.emit_end_hour,
+            s.emit_end_minute
+        ));
+    }
     Ok(cfg)
 }
 
@@ -686,6 +696,8 @@ mod tests {
             "[trade.signals]\nretry_minutes = 121",
             "[trade.signals]\nemit_end_hour = 9\nemit_end_minute = 25", // 窗口为空
             "[trade.signals]\nemit_hour = 8",                           // 早于集合竞价结束
+            "[trade.signals]\nemit_end_minute = 31",                    // 晚于实盘工单 10:30 过期
+            "[trade.signals]\nemit_end_hour = 11\nemit_end_minute = 0",
             "[trade.signals]\nunknown = 1",
         ] {
             assert!(from_toml_str(bad).is_err(), "{bad}");
