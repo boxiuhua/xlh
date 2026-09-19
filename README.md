@@ -202,7 +202,7 @@ session_ttl_days = 30              # 会话 Cookie 有效期（天）
 
 ### 运行方式
 
-交易相关的两个后台线程随 **`xlh push`**（守护模式，非 `--once`）启动，与推送/实时异动同一进程，不是独立命令；`config.toml` 须有合法的 `[trade]` 段，否则打印警告且两个线程都不启动：
+交易相关的两个后台线程随 **`xlh push`**（守护模式，非 `--once`）启动，与推送/实时异动同一进程，不是独立命令。`[trade]` 段缺失时按默认值启动；`config.toml` 读取/解析失败或 `[trade]` 段（含其子段）校验不通过时，打印警告且两个线程都不启动；`[trade] enabled = false` 同样两个都不启动：
 
 - **`trade-monitor`**：止盈止损秒级监听（每 `monitor_interval_secs` 秒一轮）、次日 9:00 撤销未回填工单、15:05–16:00 提醒待回填、日线策略信号发出、收盘后交易日报
 - **`trade-eval`**（另需 `[trade.eval].enabled = true`）：策略前推回测排队执行、每日观察期检查/实盘看门狗、每月重跑
@@ -215,8 +215,8 @@ session_ttl_days = 30              # 会话 Cookie 有效期（天）
 
 | 段 | 用途 | 常用项 |
 |---|---|---|
-| `[trade]` | 监听线程总开关与推送相关参数 | `enabled`（总开关，同时决定 `trade-monitor` 是否启动）、`monitor_interval_secs`（报价轮询间隔，默认 15 秒）、`alert_after_secs`（监听中断多久告警）、`mover_signals`（异动是否转为观察期信号）、`link_base_url`（推送工单签名链接的站点根地址，留空则不带链接）、`daily_report`/`daily_report_hour`/`daily_report_minute`（收盘后交易日报） |
-| `[trade.admission]` | 策略准入与持续监控阈值（夏普、回撤、观察期天数等）；管理员可调，用户只能调严 | 默认值见 `config.rs`（`config.toml` 未附注释样例） |
+| `[trade]` | 监听线程总开关与推送相关参数 | `enabled`（总开关，同时决定 `trade-monitor` 是否启动）、`monitor_interval_secs`（报价轮询间隔，默认 15 秒）、`alert_after_secs`（监听中断多久告警）、`mover_signals`（实时异动是否转为交易信号）、`link_base_url`（推送工单签名链接的站点根地址，留空则不带链接）、`daily_report`/`daily_report_hour`/`daily_report_minute`（收盘后交易日报） |
+| `[trade.admission]` | 策略准入与持续监控阈值（夏普、回撤、观察期天数等）；由管理员在配置文件中统一设置，暂不支持按用户调整 | 默认值见 `config.rs`（`config.toml` 未附注释样例） |
 | `[trade.walk_forward]` | 前推回测窗口切分（训练/检验/步长）与选参依据 | 默认训练 2 年、检验 6 个月、步长 6 个月 |
 | `[trade.eval]` | 策略评估线程 `trade-eval` | `enabled`、`poll_secs`、`daily_hour`/`daily_minute`（每日入队观察期检查/看门狗）、`monthly_day`/`monthly_hour`（每月重跑前推回测） |
 | `[trade.signals]` | 观察期/已准入策略的日线信号：收盘后计算、次日开盘发出 | `enabled`、`compute_hour`/`compute_minute`（开始计算）、`emit_hour`/`emit_minute` ~ `emit_end_hour`/`emit_end_minute`（次日发出窗口，固定不晚于 10:30） |
@@ -239,7 +239,7 @@ session_ttl_days = 30              # 会话 Cookie 有效期（天）
 
 ### 信号源与准入
 
-四类信号源：止盈止损（`exit`，持仓监听触发）、日线策略（`strategy`，收盘后计算、次日开盘发出）、实时异动（`mover`，仅自选股）、手动 / AI（`manual`，页面按诊断/分析结果生成）。`exit` 与 `manual` 不受策略准入约束；`strategy`/`mover` 信号则要求来源策略先过准入：新建策略是**草稿**，提交评估后进入**回测中**（前推回测，数据不足或指标不达标 → **未通过**）；通过后进入**观察期**（仅模拟盘自动成交，需满足观察天数/笔数与表现要求）；达标后**已准入**（实盘 + 模拟盘同时生成工单）；实盘期间持续监控，回撤、胜率、连亏异常触发 → **已暂停**，需用户手动重新提交前推回测才能再次进入观察期。
+四类信号源：止盈止损（`exit`，持仓监听触发）、日线策略（`strategy`，收盘后计算、次日开盘发出）、实时异动（`mover`，自选股及观察期/已准入异动策略股票池中的股票）、手动 / AI（`manual`，页面按诊断/分析结果生成）。`exit` 与 `manual` 不受策略准入约束；未绑定异动策略的 `mover` 信号（仅来自自选股）一律只进模拟盘；`strategy` 信号与绑定了异动策略的 `mover` 信号按来源策略的准入状态出单：新建策略是**草稿**，提交评估后进入**回测中**（前推回测，数据不足或指标不达标 → **未通过**）；通过后进入**观察期**（仅模拟盘自动成交，需满足观察天数/笔数与表现要求）；达标后**已准入**（实盘 + 模拟盘同时生成工单）；实盘期间持续监控，回撤、胜率、连亏异常触发 → **已暂停**，需用户手动重新提交前推回测才能再次进入观察期。
 
 ### 管理员总开关
 
