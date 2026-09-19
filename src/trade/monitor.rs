@@ -4,7 +4,6 @@
 use crate::event::Direction;
 use crate::stock::realtime::calendar::is_weekend;
 use crate::trade::exits::{exit_signal, next_trailing_high};
-use crate::trade::gate::Admission;
 use crate::trade::model::{Account, Position, Quote};
 use crate::trade::quotes::QuoteSource;
 use crate::trade::router::{self, PaperBatch};
@@ -121,7 +120,6 @@ fn process_position(
     report.exit_signals += 1;
     let ctx = SubmitContext {
         quote: Some(q),
-        admission: Admission::NotRequired,
         now,
     };
     match submit_signal(conn, &sig, &ctx)? {

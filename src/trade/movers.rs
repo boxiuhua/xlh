@@ -1,8 +1,7 @@
-//! 实时异动 → 交易信号。策略准入(计划 3)上线前一律按观察期处理:只进模拟盘。
+//! 实时异动 → 交易信号。绑定了观察期 / 已准入异动策略的按其准入状态出单,否则只进模拟盘。
 
 use crate::event::Direction;
 use crate::stock::realtime::movers::{trade_action, Mover, TradeAction};
-use crate::trade::gate::Admission;
 use crate::trade::model::{side_str, Account, AccountScope, NewSignal, Quote, SignalSource};
 use crate::trade::service::{submit_signal, SubmitContext, SubmitOutcome};
 use crate::trade::store;
@@ -19,22 +18,31 @@ pub struct MoverReport {
     pub errors: Vec<String>,
 }
 
-pub fn mover_signal(user_id: i64, m: &Mover, side: Direction) -> NewSignal {
+pub fn mover_signal(
+    user_id: i64,
+    m: &Mover,
+    side: Direction,
+    strategy_id: Option<i64>,
+) -> NewSignal {
     let hint = match side {
         Direction::Buy => "主力疑似吸筹",
         Direction::Sell => "疑似散户抬轿、主力流出",
     };
+    let tail = match strategy_id {
+        Some(id) => format!("(异动策略 #{id})"),
+        None => "(未经前瞻检验,观察期仅模拟盘)".to_string(),
+    };
     NewSignal {
         user_id,
         source: SignalSource::Mover,
-        strategy_id: None,
+        strategy_id,
         code: m.code.clone(),
         name: Some(m.name.clone()),
         side,
         scope: AccountScope::Both,
         ref_price: m.price,
         reason: format!(
-            "盘中异动:10 分钟 {:+.1}%,量能 {:.1} 倍,{hint}(未经前瞻检验,观察期仅模拟盘)",
+            "盘中异动:10 分钟 {:+.1}%,量能 {:.1} 倍,{hint}{tail}",
             m.jump_pct * 100.0,
             m.vol_surge_x
         ),
@@ -102,17 +110,28 @@ fn process_user(
 ) -> Result<()> {
     let watch = match crate::push::store::get(conn, uid)? {
         Some(cfg) => cfg.realtime_watch_stocks,
-        None => return Ok(()),
+        None => Vec::new(),
     };
-    if watch.is_empty() {
+    let mover_pools = store::active_mover_pools(conn, uid)?;
+    if watch.is_empty() && mover_pools.is_empty() {
         return Ok(());
     }
-    for m in movers.iter().filter(|m| watch.iter().any(|c| c == &m.code)) {
+    for m in movers
+        .iter()
+        .filter(|m| watch.iter().any(|c| c == &m.code) || mover_pools.iter().any(|c| c == &m.code))
+    {
+        let bound = store::active_mover_strategy(conn, uid, &m.code)?;
         let side = match trade_action(m.divergence) {
             TradeAction::Buy => Direction::Buy,
             TradeAction::Sell => {
-                // 观察期只进模拟盘,故只以模拟盘持仓判定是否可卖。
-                let held = store::get_position(conn, uid, Account::Paper, &m.code)?.is_some();
+                // 绑定了异动策略:实盘或模拟盘任一有持仓即可视为可卖;
+                // 未绑定(仅观察期旧行为)只以模拟盘持仓判定是否可卖。
+                let held = if bound.is_some() {
+                    store::get_position(conn, uid, Account::Real, &m.code)?.is_some()
+                        || store::get_position(conn, uid, Account::Paper, &m.code)?.is_some()
+                } else {
+                    store::get_position(conn, uid, Account::Paper, &m.code)?.is_some()
+                };
                 if !held {
                     continue;
                 }
@@ -127,11 +146,11 @@ fn process_user(
             report.no_quote += 1;
             continue;
         };
-        let sig = mover_signal(uid, m, side);
+        let sig = mover_signal(uid, m, side, bound.as_ref().map(|s| s.id));
         report.signals += 1;
+        // 准入由 submit_signal 自行判定(计划 3e:绑定异动策略后按其准入状态出单)
         let ctx = SubmitContext {
             quote: Some(&quote),
-            admission: Admission::Probation,
             now,
         };
         if let SubmitOutcome::Ticketed { .. } = submit_signal(conn, &sig, &ctx)? {
@@ -240,6 +259,7 @@ mod tests {
             1,
             &mover("600000", Divergence::MainAccumulating),
             Direction::Buy,
+            None,
         );
         assert_eq!(sig.dedup_key, "mover-buy-600000-202609161030");
         assert_eq!(sig.source, SignalSource::Mover);
@@ -399,5 +419,59 @@ mod tests {
             store::get_quote(&c, "600036").unwrap().is_none(),
             "昨日报价不应缓存"
         );
+    }
+
+    #[test]
+    fn mover_signal_binds_to_active_mover_strategy_and_reaches_real_once_admitted() {
+        use crate::trade::admission::state;
+        use crate::trade::model::{NewStrategy, StrategyStatus};
+        let mut c = Connection::open_in_memory().unwrap();
+        store::migrate(&c).unwrap();
+        crate::push::store::migrate(&c).unwrap();
+        store::set_capital(&c, 1, Account::Real, 100_000.0, at(9, 0)).unwrap();
+        // 不在自选里,只在异动策略股票池里:也应被处理
+        let sid = store::create_strategy(
+            &c,
+            &NewStrategy {
+                user_id: 1,
+                name: "异动".into(),
+                kind: "mover".into(),
+                grid_toml: "x = [1]".into(),
+                pool: vec!["600000".into()],
+            },
+            at(9, 0),
+        )
+        .unwrap();
+        state::submit_for_backtest(&c, 1, sid, at(9, 1)).unwrap();
+        state::update_status(
+            &c,
+            1,
+            sid,
+            StrategyStatus::Paper,
+            StrategyStatus::Admitted,
+            "x",
+            at(9, 2),
+        )
+        .unwrap();
+        // 不写推送配置:自选为空,候选代码只来自异动策略股票池(Step 6 的新行为)
+        cache_quote(&c, "600000", 10.0, Some(11.0), at(10, 30));
+        let r = submit_mover_signals(
+            &mut c,
+            &[mover("600000", Divergence::MainAccumulating)],
+            at(10, 30),
+        )
+        .unwrap();
+        assert_eq!(r.ticketed, 1);
+        let (strategy_id, real): (Option<i64>, i64) = c
+            .query_row(
+                "SELECT s.strategy_id,
+                        (SELECT COUNT(*) FROM trade_tickets t WHERE t.signal_id = s.id AND t.account = 'real')
+                 FROM trade_signals s",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(strategy_id, Some(sid), "信号绑定到异动策略");
+        assert_eq!(real, 1, "已准入的异动策略可以生成实盘工单");
     }
 }

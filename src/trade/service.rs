@@ -11,8 +11,23 @@ use rusqlite::Connection;
 
 pub struct SubmitContext<'a> {
     pub quote: Option<&'a Quote>,
-    pub admission: Admission,
     pub now: NaiveDateTime,
+}
+
+/// 信号 → 闸门准入。在 `submit_signal` 的写事务内调用:状态读取与工单生成原子,
+/// 不会出现「刚读到已准入、下一瞬间被 watchdog 暂停,却仍发出实盘工单」。
+pub fn resolve_admission(conn: &Connection, sig: &NewSignal) -> Result<Admission> {
+    use crate::trade::model::SignalSource;
+    if sig.strategy_id.is_some() {
+        return crate::trade::admission::state::admission_for(conn, sig.user_id, sig.strategy_id);
+    }
+    Ok(match sig.source {
+        SignalSource::Exit | SignalSource::Manual => Admission::NotRequired,
+        // 没绑定异动策略的异动信号:仅模拟盘(计划 2b 起的既有行为)
+        SignalSource::Mover => Admission::Probation,
+        // 日线策略信号必须来自某个策略;没有就是调用方的错,宁可拒绝
+        SignalSource::Strategy => Admission::Blocked,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +56,8 @@ pub fn submit_signal(
         return Ok(SubmitOutcome::Duplicate);
     };
 
+    let admission = resolve_admission(&tx, sig)?;
+
     let rules = store::get_risk_rules(&tx, sig.user_id)?;
     let real_account = store::get_account(&tx, sig.user_id, Account::Real)?;
     let mut paper_account = store::get_account(&tx, sig.user_id, Account::Paper)?;
@@ -62,7 +79,7 @@ pub fn submit_signal(
     let decision = gate::evaluate(&GateInput {
         signal: sig,
         quote: ctx.quote,
-        admission: ctx.admission,
+        admission,
         rules: &rules,
         real_account: real_account.as_ref(),
         paper_account: paper_account.as_ref(),
@@ -132,4 +149,167 @@ pub fn submit_signal(
         real_ticket,
         paper_ticket,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::Direction;
+    use crate::trade::admission::state;
+    use crate::trade::model::{AccountScope, NewStrategy, SignalSource, StrategyStatus};
+    use chrono::NaiveDate;
+
+    fn now() -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 9, 16)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap()
+    }
+
+    fn db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        store::migrate(&c).unwrap();
+        store::set_capital(&c, 1, Account::Real, 100_000.0, now()).unwrap();
+        c
+    }
+
+    fn sig(source: SignalSource, strategy_id: Option<i64>, key: &str) -> NewSignal {
+        NewSignal {
+            user_id: 1,
+            source,
+            strategy_id,
+            code: "600000".into(),
+            name: None,
+            side: Direction::Buy,
+            scope: AccountScope::Both,
+            ref_price: 10.0,
+            reason: "t".into(),
+            ai_note: None,
+            dedup_key: key.into(),
+            suggest_cash: Some(5_000.0),
+            suggest_qty: None,
+        }
+    }
+
+    fn quote() -> Quote {
+        Quote {
+            code: "600000".into(),
+            price: 10.0,
+            limit_up: Some(11.0),
+            limit_down: Some(9.0),
+            ts: now(),
+        }
+    }
+
+    /// kind=mover 的策略提交后直接进入观察期,是造 Paper 状态最短的路径。
+    fn paper_strategy(c: &Connection) -> i64 {
+        let user_id = 1;
+        let id = store::create_strategy(
+            c,
+            &NewStrategy {
+                user_id,
+                name: "S".into(),
+                kind: "mover".into(),
+                grid_toml: "x = [1]".into(),
+                pool: vec!["600000".into()],
+            },
+            now(),
+        )
+        .unwrap();
+        state::submit_for_backtest(c, user_id, id, now()).unwrap();
+        id
+    }
+
+    #[test]
+    fn admission_follows_strategy_status_read_inside_submit() {
+        let c = db();
+        let id = paper_strategy(&c);
+        assert_eq!(
+            resolve_admission(&c, &sig(SignalSource::Strategy, Some(id), "a")).unwrap(),
+            Admission::Probation
+        );
+        state::update_status(
+            &c,
+            1,
+            id,
+            StrategyStatus::Paper,
+            StrategyStatus::Admitted,
+            "x",
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_admission(&c, &sig(SignalSource::Strategy, Some(id), "a")).unwrap(),
+            Admission::Admitted
+        );
+        let mut other_user = sig(SignalSource::Strategy, Some(id), "a");
+        other_user.user_id = 2;
+        assert_eq!(
+            resolve_admission(&c, &other_user).unwrap(),
+            Admission::Blocked,
+            "跨用户视为不存在"
+        );
+        assert_eq!(
+            resolve_admission(&c, &sig(SignalSource::Strategy, None, "a")).unwrap(),
+            Admission::Blocked
+        );
+        assert_eq!(
+            resolve_admission(&c, &sig(SignalSource::Mover, None, "a")).unwrap(),
+            Admission::Probation
+        );
+        assert_eq!(
+            resolve_admission(&c, &sig(SignalSource::Manual, None, "a")).unwrap(),
+            Admission::NotRequired
+        );
+        assert_eq!(
+            resolve_admission(&c, &sig(SignalSource::Exit, None, "a")).unwrap(),
+            Admission::NotRequired
+        );
+    }
+
+    #[test]
+    fn submit_uses_current_status_paper_only_then_real_after_admission() {
+        let mut c = db();
+        let id = paper_strategy(&c);
+        let q = quote();
+        let ctx = SubmitContext {
+            quote: Some(&q),
+            now: now(),
+        };
+        assert!(matches!(
+            submit_signal(&mut c, &sig(SignalSource::Strategy, Some(id), "k1"), &ctx).unwrap(),
+            SubmitOutcome::Ticketed {
+                real_ticket: None,
+                paper_ticket: Some(_),
+                ..
+            }
+        ));
+        state::update_status(
+            &c,
+            1,
+            id,
+            StrategyStatus::Paper,
+            StrategyStatus::Suspended,
+            "x",
+            now(),
+        )
+        .unwrap();
+        let mut s2 = sig(SignalSource::Strategy, Some(id), "k2");
+        s2.code = "600036".into();
+        let q2 = Quote {
+            code: "600036".into(),
+            ..q.clone()
+        };
+        let ctx2 = SubmitContext {
+            quote: Some(&q2),
+            now: now(),
+        };
+        assert!(matches!(
+            submit_signal(&mut c, &s2, &ctx2).unwrap(),
+            SubmitOutcome::Rejected {
+                reason: GateReject::NotAdmitted,
+                ..
+            }
+        ));
+    }
 }

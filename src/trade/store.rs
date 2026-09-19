@@ -734,6 +734,55 @@ pub fn list_strategies(conn: &Connection, user_id: i64) -> Result<Vec<StrategyDe
     raws.into_iter().map(to_strategy).collect()
 }
 
+/// 该用户观察期 / 已准入、且股票池含 `code` 的异动策略;已准入优先,同状态取 id 最小。
+pub fn active_mover_strategy(
+    conn: &Connection,
+    user_id: i64,
+    code: &str,
+) -> Result<Option<StrategyDef>> {
+    let mut best: Option<StrategyDef> = None;
+    for s in list_strategies(conn, user_id)? {
+        if s.kind != "mover" || !s.pool.iter().any(|c| c == code) {
+            continue;
+        }
+        let rank = match s.status {
+            StrategyStatus::Admitted => 0,
+            StrategyStatus::Paper => 1,
+            _ => continue,
+        };
+        let better = match &best {
+            None => true,
+            Some(b) => {
+                let b_rank = if b.status == StrategyStatus::Admitted {
+                    0
+                } else {
+                    1
+                };
+                (rank, s.id) < (b_rank, b.id)
+            }
+        };
+        if better {
+            best = Some(s);
+        }
+    }
+    Ok(best)
+}
+
+/// 该用户观察期 / 已准入的异动策略股票池并集(去重、排序)。
+pub fn active_mover_pools(conn: &Connection, user_id: i64) -> Result<Vec<String>> {
+    let mut codes: Vec<String> = list_strategies(conn, user_id)?
+        .into_iter()
+        .filter(|s| {
+            s.kind == "mover"
+                && matches!(s.status, StrategyStatus::Paper | StrategyStatus::Admitted)
+        })
+        .flat_map(|s| s.pool)
+        .collect();
+    codes.sort();
+    codes.dedup();
+    Ok(codes)
+}
+
 /// `update_definition` 的结果(spec §10.1 + F11):区分「无变化」「仅改名」
 /// 「换版本」「策略不存在 / 不属于该用户」,调用方据此决定是否需要重新提交回测。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

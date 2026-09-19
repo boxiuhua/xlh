@@ -2,7 +2,6 @@ use chrono::{NaiveDate, NaiveDateTime};
 use rusqlite::Connection;
 use std::cell::RefCell;
 use xlh::trade::daemon::{alert_holders, notify_new_tickets, send_fill_reminders};
-use xlh::trade::gate::Admission;
 use xlh::trade::model::{Account, AccountScope, NewSignal, Position, Quote, SignalSource};
 use xlh::trade::monitor::run_tick;
 use xlh::trade::notify::Notifier;
@@ -109,7 +108,6 @@ fn fill_reminders_are_grouped_per_user() {
         };
         let ctx = SubmitContext {
             quote: Some(&q),
-            admission: Admission::NotRequired,
             now: at(16, 10, 0),
         };
         let SubmitOutcome::Ticketed {
