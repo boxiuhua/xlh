@@ -1823,7 +1823,7 @@ function toggleTicketSideFields(){
 function openTicketModal(opts){
   opts = opts || {};
   TICKET_REQUEST_ID = newRequestId();
-  TICKET_STATE = { code: opts.code || '', name: opts.name || '', aiNote: opts.aiNote || null };
+  TICKET_STATE = { code: opts.code || '', name: opts.name || '', aiNote: opts.aiNote ? String(opts.aiNote).slice(0,8000) : null };
   document.getElementById('tk-code').value = opts.code || '';
   document.getElementById('tk-name').value = opts.name || '';
   document.getElementById('tk-side-buy').checked = opts.side !== 'sell';
@@ -1863,10 +1863,16 @@ function submitTicket(){
   var amount = null, qty = null;
   if (side === 'buy') {
     var av = document.getElementById('tk-amount').value.trim();
-    if (av !== '') amount = Number(av);
+    if (av !== '') {
+      amount = Number(av);
+      if (!(isFinite(amount) && amount > 0)) { msg.innerHTML = '<span style="color:#c0392b">买入金额须为正数</span>'; return; }
+    }
   } else {
     var qv = document.getElementById('tk-qty').value.trim();
-    if (qv !== '') qty = Number(qv);
+    if (qv !== '') {
+      qty = Number(qv);
+      if (!(Number.isInteger(qty) && qty > 0)) { msg.innerHTML = '<span style="color:#c0392b">卖出股数须为正整数</span>'; return; }
+    }
   }
   var body = {
     request_id: TICKET_REQUEST_ID,
