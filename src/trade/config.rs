@@ -183,6 +183,8 @@ pub struct TradeCfg {
     pub walk_forward: WalkForwardTuning,
     pub eval: EvalCfg,
     pub signals: SignalCfg,
+    /// 推送里工单链接的站点根地址(如 https://xlh.example.com);为空则不带链接
+    pub link_base_url: String,
 }
 
 impl Default for TradeCfg {
@@ -197,6 +199,7 @@ impl Default for TradeCfg {
             walk_forward: WalkForwardTuning::default(),
             eval: EvalCfg::default(),
             signals: SignalCfg::default(),
+            link_base_url: String::new(),
         }
     }
 }
@@ -232,6 +235,15 @@ pub fn from_toml_str(text: &str) -> Result<TradeCfg> {
         return Err(anyhow!(
             "[trade] slippage 须在 [0,0.05],当前 {}",
             cfg.slippage
+        ));
+    }
+    if !cfg.link_base_url.is_empty()
+        && !cfg.link_base_url.starts_with("http://")
+        && !cfg.link_base_url.starts_with("https://")
+    {
+        return Err(anyhow!(
+            "[trade] link_base_url 须为空或以 http:// / https:// 开头,当前 {}",
+            cfg.link_base_url
         ));
     }
     let wf = &cfg.walk_forward;
@@ -686,6 +698,23 @@ mod tests {
         );
         assert!(from_toml_str("[trade.admission]\nwin_rate_sigma = -1.0\n").is_err());
         assert!(from_toml_str("[trade.admission]\nwatchdog_window = 0\n").is_err());
+    }
+
+    #[test]
+    fn link_base_url_defaults_empty_and_validates_scheme() {
+        assert_eq!(from_toml_str("[trade]\n").unwrap().link_base_url, "");
+        let c = from_toml_str("[trade]\nlink_base_url = \"https://x\"\n").unwrap();
+        assert_eq!(c.link_base_url, "https://x");
+        let c = from_toml_str("[trade]\nlink_base_url = \"http://x\"\n").unwrap();
+        assert_eq!(c.link_base_url, "http://x");
+        assert!(
+            from_toml_str("[trade]\nlink_base_url = \"ftp://x\"\n").is_err(),
+            "只允许 http(s)://"
+        );
+        assert!(
+            from_toml_str("[trade]\nlink_base_url = \"x\"\n").is_err(),
+            "只允许 http(s)://"
+        );
     }
 
     #[test]

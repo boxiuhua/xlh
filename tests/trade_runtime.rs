@@ -73,7 +73,7 @@ fn stop_loss_tick_notifies_owner_with_reason() {
     }]);
     let report = run_tick(&mut c, &quotes, at(16, 10, 0)).unwrap();
     let rec = Recorder::default();
-    assert_eq!(notify_new_tickets(&c, &rec, &report.new_real_tickets), 1);
+    assert_eq!(notify_new_tickets(&c, &rec, &report.new_real_tickets, ""), 1);
     let sent = rec.0.borrow();
     assert_eq!(sent[0].0, 1);
     assert_eq!(sent[0].1, "交易工单:卖出 600000");

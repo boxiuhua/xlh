@@ -9,7 +9,7 @@ use crate::trade::notify::{
     PushNotifier, QueuedPushNotifier,
 };
 use crate::trade::quotes::TencentQuotes;
-use crate::trade::{monitor, movers, store, ticket};
+use crate::trade::{link, monitor, movers, settings, store, ticket};
 use anyhow::Result;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use rusqlite::Connection;
@@ -94,14 +94,34 @@ pub fn probe_due(
 }
 
 /// 推送本轮新建的实盘工单,返回成功推送条数;单条失败只记日志。
-pub fn notify_new_tickets(conn: &Connection, notifier: &dyn Notifier, ticket_ids: &[i64]) -> usize {
+/// `link_base` 非空时,每张工单附带签名链接;取密钥失败只记日志、降级为无链接。
+pub fn notify_new_tickets(
+    conn: &Connection,
+    notifier: &dyn Notifier,
+    ticket_ids: &[i64],
+    link_base: &str,
+) -> usize {
+    let secret = if link_base.is_empty() {
+        None
+    } else {
+        match settings::link_secret(conn) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("[trade] 取工单链接密钥失败,本轮推送不带链接: {e:#}");
+                None
+            }
+        }
+    };
     let mut sent = 0;
     for &id in ticket_ids {
         let result = (|| -> Result<()> {
             let t =
                 ticket::get_ticket(conn, id)?.ok_or_else(|| anyhow::anyhow!("工单 {id} 不存在"))?;
             let reason = signal_reason(conn, t.signal_id)?;
-            let (title, md) = render_new_ticket(&t, &reason);
+            let url = secret
+                .as_ref()
+                .map(|secret| link::ticket_url(link_base, secret, &t));
+            let (title, md) = render_new_ticket(&t, &reason, url.as_deref());
             notifier.notify(conn, t.user_id, &title, &md)
         })();
         match result {
@@ -276,7 +296,12 @@ fn run_loop(
                     if backoff.on_success() {
                         println!("[trade] 行情恢复,监听继续");
                     }
-                    notify_new_tickets(&conn, notifier.as_ref(), &report.new_real_tickets);
+                    notify_new_tickets(
+                        &conn,
+                        notifier.as_ref(),
+                        &report.new_real_tickets,
+                        &cfg.link_base_url,
+                    );
                     for e in report
                         .errors
                         .iter()
@@ -324,7 +349,12 @@ fn run_loop(
             // 日线策略信号:窗口内每轮都尝试(无可发计划时只是一次本地查询)。
             match crate::trade::daily_signals::emit_due(&mut conn, &source, &cfg.signals, now) {
                 Ok(r) => {
-                    notify_new_tickets(&conn, notifier.as_ref(), &r.new_real_tickets);
+                    notify_new_tickets(
+                        &conn,
+                        notifier.as_ref(),
+                        &r.new_real_tickets,
+                        &cfg.link_base_url,
+                    );
                     for e in &r.errors {
                         eprintln!("[trade] 日线信号发出: {e}");
                     }

@@ -8,6 +8,7 @@ pub mod daemon;
 pub mod daily_signals;
 pub mod exits;
 pub mod gate;
+pub mod link;
 pub mod model;
 pub mod monitor;
 pub mod movers;

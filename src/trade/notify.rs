@@ -107,7 +107,7 @@ pub fn side_label(side: Direction) -> &'static str {
     }
 }
 
-pub fn render_new_ticket(t: &Ticket, reason: &str) -> (String, String) {
+pub fn render_new_ticket(t: &Ticket, reason: &str, link: Option<&str>) -> (String, String) {
     let title = format!(
         "交易工单:{} {}{}",
         side_label(t.side),
@@ -127,7 +127,12 @@ pub fn render_new_ticket(t: &Ticket, reason: &str) -> (String, String) {
             t.urgency + 1
         ));
     }
-    md.push_str("\n请在「交易」页确认,在券商 App 下单后回填成交。");
+    match link {
+        Some(link) => md.push_str(&format!(
+            "\n[查看并确认]({link}),在券商 App 下单后登录回填成交。"
+        )),
+        None => md.push_str("\n请在「交易」页确认,在券商 App 下单后回填成交。"),
+    }
     (title, md)
 }
 
@@ -199,15 +204,24 @@ mod tests {
 
     #[test]
     fn new_ticket_message() {
-        let (title, md) = super::render_new_ticket(&ticket(0), "触发止损:现价 9.100 ≤ 9.200");
+        let (title, md) = super::render_new_ticket(&ticket(0), "触发止损:现价 9.100 ≤ 9.200", None);
         assert_eq!(title, "交易工单:卖出 600000");
         for s in ["1000 股", "9.10", "10:30", "1.5%", "触发止损", "回填"] {
             assert!(md.contains(s), "缺少 {s}: {md}");
         }
         assert!(!md.contains("次提醒"));
-        let (title, md) = super::render_new_ticket(&ticket(1), "r");
+        let (title, md) = super::render_new_ticket(&ticket(1), "r", None);
         assert_eq!(title, "交易工单:卖出 600000(重发)");
         assert!(md.contains("第 2 次提醒"), "{md}");
+    }
+
+    #[test]
+    fn new_ticket_message_carries_the_link_when_given() {
+        let (_, md) = super::render_new_ticket(&ticket(0), "r", Some("https://x/trade/t/1?sig=ab"));
+        assert!(md.contains("https://x/trade/t/1?sig=ab"), "{md}");
+
+        let (_, md) = super::render_new_ticket(&ticket(0), "r", None);
+        assert!(md.contains("请在「交易」页确认"), "{md}");
     }
 
     #[test]
