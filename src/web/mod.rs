@@ -391,7 +391,8 @@ pub fn router(state: AuthState) -> Router {
         .route("/healthz", get(healthz))
         .route("/login", get(page::login_html_handler))
         .route("/api/auth/register", post(auth::handlers::register))
-        .route("/api/auth/login", post(auth::handlers::login));
+        .route("/api/auth/login", post(auth::handlers::login))
+        .merge(trade::public_routes());
 
     // 需登录（不要求授权）：logout、activate、me
     let authed = Router::new()

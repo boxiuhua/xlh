@@ -136,6 +136,14 @@ pub fn routes() -> Router<AuthState> {
         .route("/api/trade/jobs/:id/cancel", post(cancel_job))
 }
 
+/// 工单签名链接路由(design decision 3):免登录查看与确认,挂在 `public` 组。
+/// 工单不存在、签名缺失 / 错误 / 过期一律 404,不区分原因、不泄露工单是否存在。
+pub fn public_routes() -> Router<AuthState> {
+    Router::new()
+        .route("/api/trade/t/:id", get(signed_view))
+        .route("/api/trade/t/:id/confirm", post(signed_confirm))
+}
+
 // ===== 概览 =====
 
 fn alive(conn: &Connection, name: &str, max_secs: i64, now: NaiveDateTime) -> anyhow::Result<bool> {
@@ -258,18 +266,8 @@ struct ConfirmBody {
     ack_deviation: bool,
 }
 
-async fn confirm(
-    State(st): State<AuthState>,
-    Extension(user): Extension<CurrentUser>,
-    id: Result<Path<i64>, PathRejection>,
-    body: Result<Json<ConfirmBody>, JsonRejection>,
-) -> ApiResult<serde_json::Value> {
-    let Path(id) = id?;
-    let Json(body) = body?;
-    let res = {
-        let conn = st.db.lock().unwrap();
-        actions::confirm_ticket(&conn, user.id, id, body.ack_deviation, now())?
-    };
+/// `ConfirmError` → HTTP 响应,供登录态确认与签名链接确认共用(避免映射逻辑重复)。
+fn confirm_response(res: Result<(), ConfirmError>) -> ApiResult<serde_json::Value> {
     match res {
         Ok(()) => Ok(ok()),
         Err(ConfirmError::NotFound) => Err(ApiError::not_found()),
@@ -301,6 +299,21 @@ async fn confirm(
             Err(e)
         }
     }
+}
+
+async fn confirm(
+    State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
+    id: Result<Path<i64>, PathRejection>,
+    body: Result<Json<ConfirmBody>, JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    let Path(id) = id?;
+    let Json(body) = body?;
+    let res = {
+        let conn = st.db.lock().unwrap();
+        actions::confirm_ticket(&conn, user.id, id, body.ack_deviation, now())?
+    };
+    confirm_response(res)
 }
 
 #[derive(Deserialize)]
@@ -337,6 +350,63 @@ async fn ignore(
             "工单已处理,不可忽略",
         )),
     }
+}
+
+// ===== 签名链接(免登录) =====
+
+#[derive(Deserialize)]
+struct SigQuery {
+    sig: Option<String>,
+}
+
+/// 取出签名合法的工单;工单不存在 / 签名缺失 / 错误 / 过期一律 404,不区分原因
+/// (design decision 3)。数据库等内部错误仍通过 `?` 转为 500,不吞掉真实故障。
+fn signed_ticket(
+    conn: &Connection,
+    id: i64,
+    sig: Option<&str>,
+    now: NaiveDateTime,
+) -> Result<Ticket, ApiError> {
+    let sig = sig.ok_or_else(ApiError::not_found)?;
+    let t = tk::get_ticket(conn, id)?.ok_or_else(ApiError::not_found)?;
+    let secret = settings::link_secret(conn)?;
+    if crate::trade::link::verify(&secret, &t, sig, now) {
+        Ok(t)
+    } else {
+        Err(ApiError::not_found())
+    }
+}
+
+async fn signed_view(
+    State(st): State<AuthState>,
+    id: Result<Path<i64>, PathRejection>,
+    q: Result<Query<SigQuery>, QueryRejection>,
+) -> ApiResult<TicketView> {
+    let Path(id) = id?;
+    let Query(q) = q?;
+    let now = now();
+    let conn = st.db.lock().unwrap();
+    let t = signed_ticket(&conn, id, q.sig.as_deref(), now)?;
+    Ok(Json(ticket_view(&conn, t, now)?))
+}
+
+/// 以工单自身的 `user_id` 作为操作用户;不需要登录(链接只能查看与确认该工单)。
+async fn signed_confirm(
+    State(st): State<AuthState>,
+    id: Result<Path<i64>, PathRejection>,
+    q: Result<Query<SigQuery>, QueryRejection>,
+    body: Result<Json<ConfirmBody>, JsonRejection>,
+) -> ApiResult<serde_json::Value> {
+    let Path(id) = id?;
+    let Query(q) = q?;
+    let Json(body) = body?;
+    let now = now();
+    let res = {
+        let conn = st.db.lock().unwrap();
+        let t = signed_ticket(&conn, id, q.sig.as_deref(), now)?;
+        actions::confirm_ticket(&conn, t.user_id, t.id, body.ack_deviation, now)?
+    };
+    confirm_response(res)
 }
 
 #[derive(Deserialize)]
@@ -1294,6 +1364,70 @@ mod tests {
         // 不存在的策略更新 → 404。
         let (s, _) = call(&st, "POST", "/api/trade/strategies/999999", "t", Some(body)).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn signed_link_views_and_confirms_only_its_own_ticket() {
+        let st = state();
+        let uid = seed_user(&st, "u", "t");
+        let id = pending_ticket(&st, uid, "600000", 10.0);
+        let other = pending_ticket(&st, uid, "600036", 10.0); // 同用户另一张
+        let (sig, other_sig) = {
+            let c = st.db.lock().unwrap();
+            let secret = crate::trade::settings::link_secret(&c).unwrap();
+            let t = crate::trade::ticket::get_ticket(&c, id).unwrap().unwrap();
+            let o = crate::trade::ticket::get_ticket(&c, other)
+                .unwrap()
+                .unwrap();
+            (
+                crate::trade::link::sign(&secret, &t),
+                crate::trade::link::sign(&secret, &o),
+            )
+        };
+        // 不带 cookie
+        let (s, v) = call(
+            &st,
+            "GET",
+            &format!("/api/trade/t/{id}?sig={sig}"),
+            "",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["id"], id);
+        let (s, _) = call(
+            &st,
+            "GET",
+            &format!("/api/trade/t/{id}?sig={other_sig}"),
+            "",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "别的工单的签名不能用");
+        let (s, _) = call(&st, "GET", &format!("/api/trade/t/{id}"), "", None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _) = call(
+            &st,
+            "POST",
+            &format!("/api/trade/t/{id}/confirm?sig={sig}"),
+            "",
+            Some(serde_json::json!({"ack_deviation": false})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, e) = call(
+            &st,
+            "POST",
+            &format!("/api/trade/t/{id}/confirm?sig={sig}"),
+            "",
+            Some(serde_json::json!({"ack_deviation": false})),
+        )
+        .await;
+        assert_eq!(
+            (s, e["code"].as_str()),
+            (StatusCode::CONFLICT, Some("already_handled")),
+            "链接重放"
+        );
     }
 
     #[tokio::test]
