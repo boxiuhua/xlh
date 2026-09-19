@@ -365,8 +365,19 @@ pub fn watchdog_stats(
     })
 }
 
-/// 某策略在某账户某代码上的净买入股数(买入 − 卖出,下限 0)。策略卖出信号以此为上限,
+/// 某策略在某账户某代码上仍持有的「自己买入」的股数。策略卖出信号以此为上限,
 /// 不能把用户手动买入、或其它策略买入的同一只股票一并卖掉(计划 4a 设计裁决 6)。
+///
+/// 不是简单的「买入 − 卖出」:按时间顺序回放该代码的**全部**成交(任何来源),
+/// 实盘账户再并入持仓校准。`total` 为回放出的持仓,`mine` 为本策略的份额:
+/// - 本策略买入:`mine += q, total += q`;本策略卖出:`mine -= min(q, mine), total -= q`;
+/// - 其它成交(手动、止盈止损、其它策略):只改 `total`;
+/// - 校准:`total` = 校准后数量(删除持仓为 0);
+/// - 每步之后 `total = max(total, 0)`,`mine = min(mine, total)`。
+///
+/// 于是不归属策略的卖出先消耗其它份额,不够时才吃掉策略的份额;清仓后策略份额归零,
+/// 之后的手动买入不再算作策略的。
+/// 注:调用方取 `min(可卖量, 本值)`;策略份额被 T+1 锁定时,可能卖到手动份额,已接受。
 pub fn strategy_net_qty(
     conn: &Connection,
     user_id: i64,
@@ -374,16 +385,88 @@ pub fn strategy_net_qty(
     account: Account,
     code: &str,
 ) -> Result<u64> {
-    let net: i64 = conn.query_row(
-        "SELECT COALESCE(SUM(CASE t.side WHEN 'buy' THEN f.qty ELSE -f.qty END), 0)
+    /// 回放事件:成交(是否本策略、方向、数量)或校准(校准后数量)。
+    enum Event {
+        Fill {
+            mine: bool,
+            side: Direction,
+            qty: i64,
+        },
+        Calibrate {
+            qty: i64,
+        },
+    }
+    // (时间, 同一时刻成交先于校准, 行号, 事件)
+    let mut events: Vec<(String, u8, i64, Event)> = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT f.id, f.filled_at, f.side, f.qty, COALESCE(s.strategy_id = ?2, 0)
          FROM trade_fills f
-         JOIN trade_tickets t ON t.id = f.ticket_id
-         JOIN trade_signals s ON s.id = t.signal_id
-         WHERE t.user_id = ?1 AND s.strategy_id = ?2 AND t.account = ?3 AND t.code = ?4",
-        params![user_id, strategy_id, account.as_str(), code],
-        |r| r.get(0),
+         LEFT JOIN trade_tickets t ON t.id = f.ticket_id
+         LEFT JOIN trade_signals s ON s.id = t.signal_id
+         WHERE f.user_id = ?1 AND f.account = ?3 AND f.code = ?4",
     )?;
-    Ok(net.max(0) as u64)
+    let rows = stmt.query_map(params![user_id, strategy_id, account.as_str(), code], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, bool>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, at, side, qty, mine) = row?;
+        let side = parse_side(&side)?;
+        events.push((at, 0, id, Event::Fill { mine, side, qty }));
+    }
+    if account == Account::Real {
+        let mut stmt = conn.prepare(
+            "SELECT id, at, after_json FROM trade_position_adjusts
+             WHERE user_id = ?1 AND account = ?2 AND code = ?3",
+        )?;
+        let rows = stmt.query_map(params![user_id, account.as_str(), code], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, at, after) = row?;
+            let qty = match after {
+                None => 0,
+                Some(json) => serde_json::from_str::<serde_json::Value>(&json)?
+                    .get("qty")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| anyhow::anyhow!("持仓校准记录 {id} 缺少 qty"))?,
+            };
+            events.push((at, 1, id, Event::Calibrate { qty }));
+        }
+    }
+    // 时间戳为定长 `%Y-%m-%d %H:%M:%S`,按字符串排序即按时间排序。
+    events.sort_by(|a, b| (&a.0, a.1, a.2).cmp(&(&b.0, b.1, b.2)));
+
+    let (mut total, mut mine_qty) = (0i64, 0i64);
+    for (_, _, _, ev) in events {
+        match ev {
+            Event::Fill { mine, side, qty } => match (mine, side) {
+                (true, Direction::Buy) => {
+                    mine_qty += qty;
+                    total += qty;
+                }
+                (true, Direction::Sell) => {
+                    mine_qty -= qty.min(mine_qty);
+                    total -= qty;
+                }
+                (false, Direction::Buy) => total += qty,
+                (false, Direction::Sell) => total -= qty,
+            },
+            Event::Calibrate { qty } => total = qty,
+        }
+        total = total.max(0);
+        mine_qty = mine_qty.min(total);
+    }
+    Ok(mine_qty.max(0) as u64)
 }
 
 /// 执行损耗:同一信号下实盘相对模拟盘多付的比例中位数;无配对返回 None。
@@ -963,6 +1046,182 @@ mod tests {
             strategy_net_qty(&c, 1, d, Account::Real, "600000").unwrap(),
             0,
             "卖出超过买入,数据异常时下限为 0"
+        );
+    }
+
+    /// 裁决 I5:不归属任何策略的卖出(止损、手动)先消耗手动部分,手动部分不够时
+    /// 才吃掉策略的份额;清仓后策略份额归零,之后的手动买入不再算作策略的。
+    #[test]
+    fn strategy_net_qty_is_consumed_by_unattributed_sells_after_manual_shares() {
+        let mut c = db();
+        let a = strategy(&c, 1);
+        let buy = |c: &mut Connection, sid: Option<i64>, qty: u64, key: &str, t| {
+            seed(
+                c,
+                1,
+                sid,
+                Account::Real,
+                Direction::Buy,
+                10.0,
+                qty,
+                None,
+                key,
+                t,
+            );
+        };
+        let sell = |c: &mut Connection, sid: Option<i64>, qty: u64, key: &str, t| {
+            seed(
+                c,
+                1,
+                sid,
+                Account::Real,
+                Direction::Sell,
+                10.0,
+                qty,
+                Some(0.0),
+                key,
+                t,
+            );
+        };
+        buy(&mut c, Some(a), 200, "a-buy", at(16, 9, 30));
+        buy(&mut c, None, 800, "m-buy", at(16, 9, 31));
+        assert_eq!(
+            strategy_net_qty(&c, 1, a, Account::Real, "600000").unwrap(),
+            200
+        );
+        // 止损卖出 900:手动 800 先卖完,再吃掉策略 100
+        sell(&mut c, None, 900, "exit-900", at(16, 10, 0));
+        assert_eq!(
+            strategy_net_qty(&c, 1, a, Account::Real, "600000").unwrap(),
+            100,
+            "部分非策略卖出"
+        );
+        // 再卖 100 → 清仓;之后手动买入 1000 不属于策略
+        sell(&mut c, None, 100, "exit-100", at(16, 10, 1));
+        buy(&mut c, None, 1000, "m-buy-2", at(16, 10, 30));
+        assert_eq!(
+            strategy_net_qty(&c, 1, a, Account::Real, "600000").unwrap(),
+            0,
+            "清仓后策略份额归零"
+        );
+    }
+
+    #[test]
+    fn strategy_net_qty_whole_position_exit_then_manual_rebuy_is_zero() {
+        let mut c = db();
+        let a = strategy(&c, 1);
+        seed(
+            &mut c,
+            1,
+            Some(a),
+            Account::Real,
+            Direction::Buy,
+            10.0,
+            200,
+            None,
+            "a",
+            at(16, 9, 30),
+        );
+        seed(
+            &mut c,
+            1,
+            None,
+            Account::Real,
+            Direction::Buy,
+            10.0,
+            800,
+            None,
+            "m",
+            at(16, 9, 31),
+        );
+        seed(
+            &mut c,
+            1,
+            None,
+            Account::Real,
+            Direction::Sell,
+            9.0,
+            1000,
+            Some(-1000.0),
+            "sl",
+            at(16, 10, 0),
+        );
+        seed(
+            &mut c,
+            1,
+            None,
+            Account::Real,
+            Direction::Buy,
+            9.0,
+            1000,
+            None,
+            "m2",
+            at(16, 10, 30),
+        );
+        assert_eq!(
+            strategy_net_qty(&c, 1, a, Account::Real, "600000").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn strategy_net_qty_follows_real_account_calibrations() {
+        let mut c = db();
+        let a = strategy(&c, 1);
+        seed(
+            &mut c,
+            1,
+            Some(a),
+            Account::Real,
+            Direction::Buy,
+            10.0,
+            200,
+            None,
+            "a",
+            at(16, 9, 30),
+        );
+        seed(
+            &mut c,
+            1,
+            Some(a),
+            Account::Paper,
+            Direction::Buy,
+            10.0,
+            200,
+            None,
+            "ap",
+            at(16, 9, 30),
+        );
+        let adjust = |c: &Connection, account: Account, after: Option<u64>, t| {
+            store::record_position_adjust(
+                c,
+                1,
+                account,
+                "600000",
+                None,
+                after.map(|q| serde_json::json!({ "qty": q })),
+                "对账",
+                t,
+            )
+            .unwrap();
+        };
+        // 校准到 150:策略份额随之收缩
+        adjust(&c, Account::Real, Some(150), at(16, 11, 0));
+        assert_eq!(
+            strategy_net_qty(&c, 1, a, Account::Real, "600000").unwrap(),
+            150
+        );
+        // 校准到 0(删除持仓)→ 0
+        adjust(&c, Account::Real, None, at(16, 11, 1));
+        assert_eq!(
+            strategy_net_qty(&c, 1, a, Account::Real, "600000").unwrap(),
+            0
+        );
+        // 校准只作用于实盘:模拟盘不受影响
+        adjust(&c, Account::Paper, None, at(16, 11, 2));
+        assert_eq!(
+            strategy_net_qty(&c, 1, a, Account::Paper, "600000").unwrap(),
+            200
         );
     }
 
