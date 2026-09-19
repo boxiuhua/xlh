@@ -178,11 +178,12 @@ pub fn judge_watchdog(
     backtest_max_streak: usize,
     cfg: &AdmissionCfg,
 ) -> Option<String> {
+    let mut reasons = Vec::new();
     // 有意不加最小笔数守卫(与下面的胜率规则不同):分母修正为投入资金后,
     // `drawdown` 是真实发生的资金损失比例,不是小样本里的统计噪声——两笔就亏掉
     // 回测最大回撤 1.5 倍的资金,本来就该立刻停手。胜率则是频率估计,必须有样本量。
     if baseline.max_drawdown > 0.0 && s.drawdown > baseline.max_drawdown * cfg.drawdown_multiple {
-        return Some(format!(
+        reasons.push(format!(
             "实盘回撤 {:.1}% 超过回测 {:.1}% 的 {:.1} 倍",
             s.drawdown * 100.0,
             baseline.max_drawdown * 100.0,
@@ -194,7 +195,7 @@ pub fn judge_watchdog(
         let sigma = (p * (1.0 - p) / s.recent_trades as f64).sqrt();
         let floor = p - cfg.win_rate_sigma * sigma;
         if s.recent_win_rate < floor {
-            return Some(format!(
+            reasons.push(format!(
                 "近 {} 笔胜率 {:.0}% 低于回测 {:.0}% − {:.0}σ({:.0}%)",
                 s.recent_trades,
                 s.recent_win_rate * 100.0,
@@ -207,12 +208,12 @@ pub fn judge_watchdog(
     if backtest_max_streak > 0
         && (s.max_consecutive_losses as f64) > backtest_max_streak as f64 * cfg.streak_multiple
     {
-        return Some(format!(
+        reasons.push(format!(
             "连亏 {} 笔超过回测 {} 笔的 {:.1} 倍",
             s.max_consecutive_losses, backtest_max_streak, cfg.streak_multiple
         ));
     }
-    None
+    (!reasons.is_empty()).then(|| reasons.join(";"))
 }
 
 #[cfg(test)]
@@ -558,5 +559,28 @@ mod tests {
         assert!(judge_watchdog(&streak, &base, 0.55, 4, &cfg)
             .unwrap()
             .contains("连亏"));
+    }
+
+    /// 计划 4a 设计裁决 10:watchdog 列出全部触发项,以「;」连接。
+    #[test]
+    fn watchdog_lists_every_breach() {
+        let cfg = AdmissionCfg::default();
+        let base = BacktestBaseline {
+            avg_trade_return: 0.02,
+            trade_return_sd: 0.01,
+            max_drawdown: 0.20,
+        };
+        // 同时突破回撤(> 0.20 × 1.5)、胜率(远低于回测胜率)、连亏(远超回测连亏 × 倍数)
+        let breaching = WatchdogStats {
+            drawdown: 0.31,
+            recent_win_rate: 0.10,
+            recent_trades: 20,
+            max_consecutive_losses: 7,
+        };
+        let s = judge_watchdog(&breaching, &base, 0.55, 4, &cfg).unwrap();
+        assert!(s.contains("回撤"), "{s}");
+        assert!(s.contains("胜率"), "{s}");
+        assert!(s.contains("连亏"), "{s}");
+        assert_eq!(s.split(';').count(), 3, "{s}");
     }
 }

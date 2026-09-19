@@ -18,6 +18,8 @@ pub struct StageMetrics {
     pub avg_trade_return: f64,
     pub max_drawdown: f64,
     pub realized_pnl: f64,
+    /// 盈亏比 = 平均盈利 / 平均亏损绝对值;无盈利或无亏损样本时为 None
+    pub profit_factor: Option<f64>,
 }
 
 /// 入参仍是成交流水;内部先按工单合并成逻辑交易,笔数与连亏才与回测同口径。
@@ -29,6 +31,12 @@ pub fn stage_metrics(fills: &[FillRow]) -> StageMetrics {
     }
     let returns = trade_returns(&units);
     let wins = pnls.iter().filter(|p| **p > 0.0).count();
+    let win_pnls: Vec<f64> = pnls.iter().copied().filter(|p| *p > 0.0).collect();
+    let loss_pnls: Vec<f64> = pnls.iter().copied().filter(|p| *p < 0.0).collect();
+    let profit_factor = (!win_pnls.is_empty() && !loss_pnls.is_empty()).then(|| {
+        (win_pnls.iter().sum::<f64>() / win_pnls.len() as f64)
+            / (loss_pnls.iter().sum::<f64>().abs() / loss_pnls.len() as f64)
+    });
     StageMetrics {
         trades: pnls.len(),
         win_rate: wins as f64 / pnls.len() as f64,
@@ -39,6 +47,7 @@ pub fn stage_metrics(fills: &[FillRow]) -> StageMetrics {
         },
         max_drawdown: realized_drawdown(fills),
         realized_pnl: pnls.iter().sum(),
+        profit_factor,
     }
 }
 
@@ -156,5 +165,31 @@ mod tests {
         assert_eq!(m.trades, 1, "同一工单三批成交是 1 笔");
         assert!((m.realized_pnl - (-30.0)).abs() < 1e-9);
         assert_eq!(m.win_rate, 0.0);
+    }
+
+    /// 计划 4a 设计裁决 8:盈亏比 = 平均盈利 / 平均亏损绝对值。
+    #[test]
+    fn profit_factor_is_avg_win_over_avg_loss() {
+        // 卖出盈亏 +300、+100、−100、−100 → 平均盈利 200 / 平均亏损 100 = 2.0
+        let m = stage_metrics(&[
+            buy(0),
+            sell(300.0, 11.0, 1),
+            buy(10),
+            sell(100.0, 11.0, 2),
+            buy(20),
+            sell(-100.0, 11.0, 3),
+            buy(30),
+            sell(-100.0, 11.0, 4),
+        ]);
+        assert_eq!(m.profit_factor, Some(2.0), "{:?}", m.profit_factor);
+
+        // 全部盈利 → 无亏损样本 → None
+        let all_wins = stage_metrics(&[buy(0), sell(100.0, 11.0, 1), buy(10), sell(50.0, 11.0, 2)]);
+        assert_eq!(all_wins.profit_factor, None);
+
+        // 全部亏损 → 无盈利样本 → None
+        let all_losses =
+            stage_metrics(&[buy(0), sell(-100.0, 11.0, 1), buy(10), sell(-50.0, 11.0, 2)]);
+        assert_eq!(all_losses.profit_factor, None);
     }
 }

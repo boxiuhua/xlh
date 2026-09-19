@@ -365,6 +365,27 @@ pub fn watchdog_stats(
     })
 }
 
+/// 某策略在某账户某代码上的净买入股数(买入 − 卖出,下限 0)。策略卖出信号以此为上限,
+/// 不能把用户手动买入、或其它策略买入的同一只股票一并卖掉(计划 4a 设计裁决 6)。
+pub fn strategy_net_qty(
+    conn: &Connection,
+    user_id: i64,
+    strategy_id: i64,
+    account: Account,
+    code: &str,
+) -> Result<u64> {
+    let net: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(CASE t.side WHEN 'buy' THEN f.qty ELSE -f.qty END), 0)
+         FROM trade_fills f
+         JOIN trade_tickets t ON t.id = f.ticket_id
+         JOIN trade_signals s ON s.id = t.signal_id
+         WHERE t.user_id = ?1 AND s.strategy_id = ?2 AND t.account = ?3 AND t.code = ?4",
+        params![user_id, strategy_id, account.as_str(), code],
+        |r| r.get(0),
+    )?;
+    Ok(net.max(0) as u64)
+}
+
 /// 执行损耗:同一信号下实盘相对模拟盘多付的比例中位数;无配对返回 None。
 ///
 /// 这里**不**按工单合并:比的是同一信号下两侧的**首笔成交价**,分批成交的后续批次
@@ -473,6 +494,7 @@ mod tests {
         account: Account,
         side: Direction,
         price: f64,
+        qty: u64,
         realized: Option<f64>,
         key: &str,
         now: NaiveDateTime,
@@ -503,7 +525,7 @@ mod tests {
                 code: "600000".into(),
                 side,
                 suggest_price: price,
-                qty: 1000,
+                qty,
                 expires_at: now + chrono::Duration::minutes(30),
                 deviation_th: 0.015,
                 status: TicketStatus::Confirmed,
@@ -515,13 +537,14 @@ mod tests {
         // 直接写 trade_fills:绕开 record_fill 的持仓/资金校验,本测试只关心统计
         c.execute(
             "INSERT INTO trade_fills (ticket_id, user_id, account, code, side, price, qty, fee, realized_pnl, source, filled_at)
-             VALUES (?1, ?2, ?3, '600000', ?4, ?5, 1000, 10.61, ?6, 'test', ?7)",
+             VALUES (?1, ?2, ?3, '600000', ?4, ?5, ?6, 10.61, ?7, 'test', ?8)",
             rusqlite::params![
                 tid,
                 user_id,
                 account.as_str(),
                 crate::trade::model::side_str(side),
                 price,
+                qty as i64,
                 realized,
                 crate::trade::model::fmt_ts(now),
             ],
@@ -758,6 +781,7 @@ mod tests {
             Account::Real,
             Direction::Sell,
             11.0,
+            1000,
             Some(100.0),
             "k1",
             at(16, 10, 0),
@@ -769,6 +793,7 @@ mod tests {
             Account::Paper,
             Direction::Sell,
             11.0,
+            1000,
             Some(50.0),
             "k2",
             at(16, 10, 1),
@@ -780,6 +805,7 @@ mod tests {
             Account::Real,
             Direction::Sell,
             11.0,
+            1000,
             Some(70.0),
             "k3",
             at(16, 10, 2),
@@ -791,6 +817,7 @@ mod tests {
             Account::Real,
             Direction::Sell,
             11.0,
+            1000,
             Some(90.0),
             "k4",
             at(16, 10, 3),
@@ -802,6 +829,7 @@ mod tests {
             Account::Real,
             Direction::Sell,
             11.0,
+            1000,
             Some(80.0),
             "k5",
             at(16, 10, 4),
@@ -827,6 +855,117 @@ mod tests {
         );
     }
 
+    /// 裁决 6:策略卖出只能卖自己买入的部分,不能把手动买入、其它策略买入的
+    /// 同一只股票一并卖掉。
+    #[test]
+    fn strategy_net_qty_counts_only_this_strategys_fills_in_this_account() {
+        let mut c = db();
+        let a = strategy(&c, 1);
+        let b = strategy(&c, 1);
+        let d = strategy(&c, 1);
+        // 策略 A 在实盘买 1000、卖 300
+        seed(
+            &mut c,
+            1,
+            Some(a),
+            Account::Real,
+            Direction::Buy,
+            10.0,
+            1000,
+            None,
+            "a-buy",
+            at(16, 9, 30),
+        );
+        seed(
+            &mut c,
+            1,
+            Some(a),
+            Account::Real,
+            Direction::Sell,
+            11.0,
+            300,
+            Some(50.0),
+            "a-sell",
+            at(16, 10, 0),
+        );
+        // 策略 B 在实盘买 500
+        seed(
+            &mut c,
+            1,
+            Some(b),
+            Account::Real,
+            Direction::Buy,
+            10.0,
+            500,
+            None,
+            "b-buy",
+            at(16, 9, 31),
+        );
+        // 手动信号(不绑定策略)在实盘买 200
+        seed(
+            &mut c,
+            1,
+            None,
+            Account::Real,
+            Direction::Buy,
+            10.0,
+            200,
+            None,
+            "manual-buy",
+            at(16, 9, 32),
+        );
+        // 策略 A 在模拟盘买 400
+        seed(
+            &mut c,
+            1,
+            Some(a),
+            Account::Paper,
+            Direction::Buy,
+            10.0,
+            400,
+            None,
+            "a-paper-buy",
+            at(16, 9, 33),
+        );
+        // 策略 D 只有卖出、没有买入(数据异常):下限为 0
+        seed(
+            &mut c,
+            1,
+            Some(d),
+            Account::Real,
+            Direction::Sell,
+            11.0,
+            200,
+            Some(-10.0),
+            "d-sell",
+            at(16, 10, 1),
+        );
+
+        assert_eq!(
+            strategy_net_qty(&c, 1, a, Account::Real, "600000").unwrap(),
+            700,
+            "A 实盘净买入 1000 − 300"
+        );
+        assert_eq!(
+            strategy_net_qty(&c, 1, a, Account::Paper, "600000").unwrap(),
+            400
+        );
+        assert_eq!(
+            strategy_net_qty(&c, 1, b, Account::Real, "600000").unwrap(),
+            500
+        );
+        assert_eq!(
+            strategy_net_qty(&c, 1, a, Account::Real, "000001").unwrap(),
+            0,
+            "其它代码为 0"
+        );
+        assert_eq!(
+            strategy_net_qty(&c, 1, d, Account::Real, "600000").unwrap(),
+            0,
+            "卖出超过买入,数据异常时下限为 0"
+        );
+    }
+
     #[test]
     fn paper_and_watchdog_stats_come_from_fills() {
         let mut c = db();
@@ -840,6 +979,7 @@ mod tests {
                 Account::Paper,
                 Direction::Buy,
                 10.0,
+                1000,
                 None,
                 &format!("pb{i}"),
                 at(16, 9, 30 + i as u32),
@@ -851,6 +991,7 @@ mod tests {
                 Account::Paper,
                 Direction::Sell,
                 11.0,
+                1000,
                 Some(*pnl),
                 &format!("p{i}"),
                 at(16, 10, i as u32),
@@ -876,6 +1017,7 @@ mod tests {
                 Account::Real,
                 Direction::Sell,
                 11.0,
+                1000,
                 Some(*pnl),
                 &format!("r{i}"),
                 at(16, 11, i as u32),
@@ -900,6 +1042,7 @@ mod tests {
             Account::Real,
             Direction::Buy,
             10.0,
+            1000,
             None,
             "ob",
             at(14, 9, 30),
@@ -912,6 +1055,7 @@ mod tests {
                 Account::Real,
                 Direction::Sell,
                 8.0,
+                1000,
                 Some(*pnl),
                 &format!("o{i}"),
                 at(14, 10, i as u32),
@@ -929,6 +1073,7 @@ mod tests {
             Account::Real,
             Direction::Buy,
             10.0,
+            1000,
             None,
             "nb",
             at(16, 9, 30),
@@ -940,6 +1085,7 @@ mod tests {
             Account::Real,
             Direction::Sell,
             11.0,
+            1000,
             Some(100.0),
             "n0",
             at(16, 10, 0),
@@ -963,6 +1109,7 @@ mod tests {
             Account::Real,
             Direction::Buy,
             10.05,
+            1000,
             None,
             "e1",
             at(16, 10, 0),

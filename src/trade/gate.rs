@@ -74,6 +74,11 @@ pub struct GateInput<'a> {
     pub real_reserved_cash: f64,
     /// 模拟盘未完结买入工单占用资金
     pub paper_reserved_cash: f64,
+    /// 绑定策略的卖出信号在实盘的可卖上限(该策略在实盘的净买入股数);
+    /// `None` = 不设上限(非策略信号或买入信号)
+    pub real_strategy_cap: Option<u64>,
+    /// 同上,模拟盘
+    pub paper_strategy_cap: Option<u64>,
     /// 同用户同代码同方向是否已有未完结实盘工单(仅当目标账户含实盘时才会阻塞;
     /// 若信号只作用于模拟盘,如观察期策略或 `PaperOnly` 范围的止盈止损,不受此约束)
     pub has_open_ticket: bool,
@@ -158,17 +163,23 @@ pub fn evaluate(inp: &GateInput) -> GateDecision {
     let today = inp.now.date();
     let mut plans = Vec::with_capacity(accounts.len());
     for (i, account) in accounts.iter().copied().enumerate() {
-        let (acc, pos, reserved) = match account {
-            Account::Real => (inp.real_account, inp.real_position, inp.real_reserved_cash),
+        let (acc, pos, reserved, cap) = match account {
+            Account::Real => (
+                inp.real_account,
+                inp.real_position,
+                inp.real_reserved_cash,
+                inp.real_strategy_cap,
+            ),
             Account::Paper => (
                 inp.paper_account,
                 inp.paper_position,
                 inp.paper_reserved_cash,
+                inp.paper_strategy_cap,
             ),
         };
         let sized = match s.side {
             Direction::Buy => size_buy_for(s, q, rules, acc, pos, reserved),
-            Direction::Sell => size_sell_for(s, pos, today),
+            Direction::Sell => size_sell_for(s, pos, today, cap),
         };
         match sized {
             Ok(qty) => plans.push(Plan {
@@ -211,8 +222,11 @@ fn size_sell_for(
     s: &NewSignal,
     pos: Option<&Position>,
     today: chrono::NaiveDate,
+    cap: Option<u64>,
 ) -> Result<u64, GateReject> {
-    let sellable = pos.map_or(0, |p| p.sellable(today));
+    let sellable = pos
+        .map_or(0, |p| p.sellable(today))
+        .min(cap.unwrap_or(u64::MAX));
     if sellable == 0 {
         return Err(GateReject::NothingSellable);
     }
@@ -277,6 +291,8 @@ mod tests {
         pnl: f64,
         real_reserved: f64,
         paper_reserved: f64,
+        real_strategy_cap: Option<u64>,
+        paper_strategy_cap: Option<u64>,
     }
 
     fn account(a: Account, total: f64) -> AccountState {
@@ -334,6 +350,8 @@ mod tests {
                 pnl: 0.0,
                 real_reserved: 0.0,
                 paper_reserved: 0.0,
+                real_strategy_cap: None,
+                paper_strategy_cap: None,
             }
         }
 
@@ -361,6 +379,8 @@ mod tests {
                 realized_pnl_today: self.pnl,
                 real_reserved_cash: self.real_reserved,
                 paper_reserved_cash: self.paper_reserved,
+                real_strategy_cap: self.real_strategy_cap,
+                paper_strategy_cap: self.paper_strategy_cap,
                 now: now(),
             })
         }
@@ -585,6 +605,30 @@ mod tests {
             plans(f.run()),
             vec![plan(Account::Real, 900), plan(Account::Paper, 1900)]
         );
+    }
+
+    #[test]
+    fn strategy_sell_is_capped_by_what_the_strategy_bought() {
+        let mut f = Fx::sell(1000, NaiveDate::from_ymd_opt(2026, 9, 1).unwrap());
+        f.sig.source = SignalSource::Strategy;
+        f.real_strategy_cap = Some(300);
+        f.paper_strategy_cap = Some(0);
+        // 实盘只卖策略自己的 300 股;模拟盘策略没有持股 → 该账户无计划
+        let real_plans = plans(f.run());
+        assert_eq!(real_plans.len(), 1);
+        assert_eq!(
+            (real_plans[0].account, real_plans[0].qty),
+            (Account::Real, 300)
+        );
+
+        let mut f = Fx::sell(1000, NaiveDate::from_ymd_opt(2026, 9, 1).unwrap());
+        f.real_strategy_cap = Some(0);
+        f.paper_strategy_cap = Some(0);
+        assert_eq!(f.run(), GateDecision::Reject(GateReject::NothingSellable));
+
+        let f = Fx::sell(1000, NaiveDate::from_ymd_opt(2026, 9, 1).unwrap());
+        // 无上限(止盈止损 / 手动)行为不变
+        assert_eq!(plans(f.run())[0].qty, 1000);
     }
 
     #[test]
