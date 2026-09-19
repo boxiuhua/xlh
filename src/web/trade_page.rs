@@ -1275,6 +1275,11 @@ a{color:#2563eb}
   <div id="app"><div class="card"><div class="hint">加载中…</div></div></div>
 </div>
 <script>
+// esc / confirmState / fmtMoney / fmtPct / fmtCountdown / sideLabel / sourceLabel
+// 与 TRADE_HTML 保持一致，由测试 shared_helpers_are_identical_in_both_pages 校验
+// （本页独立、不 import TRADE_HTML 的脚本，这几个小工具函数按 brief 允许重复实现，
+// 用单测保证两边字节级一致，不会悄悄走样；其余逻辑均为本页独有，不与 TRADE_HTML 共享）。
+
 function esc(s){
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
@@ -1326,14 +1331,24 @@ const apiBase = `/api/trade/t/${encodeURIComponent(ticketId)}`;
 
 let stopped = false;
 let expiresMs = NaN;
+let countdownTimer = null;
+let refreshTimer = null;
+
+// 到达终态（已确认 / 链接失效）后停掉倒计时与 15 秒刷新，避免徒劳的后台请求与计时器泄漏。
+function stopTimers(){
+  if (countdownTimer !== null) { clearInterval(countdownTimer); countdownTimer = null; }
+  if (refreshTimer !== null) { clearInterval(refreshTimer); refreshTimer = null; }
+}
 
 function showInvalid(){
   stopped = true;
+  stopTimers();
   document.getElementById('app').innerHTML = '<div class="card"><div class="hint">链接无效或已过期</div></div>';
 }
 
 function showDone(){
   stopped = true;
+  stopTimers();
   document.getElementById('app').innerHTML =
     '<div class="card">已确认。请在券商 App 下单，完成后登录交易页回填成交<br/><a href="/trade">前往交易页</a></div>';
 }
@@ -1345,7 +1360,7 @@ function updateCountdown(){
   const left = expiresMs - Date.now();
   el.textContent = left > 0 ? fmtCountdown(left) : '已过期';
 }
-setInterval(updateCountdown, 1000);
+countdownTimer = setInterval(updateCountdown, 1000);
 
 function render(t){
   const cs = confirmState(t);
@@ -1438,7 +1453,7 @@ if (!ticketId) {
   showInvalid();
 } else {
   loadTicket();
-  setInterval(loadTicket, 15000);
+  refreshTimer = setInterval(loadTicket, 15000);
 }
 </script>
 </body>
@@ -1649,5 +1664,62 @@ mod tests {
         assert!(body.contains("链接无效或已过期"));
         assert!(body.contains("function confirmState("));
         assert!(!body.contains("http://") && !body.contains("https://"));
+    }
+
+    /// 从 `src` 里抽出 `function NAME(...) { ... }` 的完整源文本（从 `function NAME(`
+    /// 起，用花括号计数找到与函数体开括号匹配的闭括号，含头尾）。JS 里对象字面量、
+    /// 模板字符串 `${...}` 内的花括号都天然成对，计数法足够定位到函数结尾。
+    fn extract_fn<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+        let needle = format!("function {name}(");
+        let start = src.find(&needle)?;
+        let rest = &src[start..];
+        let brace_rel = rest.find('{')?;
+        let mut depth = 0i32;
+        let mut end_rel = None;
+        for (i, ch) in rest[brace_rel..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_rel = Some(brace_rel + i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(&rest[..end_rel?])
+    }
+
+    /// 签名链接落地页独立、不复用 `TRADE_HTML` 的脚本；brief 只明确允许 `esc` /
+    /// `confirmState` 在两页各写一份，但实现里为了保持页面独立还额外复制了几个纯
+    /// 格式化小工具函数。这些「允许重复」的函数必须两边字节级一致（trim 后），
+    /// 否则就是重复代码走偏而不是有意的独立实现——用这个测试守住这条线，而不是
+    /// 只靠代码注释自证。
+    #[test]
+    fn shared_helpers_are_identical_in_both_pages() {
+        let trade = crate::web::trade_page::TRADE_HTML;
+        let signed = crate::web::trade_page::SIGNED_TICKET_HTML;
+        for name in [
+            "esc",
+            "confirmState",
+            "fmtMoney",
+            "fmtPct",
+            "fmtCountdown",
+            "sideLabel",
+            "sourceLabel",
+        ] {
+            let Some(signed_fn) = extract_fn(signed, name) else {
+                continue; // 该函数没有在签名页出现，不参与比较
+            };
+            let trade_fn = extract_fn(trade, name)
+                .unwrap_or_else(|| panic!("TRADE_HTML 里也应该有 function {name}("));
+            assert_eq!(
+                signed_fn.trim(),
+                trade_fn.trim(),
+                "两页的 {name} 实现应保持一致（如需故意不同，请在这里加白名单并写明原因）"
+            );
+        }
     }
 }
