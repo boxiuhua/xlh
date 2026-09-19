@@ -216,7 +216,7 @@ function sideLabel(side){
 }
 
 function sourceLabel(src){
-  return { exit: '止盈止损', strategy: '策略信号', mover: '实时异动', manual: '手动/AI' }[src] || (src || '—');
+  return { exit: '止盈止损', strategy: '日线策略', mover: '异动', manual: '手动' }[src] || (src || '—');
 }
 
 function statusLabel(st){
@@ -325,10 +325,9 @@ function sideHtml(side){
   return `<span class="${cls}">${esc(sideLabel(side))}</span>`;
 }
 
-// 服务端时间是本地时区的 "YYYY-MM-DD HH:MM:SS"，按本地时间解析
-function parseLocalTs(ts){
-  if (!ts) return NaN;
-  return new Date(String(ts).replace(' ', 'T')).getTime();
+// 代码后显示股票名称的后缀（有则显示，否则为空），返回已转义的 HTML 片段（4c）
+function nameSuffixHtml(t){
+  return t.name ? ` <span class="hint">${esc(t.name)}</span>` : '';
 }
 
 function hintCard(msg){
@@ -439,9 +438,9 @@ function tickCountdowns(){
   const now = Date.now();
   document.querySelectorAll('#panel-pending .ticket').forEach(card => {
     const el = card.querySelector('.countdown');
-    const exp = Number(card.getAttribute('data-expires'));
-    if (!exp || !isFinite(exp)) { if (el) el.textContent = '有效期未知'; return; }
-    const left = exp - now;
+    const deadline = Number(card.getAttribute('data-deadline'));
+    if (!deadline || !isFinite(deadline)) { if (el) el.textContent = '有效期未知'; return; }
+    const left = deadline - now;
     if (left > 0) { if (el) el.textContent = fmtCountdown(left); return; }
     if (el) el.textContent = '已过期';
     if (!card.classList.contains('expired')) {
@@ -455,7 +454,8 @@ setInterval(tickCountdowns, 1000);
 function ticketCardHtml(t, noteOpen){
   const st = confirmState(t);
   const devBad = t.deviation != null && t.deviation > t.deviation_th;
-  const exp = parseLocalTs(t.expires_at);
+  // 倒计时以服务端剩余秒数为准:收到响应时刻 + 秒数 = 截止时间,不再解析本地时间字符串(设计裁决 4)。
+  const deadline = Date.now() + Number(t.expires_in_secs || 0) * 1000;
   const urgent = t.urgency > 0 ? `<span class="tag urgent">第 ${esc(t.urgency + 1)} 次提醒</span>` : '';
   const price = t.quote ? fmtMoney(t.quote.price) : '—';
   const stale = t.quote && t.quote.stale ? '<span class="tag urgent">行情延迟</span>' : '';
@@ -465,9 +465,9 @@ function ticketCardHtml(t, noteOpen){
   const strat = t.strategy_id != null
     ? `<button type="button" class="linkish js-strategy">查看策略成绩单</button>`
     : '';
-  return `<div class="card ticket" data-id="${esc(t.id)}" data-expires="${esc(isFinite(exp) ? exp : '')}">
+  return `<div class="card ticket" data-id="${esc(t.id)}" data-deadline="${esc(deadline)}">
     <div class="ticket-head">
-      <span class="code">${esc(t.code)}</span>${sideHtml(t.side)}
+      <span class="code">${esc(t.code)}</span>${nameSuffixHtml(t)}${sideHtml(t.side)}
       <span class="tag">${esc(sourceLabel(t.source))}</span>${urgent}${stale}
       <span class="countdown"></span>
     </div>
@@ -572,7 +572,7 @@ async function loadWorking(){
   const rows = list.map(t => {
     const left = Math.max(0, (Number(t.qty) || 0) - (Number(t.filled_qty) || 0));
     return `<tr data-id="${esc(t.id)}">
-      <td>${esc(t.code)}</td>
+      <td>${esc(t.code)}${nameSuffixHtml(t)}</td>
       <td>${sideHtml(t.side)}</td>
       <td>${esc(t.qty)}</td>
       <td>${esc(t.filled_qty)}</td>
@@ -613,7 +613,7 @@ async function loadDone(){
   const rows = list.map(t => `<tr>
       <td>${esc(fmtTime(t.created_at))}</td>
       <td>${esc(accountLabel(t.account))}</td>
-      <td>${esc(t.code)}</td>
+      <td>${esc(t.code)}${nameSuffixHtml(t)}</td>
       <td>${sideHtml(t.side)}</td>
       <td>${esc(t.qty)} / ${esc(t.filled_qty)}</td>
       <td>${esc(statusLabel(t.status))}</td>
@@ -1334,7 +1334,7 @@ a{color:#2563eb}
 </div>
 <script>
 // esc / confirmState / fmtMoney / fmtPct / fmtCountdown / sideLabel / sourceLabel /
-// statusLabel / parseLocalTs 与 TRADE_HTML 保持一致，由测试 shared_helpers_are_identical_in_both_pages 校验
+// statusLabel 与 TRADE_HTML 保持一致，由测试 shared_helpers_are_identical_in_both_pages 校验
 // （本页独立、不 import TRADE_HTML 的脚本，这几个小工具函数按 brief 允许重复实现，
 // 用单测保证两边字节级一致，不会悄悄走样；其余逻辑均为本页独有，不与 TRADE_HTML 共享）。
 
@@ -1363,7 +1363,7 @@ function sideLabel(side){
 }
 
 function sourceLabel(src){
-  return { exit: '止盈止损', strategy: '策略信号', mover: '实时异动', manual: '手动/AI' }[src] || (src || '—');
+  return { exit: '止盈止损', strategy: '日线策略', mover: '异动', manual: '手动' }[src] || (src || '—');
 }
 
 function statusLabel(st){
@@ -1386,12 +1386,6 @@ function confirmState(ticket) {
   return deviated
     ? { text: `价格已偏离 ${fmtPct(ticket.deviation)},仍要确认`, disabled: false, ack: true, warn: true }
     : { text: '确认', disabled: false, ack: false };
-}
-
-// 服务端时间是本地时区的 "YYYY-MM-DD HH:MM:SS"，按本地时间解析
-function parseLocalTs(ts){
-  if (!ts) return NaN;
-  return new Date(String(ts).replace(' ', 'T')).getTime();
 }
 
 const PATH_MATCH = location.pathname.match(/\/trade\/t\/([^/]+)/);
@@ -1451,7 +1445,8 @@ countdownTimer = setInterval(updateCountdown, 1000);
 
 function render(t){
   current = t;
-  expiresMs = parseLocalTs(t.expires_at);
+  // 倒计时以服务端剩余秒数为准:收到响应时刻 + 秒数 = 截止时间(设计裁决 4)。
+  expiresMs = Date.now() + Number(t.expires_in_secs || 0) * 1000;
   const cs = confirmState(t);
   const ok = canConfirm(t);
   const btnText = ok ? cs.text : (t.status === 'pending' ? '已过期' : `工单${statusLabel(t.status)}`);
@@ -1463,9 +1458,10 @@ function render(t){
     ? `<div class="ticket-reason"><span class="k hint">AI 说明：</span>${esc(t.ai_note)}</div>`
     : '';
   const sideCls = t.side === 'buy' ? 'side-buy' : (t.side === 'sell' ? 'side-sell' : '');
+  const nameHtml = t.name ? ` <span class="hint">${esc(t.name)}</span>` : '';
   document.getElementById('app').innerHTML = `<div class="card">
     <div class="ticket-head">
-      <span class="code">${esc(t.code)}</span><span class="${sideCls}">${esc(sideLabel(t.side))}</span>
+      <span class="code">${esc(t.code)}</span>${nameHtml}<span class="${sideCls}">${esc(sideLabel(t.side))}</span>
       <span class="tag">${esc(sourceLabel(t.source))}</span>
       <span class="tag" id="ticket-status">${esc(statusLabel(t.status))}</span>
       <span class="countdown" id="countdown"></span>
@@ -1798,6 +1794,26 @@ mod tests {
         assert!(!body.contains("http://") && !body.contains("https://"));
     }
 
+    /// 倒计时以服务端剩余秒数为准(4c,设计裁决 4):两页都用 `expires_in_secs` 而非解析
+    /// `expires_at` 字符串;`TRADE_HTML` 把截止时间存到卡片的 `data-deadline`。
+    /// 来源标签文案按设计裁决 5 统一。
+    #[tokio::test]
+    async fn countdown_uses_server_seconds_and_source_labels_follow_spec() {
+        for page in [
+            crate::web::trade_page::TRADE_HTML,
+            crate::web::trade_page::SIGNED_TICKET_HTML,
+        ] {
+            assert!(
+                page.contains("expires_in_secs"),
+                "倒计时应以服务端剩余秒数为准"
+            );
+            for label in ["止盈止损", "日线策略", "异动", "手动"] {
+                assert!(page.contains(label), "缺来源文案 {label}");
+            }
+        }
+        assert!(crate::web::trade_page::TRADE_HTML.contains("data-deadline"));
+    }
+
     /// 4b 终审 I1 / I2 / I4 / M1~M6 的页面行为标记:偏离确认带上显示的偏离值、
     /// 页面回到前台即刷新、轮询失败不清空已渲染内容、授权 403 中文提示、
     /// 签名页展示状态 / 保留错误 / 加载失败不判链接失效。
@@ -1911,7 +1927,6 @@ mod tests {
             "sideLabel",
             "sourceLabel",
             "statusLabel",
-            "parseLocalTs",
         ] {
             // 名单里的函数两页都必须有：缺了就失败，而不是跳过（4b 终审 M9）
             let signed_fn = extract_fn(signed, name)

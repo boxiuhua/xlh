@@ -723,31 +723,52 @@ pub fn last_beat(conn: &Connection, name: &str) -> Result<Option<NaiveDateTime>>
     s.as_deref().map(parse_ts).transpose()
 }
 
-/// 信号来源(工单列表展示用);信号不存在返回 None。
-pub fn signal_source(conn: &Connection, signal_id: i64) -> Result<Option<SignalSource>> {
-    let s: Option<String> = conn
-        .query_row(
-            "SELECT source FROM trade_signals WHERE id = ?1",
-            [signal_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    s.as_deref().map(SignalSource::parse).transpose()
+/// 信号展示元数据(工单视图用,4c):来源、理由、AI 备注、来源策略、股票名称,一次查询取齐。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignalMeta {
+    pub source: SignalSource,
+    pub reason: String,
+    pub ai_note: Option<String>,
+    pub strategy_id: Option<i64>,
+    pub name: Option<String>,
 }
 
-/// 信号的 AI 备注与来源策略(工单列表展示用,4b);一次查询取齐,信号不存在时两者为 `None`。
-pub fn signal_ai_note_and_strategy(
-    conn: &Connection,
-    signal_id: i64,
-) -> Result<(Option<String>, Option<i64>)> {
-    Ok(conn
+struct RawSignalMeta {
+    source: String,
+    reason: String,
+    ai_note: Option<String>,
+    strategy_id: Option<i64>,
+    name: Option<String>,
+}
+
+/// 信号展示元数据(工单视图用,4c);替换原先的 `signal_source` / `signal_reason` /
+/// `signal_ai_note_and_strategy` 三次查询。信号不存在返回 `None`。
+pub fn signal_meta(conn: &Connection, signal_id: i64) -> Result<Option<SignalMeta>> {
+    let raw: Option<RawSignalMeta> = conn
         .query_row(
-            "SELECT ai_note, strategy_id FROM trade_signals WHERE id = ?1",
+            "SELECT source, reason, ai_note, strategy_id, name FROM trade_signals WHERE id = ?1",
             [signal_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| {
+                Ok(RawSignalMeta {
+                    source: r.get(0)?,
+                    reason: r.get(1)?,
+                    ai_note: r.get(2)?,
+                    strategy_id: r.get(3)?,
+                    name: r.get(4)?,
+                })
+            },
         )
-        .optional()?
-        .unwrap_or((None, None)))
+        .optional()?;
+    raw.map(|r| {
+        Ok(SignalMeta {
+            source: SignalSource::parse(&r.source)?,
+            reason: r.reason,
+            ai_note: r.ai_note,
+            strategy_id: r.strategy_id,
+            name: r.name,
+        })
+    })
+    .transpose()
 }
 
 /// 被闸门拦下的信号(计划 4a:让用户看到「为什么没出工单」)。
@@ -2054,19 +2075,15 @@ mod tests {
         );
     }
 
-    /// `signal_ai_note_and_strategy` 一次查询取齐 `ai_note` / `strategy_id`;
-    /// 信号不存在时两者为 `None`,而非报错(4b)。
+    /// `signal_meta` 一次查询取齐来源 / 理由 / AI 备注 / 来源策略 / 股票名称(4c);
+    /// 信号不存在返回 `None`。
     #[test]
-    fn signal_ai_note_and_strategy_reads_both_and_defaults_when_missing() {
+    fn signal_meta_reads_all_display_fields_in_one_row() {
         use crate::event::Direction;
         use crate::trade::ticket::insert_signal;
 
         let c = db();
-        assert_eq!(
-            signal_ai_note_and_strategy(&c, 999).unwrap(),
-            (None, None),
-            "信号不存在"
-        );
+        assert_eq!(signal_meta(&c, 999).unwrap(), None, "信号不存在");
 
         let sid = insert_signal(
             &c,
@@ -2075,13 +2092,13 @@ mod tests {
                 source: SignalSource::Strategy,
                 strategy_id: Some(7),
                 code: "600000".into(),
-                name: None,
+                name: Some("浦发银行".into()),
                 side: Direction::Buy,
                 scope: AccountScope::RealOnly,
                 ref_price: 10.0,
                 reason: "策略触发".into(),
                 ai_note: Some("AI: 趋势向上".into()),
-                dedup_key: "ai-note-test".into(),
+                dedup_key: "signal-meta-test".into(),
                 suggest_cash: Some(5_000.0),
                 suggest_qty: None,
             },
@@ -2090,31 +2107,14 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(
-            signal_ai_note_and_strategy(&c, sid).unwrap(),
-            (Some("AI: 趋势向上".into()), Some(7))
+            signal_meta(&c, sid).unwrap(),
+            Some(SignalMeta {
+                source: SignalSource::Strategy,
+                reason: "策略触发".into(),
+                ai_note: Some("AI: 趋势向上".into()),
+                strategy_id: Some(7),
+                name: Some("浦发银行".into()),
+            })
         );
-
-        let sid2 = insert_signal(
-            &c,
-            &NewSignal {
-                user_id: 1,
-                source: SignalSource::Manual,
-                strategy_id: None,
-                code: "600000".into(),
-                name: None,
-                side: Direction::Buy,
-                scope: AccountScope::RealOnly,
-                ref_price: 10.0,
-                reason: "手动".into(),
-                ai_note: None,
-                dedup_key: "ai-note-test-2".into(),
-                suggest_cash: Some(5_000.0),
-                suggest_qty: None,
-            },
-            at(15, 9, 1),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(signal_ai_note_and_strategy(&c, sid2).unwrap(), (None, None));
     }
 }

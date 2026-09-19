@@ -22,7 +22,7 @@ use crate::trade::model::{
     Ticket, TicketStatus,
 };
 use crate::trade::ticket::{self as tk, Transition};
-use crate::trade::{notify, settings, store};
+use crate::trade::{settings, store};
 use crate::web::auth::config::AuthCfg;
 use crate::web::auth::model::LicenseStatus;
 use crate::web::auth::store as auth_store;
@@ -204,13 +204,16 @@ struct TicketView {
     ai_note: Option<String>,
     /// 来自信号的来源策略。
     strategy_id: Option<i64>,
+    /// 股票名称(来自信号,4c);手动信号未填名称时为 `None`。
+    name: Option<String>,
+    /// 服务端计算的工单剩余有效秒数,下限 0(4c:倒计时以服务端为准,不再由前端解析时间字符串)。
+    expires_in_secs: i64,
 }
 
 fn ticket_view(conn: &Connection, t: Ticket, now: NaiveDateTime) -> anyhow::Result<TicketView> {
-    let source = store::signal_source(conn, t.signal_id)?;
-    // reason 的读取错误不再吞掉(4a 遗留):信号缺失等内部错误应上抛为 500,而不是静默空字符串。
-    let reason = notify::signal_reason(conn, t.signal_id)?;
-    let (ai_note, strategy_id) = store::signal_ai_note_and_strategy(conn, t.signal_id)?;
+    // 一次查询取齐信号展示元数据(4c);信号缺失等内部错误应上抛为 500,而不是静默空字符串(4a 遗留)。
+    let meta = store::signal_meta(conn, t.signal_id)?
+        .ok_or_else(|| anyhow::anyhow!("信号 {} 不存在", t.signal_id))?;
     let q = store::get_quote(conn, &t.code)?;
     let deviation = q
         .as_ref()
@@ -226,16 +229,19 @@ fn ticket_view(conn: &Connection, t: Ticket, now: NaiveDateTime) -> anyhow::Resu
         Direction::Buy => fee_model.buy_fee(est_amount),
         Direction::Sell => fee_model.sell_fee(t.qty as f64, t.suggest_price, 0),
     };
+    let expires_in_secs = (t.expires_at - now).num_seconds().max(0);
     Ok(TicketView {
+        source: Some(meta.source),
+        reason: meta.reason,
+        ai_note: meta.ai_note,
+        strategy_id: meta.strategy_id,
+        name: meta.name,
+        expires_in_secs,
         ticket: t,
-        source,
-        reason,
         quote,
         deviation,
         est_amount,
         est_fee,
-        ai_note,
-        strategy_id,
     })
 }
 
@@ -928,7 +934,7 @@ mod tests {
             source: SignalSource::Manual,
             strategy_id: None,
             code: code.into(),
-            name: None,
+            name: Some("浦发银行".into()),
             side: Direction::Buy,
             scope: AccountScope::RealOnly,
             ref_price: 10.0,
@@ -977,6 +983,11 @@ mod tests {
         );
         assert!(list[0]["est_fee"].as_f64().unwrap() > 0.0);
         assert!(list[0]["strategy_id"].is_null(), "手动信号无来源策略");
+        assert!(
+            list[0]["expires_in_secs"].as_i64().unwrap() > 0,
+            "倒计时以服务端剩余秒数为准"
+        );
+        assert_eq!(list[0]["name"], "浦发银行");
 
         let url = format!("/api/trade/tickets/{id}/confirm");
         let (s, e) = call(&st, "POST", &url, "t1", Some(serde_json::json!({}))).await;
