@@ -154,6 +154,12 @@ CREATE INDEX IF NOT EXISTS idx_trade_eval_jobs_status ON trade_eval_jobs(status,
 -- SELECT 判重会有竞态,真正兜底的是这条唯一索引;上面的 SELECT 只是快路径。
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_eval_jobs_pending
   ON trade_eval_jobs(user_id, strategy_id, kind) WHERE status IN ('queued', 'running');
+
+CREATE TABLE IF NOT EXISTS trade_calendar (
+  day        TEXT PRIMARY KEY,
+  is_open    INTEGER NOT NULL,
+  checked_at TEXT NOT NULL
+);
 "#;
 
 /// 表已存在但缺列时补建:`CREATE TABLE IF NOT EXISTS` 对已存在的旧表是空操作,
@@ -1280,7 +1286,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 12);
+        assert_eq!(n, 13);
     }
 
     #[test]
