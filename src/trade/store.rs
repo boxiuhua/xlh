@@ -7,6 +7,7 @@ use crate::trade::model::{
 use anyhow::{anyhow, Context, Result};
 use chrono::{NaiveDate, NaiveDateTime};
 use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde::Serialize;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS trade_accounts (
@@ -186,6 +187,18 @@ CREATE TABLE IF NOT EXISTS trade_strategy_plans (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_strategy_plans_key
   ON trade_strategy_plans(strategy_id, code, basis_date);
 CREATE INDEX IF NOT EXISTS idx_trade_strategy_plans_status ON trade_strategy_plans(status, basis_date);
+
+CREATE TABLE IF NOT EXISTS trade_position_adjusts (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     INTEGER NOT NULL,
+  account     TEXT NOT NULL,
+  code        TEXT NOT NULL,
+  before_json TEXT,
+  after_json  TEXT,
+  reason      TEXT NOT NULL,
+  at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trade_position_adjusts_user ON trade_position_adjusts(user_id, id);
 "#;
 
 /// 表已存在但缺列时补建:`CREATE TABLE IF NOT EXISTS` 对已存在的旧表是空操作,
@@ -431,6 +444,95 @@ pub fn upsert_position(conn: &Connection, p: &Position, now: NaiveDateTime) -> R
         ],
     )?;
     Ok(())
+}
+
+/// 删除一行持仓(实盘持仓校准归零用)。返回是否确有该行。
+pub fn delete_position(
+    conn: &Connection,
+    user_id: i64,
+    account: Account,
+    code: &str,
+) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM trade_positions WHERE user_id = ?1 AND account = ?2 AND code = ?3",
+        params![user_id, account.as_str(), code],
+    )?;
+    Ok(n > 0)
+}
+
+/// 持仓校准留痕(计划 4a):改前 / 改后各以 `Position` 的 JSON 快照存,没有则 NULL。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PositionAdjust {
+    pub id: i64,
+    pub code: String,
+    pub before: Option<serde_json::Value>,
+    pub after: Option<serde_json::Value>,
+    pub reason: String,
+    pub at: NaiveDateTime,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_position_adjust(
+    conn: &Connection,
+    user_id: i64,
+    account: Account,
+    code: &str,
+    before: Option<serde_json::Value>,
+    after: Option<serde_json::Value>,
+    reason: &str,
+    now: NaiveDateTime,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO trade_position_adjusts (user_id, account, code, before_json, after_json, reason, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            user_id,
+            account.as_str(),
+            code,
+            before.map(|v| v.to_string()),
+            after.map(|v| v.to_string()),
+            reason,
+            fmt_ts(now),
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn list_adjusts(conn: &Connection, user_id: i64, limit: usize) -> Result<Vec<PositionAdjust>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, code, before_json, after_json, reason, at FROM trade_position_adjusts
+         WHERE user_id = ?1 ORDER BY id DESC LIMIT ?2",
+    )?;
+    let raws = stmt
+        .query_map(params![user_id, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    raws.into_iter()
+        .map(|(id, code, before, after, reason, at)| {
+            Ok(PositionAdjust {
+                id,
+                code,
+                before: before
+                    .map(|s| serde_json::from_str(&s))
+                    .transpose()
+                    .context("持仓校准前值格式错误")?,
+                after: after
+                    .map(|s| serde_json::from_str(&s))
+                    .transpose()
+                    .context("持仓校准后值格式错误")?,
+                reason,
+                at: parse_ts(&at)?,
+            })
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1362,7 +1464,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 15);
+        assert_eq!(n, 16);
     }
 
     #[test]
