@@ -30,6 +30,15 @@ pub fn quote_is_stale(quote_ts: NaiveDateTime, now: NaiveDateTime) -> bool {
     (now - quote_ts).num_seconds() > QUOTE_MAX_AGE_SECS
 }
 
+/// 手动工单能否生成(4c 遗留,design decision 4):交易时段内、15:00 之前、且当日
+/// 未被交易日历证实休市(未证实的工作日按开市处理,与 `calendar::is_trading_day` 同口径)。
+/// `submit_manual` 与 Web 层 handler 的时段判断都用它,保证生成与「非交易时段」文案一致。
+pub fn manual_session(conn: &Connection, now: NaiveDateTime) -> Result<bool> {
+    Ok(crate::trade::monitor::is_session(now)
+        && now.time() < chrono::NaiveTime::from_hms_opt(15, 0, 0).unwrap()
+        && crate::trade::calendar::day_status(conn, now.date())? != Some(false))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfirmError {
     /// 工单不存在,或不属于该用户(跨用户视为不存在)。
@@ -498,7 +507,7 @@ pub fn submit_manual(
     now: NaiveDateTime,
 ) -> Result<ManualOutcome> {
     validate_manual(o)?;
-    if !crate::trade::monitor::is_session(now) {
+    if !manual_session(conn, now)? {
         return Ok(ManualOutcome::NoQuote);
     }
     let Some(q) = quote
@@ -1397,18 +1406,80 @@ mod tests {
             ManualOutcome::NoQuote,
             "周末不生成工单"
         );
-        // 边界:盘中、恰好 60 秒 → 放行
+        // 边界:14:59:59,行情 59 秒前 → 仍在 15:00 截止之前,放行(4c 遗留)
         assert!(matches!(
             submit_manual(
                 &mut c,
                 1,
                 &o,
                 Some(&quote(10.0, at(14, 59, 0))),
-                at(15, 0, 0)
+                at(14, 59, 59)
             )
             .unwrap(),
             ManualOutcome::Ticketed { .. }
         ));
+    }
+
+    /// 4c 遗留:手动工单 15:00 截止——即使行情新鲜、仍在 `monitor::is_session` 认为的
+    /// 时段内(该函数按分钟计,不含秒),15:00:00 与 15:00:59 都应视为非交易时段。
+    #[test]
+    fn manual_cuts_off_at_15_00_even_if_quote_is_fresh() {
+        let mut c = db();
+        let o = manual(Direction::Buy, "req-1500");
+        for (i, t) in [at(15, 0, 0), at(15, 0, 59)].into_iter().enumerate() {
+            let o = ManualOrder {
+                request_id: format!("req-1500-{i}"),
+                ..o.clone()
+            };
+            assert_eq!(
+                submit_manual(&mut c, 1, &o, Some(&quote(10.0, at(14, 59, 30))), t).unwrap(),
+                ManualOutcome::NoQuote,
+                "{t} 应视为非交易时段"
+            );
+        }
+    }
+
+    /// 4c 遗留:交易日历证实当日休市时,即使处于常规交易时间段内也不生成工单,
+    /// 与非交易时段返回同一 `NoQuote`(web 层据此映射到同一提示文案)。
+    #[test]
+    fn manual_session_is_false_on_a_calendar_confirmed_holiday() {
+        let c = db();
+        // 2026-09-23(周三)默认按开市处理
+        assert!(manual_session(&c, at(10, 0, 0)).unwrap());
+        crate::trade::calendar::mark_day(&c, at(10, 0, 0).date(), false, at(9, 0, 0)).unwrap();
+        assert!(!manual_session(&c, at(10, 0, 0)).unwrap(), "被证实休市");
+        // 后来的证据可以纠正回开市
+        crate::trade::calendar::mark_day(&c, at(10, 0, 0).date(), true, at(9, 0, 1)).unwrap();
+        assert!(manual_session(&c, at(10, 0, 0)).unwrap());
+    }
+
+    /// 4c 遗留:calendar 证实休市 → `submit_manual` 同非交易时段一样返回 `NoQuote`。
+    #[test]
+    fn submit_manual_rejects_on_a_calendar_confirmed_holiday() {
+        let mut c = db();
+        crate::trade::calendar::mark_day(&c, at(10, 0, 0).date(), false, at(9, 0, 0)).unwrap();
+        let o = manual(Direction::Buy, "req-holiday");
+        assert_eq!(
+            submit_manual(
+                &mut c,
+                1,
+                &o,
+                Some(&quote(10.0, at(10, 0, 0))),
+                at(10, 0, 0)
+            )
+            .unwrap(),
+            ManualOutcome::NoQuote,
+            "被证实休市当日不生成工单"
+        );
+    }
+
+    /// `manual_session` 单测:15:00:00 与 15:00:59 → 非交易时段;14:59:59 → 交易时段内。
+    #[test]
+    fn manual_session_cuts_off_at_15_00() {
+        let c = db();
+        assert!(manual_session(&c, at(14, 59, 59)).unwrap());
+        assert!(!manual_session(&c, at(15, 0, 0)).unwrap());
+        assert!(!manual_session(&c, at(15, 0, 59)).unwrap());
     }
 
     #[test]

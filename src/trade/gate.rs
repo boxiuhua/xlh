@@ -667,6 +667,34 @@ mod tests {
     }
 
     #[test]
+    fn all_lists_every_variant_once() {
+        // 新增变体时这里的 match 会编译失败,提醒同步 ALL
+        fn index(r: GateReject) -> usize {
+            match r {
+                GateReject::TradingDisabled => 0,
+                GateReject::DuplicateOpenTicket => 1,
+                GateReject::Cooldown => 2,
+                GateReject::NotAdmitted => 3,
+                GateReject::NoQuote => 4,
+                GateReject::LimitUp => 5,
+                GateReject::LimitDown => 6,
+                GateReject::DailyTicketCap => 7,
+                GateReject::DailyLossHalt => 8,
+                GateReject::NoCapital => 9,
+                GateReject::BelowOneLot => 10,
+                GateReject::NothingSellable => 11,
+            }
+        }
+        let mut seen = [false; 12];
+        for r in GateReject::ALL {
+            let i = index(r);
+            assert!(!seen[i], "{r:?} 重复");
+            seen[i] = true;
+        }
+        assert!(seen.iter().all(|s| *s), "ALL 缺变体");
+    }
+
+    #[test]
     fn reject_reason_strings() {
         assert_eq!(GateReject::BelowOneLot.as_str(), "below_one_lot");
         assert_eq!(

@@ -27,7 +27,7 @@ use crate::trade::model::{
 };
 use crate::trade::quotes::{QuoteSource, TencentQuotes};
 use crate::trade::ticket::{self as tk, Transition};
-use crate::trade::{monitor, settings, store};
+use crate::trade::{settings, store};
 use crate::web::auth::config::AuthCfg;
 use crate::web::auth::model::LicenseStatus;
 use crate::web::auth::store as auth_store;
@@ -198,7 +198,7 @@ struct QuoteView {
 struct TicketView {
     #[serde(flatten)]
     ticket: Ticket,
-    source: Option<SignalSource>,
+    source: SignalSource,
     reason: String,
     quote: Option<QuoteView>,
     deviation: Option<f64>,
@@ -237,7 +237,7 @@ fn ticket_view(conn: &Connection, t: Ticket, now: NaiveDateTime) -> anyhow::Resu
     };
     let expires_in_secs = (t.expires_at - now).num_seconds().max(0);
     Ok(TicketView {
-        source: Some(meta.source),
+        source: meta.source,
         reason: meta.reason,
         ai_note: meta.ai_note,
         strategy_id: meta.strategy_id,
@@ -534,7 +534,9 @@ async fn manual_ticket(
 
 /// `manual_ticket` 的主体,时钟与补拉行情可注入(测试用固定时刻与桩,不依赖挂钟、不联网)。
 ///
-/// 1. 校验字段;非交易时段直接 400,不查缓存也不联网(终审 I1)。
+/// 1. 校验字段;非交易时段(含 15:00 之后、交易日历证实的休市日,`actions::manual_session`,
+///    4c 遗留)直接 400,不查缓存也不联网(终审 I1)——日历判断需要读库,故在锁内做,
+///    紧邻着同一把锁里的缓存查询;补拉行情仍在锁外(顺序同此前)。
 /// 2. 先用缓存(≤60s);未命中则锁外补拉,限时 `fetch_timeout`;失败 / 超时记日志并
 ///    返回「行情获取失败」(M1/M3),不把网络错误变成 500。
 /// 3. 补拉后重新取时刻(M3),持锁提交;补拉结果写缓存,但不覆盖期间别处写入的
@@ -554,11 +556,11 @@ where
 {
     actions::validate_manual(&o).map_err(|e| ApiError::bad(e.to_string()))?;
     let now = clock();
-    if !monitor::is_session(now) {
-        return Err(no_quote(MANUAL_OFF_SESSION));
-    }
     let cached = {
         let conn = st.db.lock().unwrap();
+        if !actions::manual_session(&conn, now)? {
+            return Err(no_quote(MANUAL_OFF_SESSION));
+        }
         store::fresh_quote(&conn, &o.code, now, actions::QUOTE_MAX_AGE_SECS)?
     };
     let fetched = match cached {
@@ -608,7 +610,7 @@ where
             e.extra = Some(json!({ "reason": r.as_str() }));
             return Err(e);
         }
-        ManualOutcome::NoQuote if !monitor::is_session(now) => {
+        ManualOutcome::NoQuote if !actions::manual_session(&conn, now)? => {
             return Err(no_quote(MANUAL_OFF_SESSION))
         }
         ManualOutcome::NoQuote => return Err(no_quote(MANUAL_NO_TODAY_QUOTE)),
@@ -1998,7 +2000,14 @@ mod tests {
             .unwrap()
             .and_hms_opt(10, 0, 0)
             .unwrap();
-        let times = [wed(16, 0, 0), wed(12, 0, 0), wed(9, 29, 59), sat];
+        let times = [
+            wed(16, 0, 0),
+            wed(12, 0, 0),
+            wed(9, 29, 59),
+            wed(15, 0, 0),
+            wed(15, 0, 59),
+            sat,
+        ];
         for (i, t) in times.into_iter().enumerate() {
             // 缓存里放一条「看起来新鲜」的行情,证明时段检查在前
             cache_quote(&st, q600000(10.0, t));
@@ -2014,6 +2023,31 @@ mod tests {
                 "{t}"
             );
         }
+    }
+
+    /// 4c 遗留:交易日历证实当日休市 → 与非交易时段同一提示,不查缓存也不联网,
+    /// 即使处于常规交易时间段内、缓存里也有「看起来新鲜」的行情。
+    #[tokio::test]
+    async fn manual_ticket_off_on_a_calendar_confirmed_holiday() {
+        let st = state();
+        let uid = seed_user(&st, "u", "t");
+        seed_capital(&st, uid);
+        {
+            let c = st.db.lock().unwrap();
+            crate::trade::calendar::mark_day(&c, wed(10, 0, 0).date(), false, wed(9, 0, 0))
+                .unwrap();
+        }
+        cache_quote(&st, q600000(10.0, wed(10, 0, 0)));
+        let o = manual_order("holiday-1", "buy");
+        let r = manual_ticket_at(&st, uid, o, || wed(10, 0, 5), no_fetch, FAST).await;
+        assert_eq!(
+            expect_err(r),
+            (
+                StatusCode::BAD_REQUEST,
+                "no_quote",
+                MANUAL_OFF_SESSION.to_string()
+            )
+        );
     }
 
     /// 补拉失败 / 超时:400 no_quote「行情获取失败」;补拉成功但无今日行情:原文案(M1/M3)。

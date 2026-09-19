@@ -1383,6 +1383,11 @@ function statusLabel(st){
   }[st] || (st || '—');
 }
 
+// 代码后显示股票名称的后缀（有则显示，否则为空），返回已转义的 HTML 片段（4c）
+function nameSuffixHtml(t){
+  return t.name ? ` <span class="hint">${esc(t.name)}</span>` : '';
+}
+
 // 与 Task 3 待确认卡片相同的规则（设计裁决 4）：无报价或行情延迟禁用；
 // 偏离超阈值时按钮初始就带二次确认文案，一次点击即带 ack。
 function confirmState(ticket) {
@@ -1462,7 +1467,7 @@ function render(t){
     ? `<div class="ticket-reason"><span class="k hint">AI 说明：</span>${esc(t.ai_note)}</div>`
     : '';
   const sideCls = t.side === 'buy' ? 'side-buy' : (t.side === 'sell' ? 'side-sell' : '');
-  const nameHtml = t.name ? ` <span class="hint">${esc(t.name)}</span>` : '';
+  const nameHtml = nameSuffixHtml(t);
   document.getElementById('app').innerHTML = `<div class="card">
     <div class="ticket-head">
       <span class="code">${esc(t.code)}</span>${nameHtml}<span class="${sideCls}">${esc(sideLabel(t.side))}</span>
@@ -1931,6 +1936,7 @@ mod tests {
             "sideLabel",
             "sourceLabel",
             "statusLabel",
+            "nameSuffixHtml",
         ] {
             // 名单里的函数两页都必须有：缺了就失败，而不是跳过（4b 终审 M9）
             let signed_fn = extract_fn(signed, name)
