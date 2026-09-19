@@ -489,17 +489,24 @@ pub fn submit_manual(
     let Some(q) = quote.filter(|q| q.ts.date() == now.date() && q.code == o.code) else {
         return Ok(ManualOutcome::NoQuote);
     };
+    // name / ai_note:去空白后空串视为 None(brief 校验表)。
+    let trim_to_none = |s: &Option<String>| -> Option<String> {
+        s.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
     let sig = NewSignal {
         user_id,
         source: SignalSource::Manual,
         strategy_id: None,
         code: o.code.clone(),
-        name: o.name.clone(),
+        name: trim_to_none(&o.name),
         side: o.side,
         scope: AccountScope::Both,
         ref_price: q.price,
         reason: o.reason.trim().to_string(),
-        ai_note: o.ai_note.clone(),
+        ai_note: trim_to_none(&o.ai_note),
         dedup_key: format!("manual-{}", o.request_id),
         suggest_cash: o.amount,
         suggest_qty: o.qty,
@@ -1268,6 +1275,29 @@ mod tests {
         let meta = store::signal_meta(&c, t.signal_id).unwrap().unwrap();
         assert_eq!(meta.name.as_deref(), Some("浦发银行"));
         assert_eq!(meta.ai_note.as_deref(), Some("AI:估值偏低"));
+    }
+
+    #[test]
+    fn manual_blank_name_and_empty_ai_note_become_none() {
+        let mut c = db();
+        let q = quote(10.0, at(10, 0, 0));
+        let o = ManualOrder {
+            name: Some("  ".into()),
+            ai_note: Some("".into()),
+            ..manual(Direction::Buy, "req-blank")
+        };
+        let r = submit_manual(&mut c, 1, &o, Some(&q), at(10, 0, 0)).unwrap();
+        let ManualOutcome::Ticketed {
+            real_ticket: Some(real),
+            ..
+        } = r
+        else {
+            panic!("{r:?}");
+        };
+        let t = crate::trade::ticket::get_ticket(&c, real).unwrap().unwrap();
+        let meta = store::signal_meta(&c, t.signal_id).unwrap().unwrap();
+        assert_eq!(meta.name, None, "空白名称视为 None");
+        assert_eq!(meta.ai_note, None, "空串 AI 备注视为 None");
     }
 
     #[test]
