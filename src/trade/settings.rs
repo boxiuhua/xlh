@@ -9,6 +9,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 const KILL_SWITCH: &str = "kill_switch";
 const LINK_SECRET: &str = "link_secret";
+/// 签名密钥字节数(design decision 3)。
+const SECRET_LEN: usize = 32;
 
 fn get(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn
@@ -42,7 +44,7 @@ pub fn set_kill_switch(conn: &Connection, on: bool, now: NaiveDateTime) -> Resul
 /// 两个进程同时首次调用也只会留下一把。
 pub fn link_secret(conn: &Connection) -> Result<Vec<u8>> {
     if get(conn, LINK_SECRET)?.is_none() {
-        let mut buf = [0u8; 32];
+        let mut buf = [0u8; SECRET_LEN];
         rand::thread_rng().fill_bytes(&mut buf);
         conn.execute(
             "INSERT OR IGNORE INTO trade_settings (key, value, updated_at) VALUES (?1, ?2, ?3)",
@@ -61,13 +63,21 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// 解码十六进制密钥,且必须恰好 32 字节:过短 / 空的密钥会让签名可被伪造。
+/// 按字节处理,非 ASCII 输入返回错误而不会在字符中间切片 panic。
 fn unhex(s: &str) -> Result<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return Err(anyhow!("签名密钥格式错误"));
+    let bytes = s.as_bytes();
+    if bytes.len() != SECRET_LEN * 2 {
+        return Err(anyhow!("签名密钥长度错误:须为 {SECRET_LEN} 字节"));
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow!("签名密钥格式错误: {e}")))
+    let nibble = |b: u8| {
+        (b as char)
+            .to_digit(16)
+            .ok_or_else(|| anyhow!("签名密钥格式错误"))
+    };
+    bytes
+        .chunks_exact(2)
+        .map(|p| Ok((nibble(p[0])? * 16 + nibble(p[1])?) as u8))
         .collect()
 }
 
@@ -98,6 +108,23 @@ mod tests {
         assert!(kill_switch(&c).unwrap());
         set_kill_switch(&c, false, now()).unwrap();
         assert!(!kill_switch(&c).unwrap());
+    }
+
+    #[test]
+    fn link_secret_rejects_stored_secret_that_is_not_32_bytes() {
+        let c = db();
+        // 过短 / 空的密钥会让签名可被伪造:必须报错而不是照用
+        for bad in ["", "abcd", &"ab".repeat(31), &"ab".repeat(33)] {
+            put(&c, LINK_SECRET, bad, now()).unwrap();
+            assert!(link_secret(&c).is_err(), "长度不对应报错: {bad:?}");
+        }
+        // 非 ASCII(按字节切片会在字符中间切断)不得 panic
+        put(&c, LINK_SECRET, &"é".repeat(32), now()).unwrap();
+        assert!(link_secret(&c).is_err());
+        put(&c, LINK_SECRET, &"zz".repeat(32), now()).unwrap();
+        assert!(link_secret(&c).is_err());
+        put(&c, LINK_SECRET, &"0f".repeat(32), now()).unwrap();
+        assert_eq!(link_secret(&c).unwrap(), vec![0x0f; 32]);
     }
 
     #[test]
