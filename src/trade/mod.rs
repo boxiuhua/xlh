@@ -16,6 +16,7 @@ pub mod movers;
 pub mod notify;
 pub mod plans;
 pub mod quotes;
+pub mod report;
 pub mod router;
 pub mod service;
 pub mod settings;

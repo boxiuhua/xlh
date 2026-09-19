@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// 策略准入阈值(spec §10.4)。管理员可在 `[trade.admission]` 调整;用户侧只可调严。
+/// 策略准入阈值(spec §10.4)。管理员可在 `[trade.admission]` 调整;暂不支持按用户调整。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AdmissionCfg {
@@ -185,6 +185,11 @@ pub struct TradeCfg {
     pub signals: SignalCfg,
     /// 推送里工单链接的站点根地址(如 https://xlh.example.com);为空则不带链接
     pub link_base_url: String,
+    /// 是否收盘后推送交易日报(计划 5)
+    pub daily_report: bool,
+    /// 日报发出窗口起点(须收盘后、18:00 前)
+    pub daily_report_hour: u32,
+    pub daily_report_minute: u32,
 }
 
 impl Default for TradeCfg {
@@ -200,6 +205,9 @@ impl Default for TradeCfg {
             eval: EvalCfg::default(),
             signals: SignalCfg::default(),
             link_base_url: String::new(),
+            daily_report: true,
+            daily_report_hour: 15,
+            daily_report_minute: 35,
         }
     }
 }
@@ -463,6 +471,18 @@ pub fn from_toml_str(text: &str) -> Result<TradeCfg> {
             s.emit_end_minute
         ));
     }
+    if !(15..=17).contains(&cfg.daily_report_hour) {
+        return Err(anyhow!(
+            "[trade] daily_report_hour 须在 [15,17](收盘后、窗口结束 18:00 前),当前 {}",
+            cfg.daily_report_hour
+        ));
+    }
+    if cfg.daily_report_minute > 59 {
+        return Err(anyhow!(
+            "[trade] daily_report_minute 须在 0..=59,当前 {}",
+            cfg.daily_report_minute
+        ));
+    }
     Ok(cfg)
 }
 
@@ -714,6 +734,21 @@ mod tests {
         assert!(
             from_toml_str("[trade]\nlink_base_url = \"x\"\n").is_err(),
             "只允许 http(s)://"
+        );
+    }
+
+    #[test]
+    fn daily_report_defaults_and_validation() {
+        let c = from_toml_str("").unwrap();
+        assert!(c.daily_report);
+        assert_eq!((c.daily_report_hour, c.daily_report_minute), (15, 35));
+        assert!(from_toml_str("[trade]\ndaily_report_hour = 14").is_err());
+        assert!(from_toml_str("[trade]\ndaily_report_hour = 18").is_err());
+        assert!(from_toml_str("[trade]\ndaily_report_minute = 60").is_err());
+        assert!(
+            !from_toml_str("[trade]\ndaily_report = false")
+                .unwrap()
+                .daily_report
         );
     }
 
