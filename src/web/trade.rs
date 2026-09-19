@@ -391,9 +391,9 @@ async fn post_risk(
     body: Result<Json<RiskRules>, JsonRejection>,
 ) -> ApiResult<serde_json::Value> {
     let Json(rules) = body?;
+    rules.validate().map_err(|e| ApiError::bad(e.to_string()))?;
     let conn = st.db.lock().unwrap();
-    store::save_risk_rules(&conn, user.id, &rules, now())
-        .map_err(|e| ApiError::bad(e.to_string()))?;
+    store::save_risk_rules(&conn, user.id, &rules, now())?;
     Ok(ok())
 }
 
@@ -410,9 +410,11 @@ async fn set_capital(
 ) -> ApiResult<serde_json::Value> {
     let Json(body) = body?;
     let account = Account::parse(&body.account).map_err(|e| ApiError::bad(e.to_string()))?;
+    if !(body.total.is_finite() && body.total > 0.0) {
+        return Err(ApiError::bad("账户总资金必须为正数"));
+    }
     let conn = st.db.lock().unwrap();
-    store::set_capital(&conn, user.id, account, body.total, now())
-        .map_err(|e| ApiError::bad(e.to_string()))?;
+    store::set_capital(&conn, user.id, account, body.total, now())?;
     Ok(ok())
 }
 
@@ -517,28 +519,27 @@ async fn calibrate(
     body: Result<Json<CalibrateBody>, JsonRejection>,
 ) -> ApiResult<serde_json::Value> {
     let Json(body) = body?;
+    let c = actions::Calibration {
+        code: body.code,
+        qty: body.qty,
+        avg_cost: body.avg_cost,
+        reason: body.reason,
+    };
+    actions::validate_calibration(&c).map_err(|e| ApiError::bad(e.to_string()))?;
     let mut conn = st.db.lock().unwrap();
-    actions::calibrate_position(
-        &mut conn,
-        user.id,
-        &actions::Calibration {
-            code: body.code,
-            qty: body.qty,
-            avg_cost: body.avg_cost,
-            reason: body.reason,
-        },
-        now(),
-    )
-    .map_err(|e| ApiError::bad(e.to_string()))?;
+    actions::calibrate_position(&mut conn, user.id, &c, now())?;
     Ok(ok())
 }
+
+/// `/api/trade/positions/adjusts` 最多返回的校准记录数。
+const ADJUSTS_LIMIT: usize = 100;
 
 async fn adjusts(
     State(st): State<AuthState>,
     Extension(user): Extension<CurrentUser>,
 ) -> ApiResult<Vec<store::PositionAdjust>> {
     let conn = st.db.lock().unwrap();
-    Ok(Json(store::list_adjusts(&conn, user.id, DONE_LIMIT)?))
+    Ok(Json(store::list_adjusts(&conn, user.id, ADJUSTS_LIMIT)?))
 }
 
 #[cfg(test)]

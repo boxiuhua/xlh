@@ -111,25 +111,32 @@ pub struct Calibration {
     pub reason: String,
 }
 
-/// 持仓校准:代码须为 6 位数字;`qty` 为 0 时删除实盘持仓,否则 `avg_cost` 须有限且 > 0;
-/// `reason` 去掉首尾空白后不得为空。改前 / 改后各写一条 `trade_position_adjusts`,整体一个
-/// `IMMEDIATE` 事务,失败不留痕。
+/// 持仓校准输入校验:代码须为 6 位数字;`qty` 为 0 时删除实盘持仓,否则 `avg_cost` 须有限
+/// 且 > 0;`reason` 去掉首尾空白后不得为空。独立导出,供 web 层在落库前先行校验(400),
+/// `calibrate_position` 自身也调用它,直接调用方同样受保护。
+pub fn validate_calibration(c: &Calibration) -> Result<()> {
+    if c.code.len() != 6 || !c.code.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(anyhow!("股票代码须为 6 位数字: {}", c.code));
+    }
+    if c.reason.trim().is_empty() {
+        return Err(anyhow!("校准原因不能为空"));
+    }
+    if c.qty > 0 && !(c.avg_cost.is_finite() && c.avg_cost > 0.0) {
+        return Err(anyhow!("持仓成本必须为正数: {}", c.avg_cost));
+    }
+    Ok(())
+}
+
+/// 持仓校准:输入校验见 `validate_calibration`。改前 / 改后各写一条 `trade_position_adjusts`,
+/// 整体一个 `IMMEDIATE` 事务,失败不留痕。
 pub fn calibrate_position(
     conn: &mut Connection,
     user_id: i64,
     c: &Calibration,
     now: NaiveDateTime,
 ) -> Result<()> {
-    if c.code.len() != 6 || !c.code.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(anyhow!("股票代码须为 6 位数字: {}", c.code));
-    }
+    validate_calibration(c)?;
     let reason = c.reason.trim();
-    if reason.is_empty() {
-        return Err(anyhow!("校准原因不能为空"));
-    }
-    if c.qty > 0 && !(c.avg_cost.is_finite() && c.avg_cost > 0.0) {
-        return Err(anyhow!("持仓成本必须为正数: {}", c.avg_cost));
-    }
 
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let before = store::get_position(&tx, user_id, Account::Real, &c.code)?;
@@ -419,6 +426,57 @@ mod tests {
         assert!(
             validate_exit_levels(None, None, Some(0.51)).is_err(),
             "trailing_pct 须 <= 0.5"
+        );
+    }
+
+    #[test]
+    fn validate_calibration_rejects_bad_input() {
+        assert!(validate_calibration(&Calibration {
+            code: "600000".into(),
+            qty: 100,
+            avg_cost: 10.0,
+            reason: "对账".into(),
+        })
+        .is_ok());
+        assert!(
+            validate_calibration(&Calibration {
+                code: "60000".into(),
+                qty: 100,
+                avg_cost: 10.0,
+                reason: "x".into(),
+            })
+            .is_err(),
+            "代码须为 6 位数字"
+        );
+        assert!(
+            validate_calibration(&Calibration {
+                code: "600000".into(),
+                qty: 100,
+                avg_cost: 0.0,
+                reason: "x".into(),
+            })
+            .is_err(),
+            "持仓成本须为正数"
+        );
+        assert!(
+            validate_calibration(&Calibration {
+                code: "600000".into(),
+                qty: 100,
+                avg_cost: 10.0,
+                reason: "  ".into(),
+            })
+            .is_err(),
+            "原因不能为空"
+        );
+        assert!(
+            validate_calibration(&Calibration {
+                code: "600000".into(),
+                qty: 0,
+                avg_cost: 0.0,
+                reason: "清仓".into(),
+            })
+            .is_ok(),
+            "qty 为 0 时不校验 avg_cost"
         );
     }
 
