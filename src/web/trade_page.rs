@@ -429,7 +429,10 @@ async function onIgnore(ticket, btn){
 function fmtCountdown(ms){
   const s = Math.max(0, Math.floor(ms / 1000));
   const p = n => String(n).padStart(2, '0');
-  return `剩 ${p(Math.floor(s / 60))}:${p(s % 60)}`;
+  const h = Math.floor(s / 3600);
+  return h > 0
+    ? `剩 ${h}:${p(Math.floor(s % 3600 / 60))}:${p(s % 60)}`
+    : `剩 ${p(Math.floor(s / 60))}:${p(s % 60)}`;
 }
 
 // 每秒刷新所有待确认卡片的倒计时；到期置灰并禁用操作按钮。
@@ -439,7 +442,6 @@ function tickCountdowns(){
   document.querySelectorAll('#panel-pending .ticket').forEach(card => {
     const el = card.querySelector('.countdown');
     const deadline = Number(card.getAttribute('data-deadline'));
-    if (!deadline || !isFinite(deadline)) { if (el) el.textContent = '有效期未知'; return; }
     const left = deadline - now;
     if (left > 0) { if (el) el.textContent = fmtCountdown(left); return; }
     if (el) el.textContent = '已过期';
@@ -1355,7 +1357,10 @@ function fmtPct(x){
 function fmtCountdown(ms){
   const s = Math.max(0, Math.floor(ms / 1000));
   const p = n => String(n).padStart(2, '0');
-  return `剩 ${p(Math.floor(s / 60))}:${p(s % 60)}`;
+  const h = Math.floor(s / 3600);
+  return h > 0
+    ? `剩 ${h}:${p(Math.floor(s % 3600 / 60))}:${p(s % 60)}`
+    : `剩 ${p(Math.floor(s / 60))}:${p(s % 60)}`;
 }
 
 function sideLabel(side){
@@ -1394,7 +1399,7 @@ const sig = new URLSearchParams(location.search).get('sig') || '';
 const apiBase = `/api/trade/t/${encodeURIComponent(ticketId)}`;
 
 let stopped = false;
-let expiresMs = NaN;
+let expiresMs = 0; // render() 按服务端剩余秒数设置,总是有限值
 // 最近一次确认失败的提示:loadTicket 重绘 #app 后重新贴回,不被立即抹掉(4b 终审 I2)。
 // 新的确认尝试,或工单状态与出错时不同(已有终态可看)时清空。
 let lastErr = '';
@@ -1422,16 +1427,15 @@ function showDone(){
     '<div class="card">已确认。请在券商 App 下单，完成后登录交易页回填成交<br/><a href="/trade">前往交易页</a></div>';
 }
 
-// 只有待确认且未到期的工单可以确认(4b 终审 M1);有效期未知时交给服务端判断
+// 只有待确认且未到期的工单可以确认(4b 终审 M1)
 function canConfirm(t){
   if (!t || t.status !== 'pending') return false;
-  return !isFinite(expiresMs) || expiresMs > Date.now();
+  return expiresMs > Date.now();
 }
 
 function updateCountdown(){
   const el = document.getElementById('countdown');
   if (!el) return;
-  if (!isFinite(expiresMs)) { el.textContent = '有效期未知'; return; }
   const left = expiresMs - Date.now();
   el.textContent = left > 0 ? fmtCountdown(left) : '已过期';
   const btn = document.getElementById('confirm-btn');
@@ -1938,6 +1942,25 @@ mod tests {
                 trade_fn.trim(),
                 "两页的 {name} 实现应保持一致（如需故意不同，请在这里加白名单并写明原因）"
             );
+        }
+    }
+
+    /// 截止时间恒为有限值(服务端剩余秒数,设计裁决 4):不再有「有效期未知」分支;
+    /// 手动工单可剩 5 小时以上,倒计时满 1 小时显示「剩 H:MM:SS」(终审 M10/M11)。
+    /// 行为在 Node 里用桩验证过;这里钉住实现,两页一致由上面的测试保证。
+    #[test]
+    fn countdown_shows_hours_and_has_no_unknown_expiry_branch() {
+        let trade = crate::web::trade_page::TRADE_HTML;
+        let signed = crate::web::trade_page::SIGNED_TICKET_HTML;
+        let f = extract_fn(trade, "fmtCountdown").unwrap();
+        assert!(f.contains("const h = Math.floor(s / 3600);"), "{f}");
+        assert!(
+            f.contains("`剩 ${h}:${p(Math.floor(s % 3600 / 60))}:${p(s % 60)}`"),
+            "{f}"
+        );
+        for page in [trade, signed] {
+            assert!(!page.contains("有效期未知"));
+            assert!(!page.contains("isFinite(expiresMs)"));
         }
     }
 }

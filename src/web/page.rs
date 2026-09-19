@@ -1187,7 +1187,7 @@ function renderStockDiag(d){
   if (tbtn) tbtn.addEventListener('click', function(){
     var side = d.action === 'sell' ? 'sell' : 'buy';
     var prefix = d.action === 'hold' ? '诊断为观望。' : '';
-    var reason = (prefix + '个股诊断:' + (d.signal||'') + ',' + (d.rationale||'')).slice(0,500);
+    var reason = clipChars(prefix + '个股诊断:' + (d.signal||'') + ',' + (d.rationale||''), 500);
     openTicketModal({ code: d.code, name: d.name || '', side: side, reason: reason, aiNote: null });
   });
 }
@@ -1636,7 +1636,7 @@ function loadAiConfig(){
 }
 document.getElementById('ai-load').addEventListener('click',loadAiConfig);
 document.getElementById('ai-save').addEventListener('click',function(){var b=this,m=document.getElementById('ai-config-msg');b.disabled=true;m.textContent='保存中…';fetch('/api/ai/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(aiConfigValue())}).then(function(r){if(!r.ok)return r.text().then(function(x){throw new Error(aiErrorText(x))});return r.json();}).then(function(){m.textContent='模型配置已保存。';}).catch(function(e){m.textContent='保存失败：'+String(e.message||e);}).finally(function(){b.disabled=false;});});
-document.getElementById('ai-run').addEventListener('click',function(){var b=this,code=document.getElementById('ai-code').value.trim(),asset=document.getElementById('ai-asset').value,out=document.getElementById('ai-result'),tbtn=document.getElementById('ai-ticket-btn');tbtn.style.display='none';tbtn.onclick=null;if(!code){out.textContent='请先输入代码。';return;}b.disabled=true;out.textContent='正在生成本地指标并请求模型…';fetch('/api/ai/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({asset_type:asset,code:code})}).then(function(r){if(!r.ok)return r.text().then(function(x){throw new Error(aiErrorText(x))});return r.json();}).then(function(d){out.textContent='模型：'+(d.model||'')+'\n\n'+(d.analysis||'');if(asset==='stock' && /^\d{6}$/.test(code)){tbtn.style.display='';tbtn.onclick=function(){openTicketModal({code:code,name:'',side:'buy',reason:'AI 分析',aiNote:String(d.analysis||'').slice(0,8000)});};}}).catch(function(e){out.textContent='分析失败：'+String(e.message||e);}).finally(function(){b.disabled=false;});});
+document.getElementById('ai-run').addEventListener('click',function(){var b=this,code=document.getElementById('ai-code').value.trim(),asset=document.getElementById('ai-asset').value,out=document.getElementById('ai-result'),tbtn=document.getElementById('ai-ticket-btn');tbtn.style.display='none';tbtn.onclick=null;if(!code){out.textContent='请先输入代码。';return;}b.disabled=true;out.textContent='正在生成本地指标并请求模型…';fetch('/api/ai/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({asset_type:asset,code:code})}).then(function(r){if(!r.ok)return r.text().then(function(x){throw new Error(aiErrorText(x))});return r.json();}).then(function(d){out.textContent='模型：'+(d.model||'')+'\n\n'+(d.analysis||'');if(asset==='stock' && /^\d{6}$/.test(code)){tbtn.style.display='';tbtn.onclick=function(){openTicketModal({code:code,name:'',side:'buy',reason:'AI 分析',aiNote:clipChars(d.analysis||'',8000)});};}}).catch(function(e){out.textContent='分析失败：'+String(e.message||e);}).finally(function(){b.disabled=false;});});
 document.getElementById('ai-optimize-prompt').addEventListener('click',function(){var b=this,d=document.getElementById('ai-prompt-draft').value.trim(),out=document.getElementById('ai-prompt-result');if(!d){out.style.display='block';out.textContent='请先填写提示词需求。';return;}b.disabled=true;out.style.display='block';out.textContent='正在用 DeepSeek 优化提示词…';fetch('/api/ai/optimize-prompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:d})}).then(function(r){if(!r.ok)return r.text().then(function(x){throw new Error(aiErrorText(x))});return r.json();}).then(function(x){out.textContent=x.prompt||'';document.getElementById('ai-use-prompt').disabled=!x.prompt;}).catch(function(e){out.textContent='优化失败：'+String(e.message||e);}).finally(function(){b.disabled=false;});});
 document.getElementById('ai-use-prompt').addEventListener('click',function(){var v=document.getElementById('ai-prompt-result').textContent;if(v){document.getElementById('ai-prompt').value=v;document.getElementById('ai-config-msg').textContent='已写入系统提示词，点击“保存配置”后生效。';}});
 loadAiConfig();
@@ -1809,6 +1809,21 @@ loadPushStatus();
 // ---- 手动工单弹窗（4c：股诊断 / AI 分析结果一键生成工单，同一闸门、幂等） ----
 var TICKET_REQUEST_ID = null;
 var TICKET_STATE = null;
+// 本框已生成工单(ticketed / duplicate):保持提交禁用、下单字段只读,重新打开弹窗才解除(终审 M6)
+var TICKET_DONE = false;
+
+// 按码点截断(服务端按字符数校验;String.prototype.slice 按 UTF-16 码元,会切开代理对)
+function clipChars(s, n){
+  return Array.from(String(s)).slice(0, n).join('');
+}
+
+function setTicketLocked(locked){
+  document.getElementById('tk-side-buy').disabled = locked;
+  document.getElementById('tk-side-sell').disabled = locked;
+  document.getElementById('tk-amount').readOnly = locked;
+  document.getElementById('tk-qty').readOnly = locked;
+  document.getElementById('tk-submit').disabled = locked;
+}
 
 function newRequestId(){
   return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + '-' + Math.random().toString(36).slice(2));
@@ -1823,19 +1838,20 @@ function toggleTicketSideFields(){
 function openTicketModal(opts){
   opts = opts || {};
   TICKET_REQUEST_ID = newRequestId();
-  TICKET_STATE = { code: opts.code || '', name: opts.name || '', aiNote: opts.aiNote ? String(opts.aiNote).slice(0,8000) : null };
+  TICKET_STATE = { code: opts.code || '', name: opts.name || '', aiNote: opts.aiNote ? clipChars(opts.aiNote, 8000) : null };
+  TICKET_DONE = false;
   document.getElementById('tk-code').value = opts.code || '';
   document.getElementById('tk-name').value = opts.name || '';
   document.getElementById('tk-side-buy').checked = opts.side !== 'sell';
   document.getElementById('tk-side-sell').checked = opts.side === 'sell';
   document.getElementById('tk-amount').value = '';
   document.getElementById('tk-qty').value = '';
-  document.getElementById('tk-reason').value = String(opts.reason || '').slice(0,500);
+  document.getElementById('tk-reason').value = clipChars(opts.reason || '', 500);
   var aiWrap = document.getElementById('tk-ainote-wrap');
   var aiPre = document.getElementById('tk-ainote');
   var aiToggle = document.getElementById('tk-ainote-toggle');
   if (opts.aiNote) {
-    aiPre.textContent = String(opts.aiNote).slice(0,8000);
+    aiPre.textContent = TICKET_STATE.aiNote;
     aiPre.style.display = 'none';
     aiToggle.textContent = '展开 AI 说明 ▾';
     aiWrap.style.display = '';
@@ -1844,7 +1860,7 @@ function openTicketModal(opts){
     aiWrap.style.display = 'none';
   }
   document.getElementById('tk-msg').innerHTML = '';
-  document.getElementById('tk-submit').disabled = false;
+  setTicketLocked(false);
   toggleTicketSideFields();
   document.getElementById('ticket-modal').style.display = 'flex';
 }
@@ -1855,6 +1871,8 @@ function closeTicketModal(){ document.getElementById('ticket-modal').style.displ
 var TICKET_LICENSE_ERR = { expired: '授权已过期，请在主页续期', license_required: '未激活授权，请在主页输入授权码' };
 
 function submitTicket(){
+  if (TICKET_DONE) return;
+  var rid = TICKET_REQUEST_ID;
   var btn = document.getElementById('tk-submit');
   var msg = document.getElementById('tk-msg');
   var reason = document.getElementById('tk-reason').value.trim();
@@ -1891,7 +1909,10 @@ function submitTicket(){
       return r.json().catch(function(){ return {}; }).then(function(j){ return { status: r.status, ok: r.ok, data: j }; });
     })
     .then(function(res){
+      if (rid !== TICKET_REQUEST_ID) return; // 弹窗已重新打开,旧响应作废
       if (res.ok && res.data && (res.data.result === 'ticketed' || res.data.result === 'duplicate')) {
+        TICKET_DONE = true;
+        setTicketLocked(true);
         var text = res.data.result === 'duplicate' ? '工单已生成（重复提交）' : '已生成工单';
         msg.innerHTML = '<span style="color:#2c6e49">'+esc(text)+'</span> · <a href="/trade#pending">去交易页确认</a>';
         return;
@@ -1909,8 +1930,11 @@ function submitTicket(){
       }
       msg.innerHTML = '<span style="color:#c0392b">'+esc(text)+'</span>';
     })
-    .catch(function(e){ msg.innerHTML = '<span style="color:#c0392b">'+esc('请求失败：'+String((e&&e.message)||e))+'</span>'; })
-    .finally(function(){ btn.disabled = false; });
+    .catch(function(e){
+      if (rid !== TICKET_REQUEST_ID) return;
+      msg.innerHTML = '<span style="color:#c0392b">'+esc('请求失败：'+String((e&&e.message)||e))+'</span>';
+    })
+    .finally(function(){ if (rid === TICKET_REQUEST_ID && !TICKET_DONE) btn.disabled = false; });
 }
 
 document.getElementById('tk-side-buy').addEventListener('change', toggleTicketSideFields);
