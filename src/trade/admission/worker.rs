@@ -82,7 +82,10 @@ where
                 // 被取消的首次回测不能滞留 Backtesting(design decision 7);月度重跑
                 // (已在 Paper/Admitted)被取消则维持原状,不影响已准入 / 观察期的策略。
                 state::fail_cancelled_backtest(conn, job.user_id, job.strategy_id, ctx.now)?;
-                return Ok("已取消".to_string());
+                // 以 Err 结束:`finish_job` 记为 failed/「用户取消」,与排队中取消同口径。
+                // `thread.rs` 的兜底转换(Backtesting → Failed)此时策略已不在 Backtesting,
+                // 条件更新为空操作,不会覆盖上面的原因。
+                return Err(anyhow!("用户取消"));
             }
             // 月度重跑与首次回测对「数据不足」的处理必须不同:首次回测(仍在
             // Backtesting)按 spec §10.3/§12 fail-closed,直接判未通过。但已在
@@ -862,7 +865,9 @@ mod tests {
         .unwrap();
         let mut load_calls = 0;
         let (wf, adm) = ctx(at(16, 9, 2));
-        let note = run_job(
+        // 取消以 Err 结束,好让 `finish_job` 把任务记为 failed/「用户取消」,
+        // 与排队中取消同一口径(而不是记成 done)。
+        let err = run_job(
             &mut c,
             &j,
             &JobContext {
@@ -875,8 +880,8 @@ mod tests {
                 Ok(wave_bars(190))
             },
         )
-        .unwrap();
-        assert!(note.contains("已取消"), "{note}");
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("用户取消"), "{err:#}");
         assert_eq!(load_calls, 1, "处理完第一只后即中止,不再加载第二只");
         let got = store::get_strategy(&c, 1, id).unwrap().unwrap();
         assert_eq!(

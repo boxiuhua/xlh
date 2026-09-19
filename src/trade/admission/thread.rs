@@ -591,6 +591,55 @@ mod tests {
         );
     }
 
+    /// 运行中被取消的前推回测:任务记为 failed/「用户取消」(与排队中取消同口径),
+    /// 策略由 `fail_cancelled_backtest` 转为 Failed,兜底转换不会覆盖其原因。
+    #[test]
+    fn a_cancelled_running_job_is_recorded_failed() {
+        let mut c = db();
+        let id = store::create_strategy(
+            &c,
+            &NewStrategy {
+                user_id: 1,
+                name: "S".into(),
+                kind: "trend".into(),
+                grid_toml: "short_window = [3]
+long_window = [10]
+amount = [20000.0]"
+                    .into(),
+                pool: vec!["600000".into(), "000001".into()],
+            },
+            at(16, 9, 0),
+        )
+        .unwrap();
+        state::submit_for_backtest(&c, 1, id, at(16, 9, 1)).unwrap();
+        let job_id = store::enqueue_eval(&c, 1, id, EvalKind::WalkForward, at(16, 9, 2))
+            .unwrap()
+            .unwrap();
+        // 模拟任务运行期间到达的 cancel_job:领取不会清掉标记,处理完第一只即中止。
+        c.execute(
+            "UPDATE trade_eval_jobs SET cancel_requested = 1 WHERE id = ?1",
+            rusqlite::params![job_id],
+        )
+        .unwrap();
+        let (wf, adm, ev) = deps();
+        let d = EvalDeps {
+            wf: &wf,
+            admission: &adm,
+            eval: &ev,
+        };
+        let mut st = TickState {
+            reclaimed: true,
+            ..Default::default()
+        };
+        tick(&mut c, &d, &mut st, at(16, 10, 0), |_| Ok(Vec::new()));
+        let j = store::get_job(&c, 1, job_id).unwrap().unwrap();
+        assert_eq!(j.status, crate::trade::model::JobStatus::Failed);
+        assert_eq!(j.error.as_deref(), Some("用户取消"));
+        let s = store::get_strategy(&c, 1, id).unwrap().unwrap();
+        assert_eq!(s.status, crate::trade::model::StrategyStatus::Failed);
+        assert_eq!(s.status_reason.as_deref(), Some("用户取消前推回测"));
+    }
+
     /// panic 与 `Err` 走同一条收尾路径:`run_job` 内部 panic(经由 `load` 闭包注入)
     /// 只被外层线程的 `catch_unwind` 兜住会恢复线程但留下 running 的任务行——
     /// `state.reclaimed` 本轮已是 true,不会再有人回收,而 `enqueue_eval` 的
