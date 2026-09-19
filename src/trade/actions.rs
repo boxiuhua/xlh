@@ -3,9 +3,7 @@
 //! 持仓校准留痕都在这里实现并单测;handler 只调用。
 
 use crate::trade::admission::state;
-use crate::trade::model::{
-    fmt_ts, Account, EvalKind, JobStatus, Position, StrategyStatus, TicketStatus,
-};
+use crate::trade::model::{fmt_ts, Account, EvalKind, JobStatus, Position, TicketStatus};
 use crate::trade::settings;
 use crate::trade::store;
 use crate::trade::ticket::{self, Transition};
@@ -219,26 +217,18 @@ pub fn cancel_job(
                 // 并发:在我们判断状态之后、更新之前被领走了。
                 return Ok(CancelOutcome::NotCancellable);
             }
-            if let Some(s) = store::get_strategy(conn, user_id, job.strategy_id)? {
-                if s.status == StrategyStatus::Backtesting {
-                    state::update_status(
-                        conn,
-                        user_id,
-                        job.strategy_id,
-                        StrategyStatus::Backtesting,
-                        StrategyStatus::Failed,
-                        "用户取消前推回测",
-                        now,
-                    )?;
-                }
-            }
+            state::fail_cancelled_backtest(conn, user_id, job.strategy_id, now)?;
             Ok(CancelOutcome::Cancelled)
         }
         JobStatus::Running => {
-            conn.execute(
-                "UPDATE trade_eval_jobs SET cancel_requested = 1 WHERE id = ?1",
+            let n = conn.execute(
+                "UPDATE trade_eval_jobs SET cancel_requested = 1 WHERE id = ?1 AND status = 'running'",
                 params![job_id],
             )?;
+            if n == 0 {
+                // 并发:在我们判断状态之后、结束之前任务已经跑完了。
+                return Ok(CancelOutcome::NotCancellable);
+            }
             Ok(CancelOutcome::Requested)
         }
         JobStatus::Done | JobStatus::Failed => Ok(CancelOutcome::NotCancellable),

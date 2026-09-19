@@ -81,17 +81,7 @@ where
             if outcome.cancelled {
                 // 被取消的首次回测不能滞留 Backtesting(design decision 7);月度重跑
                 // (已在 Paper/Admitted)被取消则维持原状,不影响已准入 / 观察期的策略。
-                if s.status == StrategyStatus::Backtesting {
-                    state::update_status(
-                        conn,
-                        job.user_id,
-                        job.strategy_id,
-                        StrategyStatus::Backtesting,
-                        StrategyStatus::Failed,
-                        "用户取消前推回测",
-                        ctx.now,
-                    )?;
-                }
+                state::fail_cancelled_backtest(conn, job.user_id, job.strategy_id, ctx.now)?;
                 return Ok("已取消".to_string());
             }
             // 月度重跑与首次回测对「数据不足」的处理必须不同:首次回测(仍在
