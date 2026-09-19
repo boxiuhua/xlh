@@ -1,5 +1,6 @@
 use crate::broker::Broker;
 use crate::engine::Engine;
+use crate::event::SignalEvent;
 use crate::execution::{ExecutionModel, RejectedOrder};
 use crate::metrics::{self, Summary};
 use crate::portfolio::Portfolio;
@@ -8,6 +9,7 @@ use crate::stock::data::StockData;
 use crate::stock::fee::StockFee;
 use crate::stock::trade_stats::{self, TradeStats};
 use crate::strategy::Strategy;
+use chrono::NaiveDate;
 
 #[derive(serde::Serialize)]
 pub struct StockRunOutcome {
@@ -49,6 +51,27 @@ pub fn run_one(
         execution: engine.execution_name().to_string(),
         rejected: engine.rejected().to_vec(),
     }
+}
+
+/// 回放 `data` 后追问次日决策(见 `Engine::decide_next`)。历史取 `data` 的全部 bar。
+pub fn replay_and_decide(
+    data: StockData,
+    strategy: Box<dyn Strategy>,
+    fee: StockFee,
+    initial_cash: f64,
+    exec: Box<dyn ExecutionModel>,
+    next: NaiveDate,
+) -> Vec<SignalEvent> {
+    let history = data.events().to_vec();
+    let mut engine = Engine::new(
+        data,
+        strategy,
+        Broker::new(fee),
+        Portfolio::new(initial_cash),
+    )
+    .with_execution(exec);
+    engine.run();
+    engine.decide_next(next, &history)
 }
 
 #[cfg(test)]

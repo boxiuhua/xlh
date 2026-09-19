@@ -64,6 +64,11 @@ impl StockData {
             cursor: 0,
         }
     }
+
+    /// 全部 bar 的策略视图(不受游标影响)。
+    pub fn events(&self) -> &[MarketEvent] {
+        &self.bars
+    }
 }
 
 impl DataHandler for StockData {
