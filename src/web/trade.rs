@@ -12,6 +12,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::broker::Fee;
+use crate::event::Direction;
+use crate::stock::fee::StockFee;
 use crate::trade::actions::{self, CancelOutcome, ConfirmError, FillError, SubmitStrategyOutcome};
 use crate::trade::admission::scorecard::{self, Scorecard};
 use crate::trade::model::{
@@ -193,11 +196,21 @@ struct TicketView {
     reason: String,
     quote: Option<QuoteView>,
     deviation: Option<f64>,
+    /// 预估金额:建议价 × 数量。
+    est_amount: f64,
+    /// 预估费用:买入 `buy_fee(est_amount)`,卖出 `sell_fee(qty, suggest_price, 0)`。
+    est_fee: f64,
+    /// 来自信号的 AI 备注。
+    ai_note: Option<String>,
+    /// 来自信号的来源策略。
+    strategy_id: Option<i64>,
 }
 
 fn ticket_view(conn: &Connection, t: Ticket, now: NaiveDateTime) -> anyhow::Result<TicketView> {
     let source = store::signal_source(conn, t.signal_id)?;
-    let reason = notify::signal_reason(conn, t.signal_id).unwrap_or_default();
+    // reason 的读取错误不再吞掉(4a 遗留):信号缺失等内部错误应上抛为 500,而不是静默空字符串。
+    let reason = notify::signal_reason(conn, t.signal_id)?;
+    let (ai_note, strategy_id) = store::signal_ai_note_and_strategy(conn, t.signal_id)?;
     let q = store::get_quote(conn, &t.code)?;
     let deviation = q
         .as_ref()
@@ -207,12 +220,22 @@ fn ticket_view(conn: &Connection, t: Ticket, now: NaiveDateTime) -> anyhow::Resu
         ts: q.ts,
         stale: actions::quote_is_stale(q.ts, now),
     });
+    let est_amount = t.suggest_price * t.qty as f64;
+    let fee_model = StockFee::a_share();
+    let est_fee = match t.side {
+        Direction::Buy => fee_model.buy_fee(est_amount),
+        Direction::Sell => fee_model.sell_fee(t.qty as f64, t.suggest_price, 0),
+    };
     Ok(TicketView {
         ticket: t,
         source,
         reason,
         quote,
         deviation,
+        est_amount,
+        est_fee,
+        ai_note,
+        strategy_id,
     })
 }
 
@@ -242,12 +265,7 @@ async fn list_tickets(
         .into_iter()
         .filter(is_working)
         .collect(),
-        "done" => tk::list_tickets(&conn, user.id, &[])?
-            .into_iter()
-            .rev()
-            .filter(|t| !is_pending(t) && !is_working(t))
-            .take(DONE_LIMIT)
-            .collect(),
+        "done" => tk::list_done_tickets(&conn, user.id, DONE_LIMIT)?,
         other => {
             return Err(ApiError::bad(format!(
                 "未知视图: {other}(可选 pending / working / done)"
@@ -935,6 +953,13 @@ mod tests {
         assert_eq!(list[0]["quote"]["stale"], false);
         assert_eq!(list[0]["source"], "manual");
         assert_eq!(list[0]["reason"], "测试");
+        let qty0 = list[0]["qty"].as_u64().unwrap();
+        assert!(
+            (list[0]["est_amount"].as_f64().unwrap() - 10.0 * qty0 as f64).abs() < 1e-6,
+            "est_amount ≈ 建议价 × 数量"
+        );
+        assert!(list[0]["est_fee"].as_f64().unwrap() > 0.0);
+        assert!(list[0]["strategy_id"].is_null(), "手动信号无来源策略");
 
         let url = format!("/api/trade/tickets/{id}/confirm");
         let (s, e) = call(&st, "POST", &url, "t1", Some(serde_json::json!({}))).await;
@@ -991,6 +1016,13 @@ mod tests {
         let (s, list) = call(&st, "GET", "/api/trade/tickets?view=done", "t1", None).await;
         assert_eq!((s, list.as_array().unwrap().len()), (StatusCode::OK, 1));
         assert_eq!(list[0]["id"], id);
+        assert!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .all(|t| !matches!(t["status"].as_str(), Some("pending") | Some("confirmed"))),
+            "已完成视图不含 pending/confirmed 工单: {list}"
+        );
     }
 
     #[tokio::test]
@@ -1170,8 +1202,13 @@ mod tests {
         seed_user(&st, "u", "t");
         {
             let c = st.db.lock().unwrap();
-            crate::trade::settings::set_kill_switch(&c, true, chrono::Local::now().naive_local())
-                .unwrap();
+            crate::trade::settings::set_kill_switch(
+                &c,
+                true,
+                None,
+                chrono::Local::now().naive_local(),
+            )
+            .unwrap();
             crate::trade::store::beat(&c, "trade-monitor", chrono::Local::now().naive_local())
                 .unwrap();
         }
@@ -1191,8 +1228,13 @@ mod tests {
         let id = pending_ticket(&st, uid, "600000", 10.0);
         {
             let c = st.db.lock().unwrap();
-            crate::trade::settings::set_kill_switch(&c, true, chrono::Local::now().naive_local())
-                .unwrap();
+            crate::trade::settings::set_kill_switch(
+                &c,
+                true,
+                None,
+                chrono::Local::now().naive_local(),
+            )
+            .unwrap();
         }
         let (s, e) = call(
             &st,
@@ -1284,7 +1326,7 @@ mod tests {
             let now = chrono::Local::now().naive_local();
             let mut c = st.db.lock().unwrap();
             crate::trade::store::set_capital(&c, a, Account::Real, 100_000.0, now).unwrap();
-            crate::trade::settings::set_kill_switch(&c, true, now).unwrap();
+            crate::trade::settings::set_kill_switch(&c, true, None, now).unwrap();
             let q = Quote {
                 code: "600000".into(),
                 price: 10.0,
@@ -1598,7 +1640,7 @@ mod tests {
         let (s, _) = call(&st, "GET", "/api/admin/trade/kill-switch", "t", None).await;
         assert_ne!(s, StatusCode::OK, "普通用户不可查看");
 
-        seed_admin(&st, "root", "ta");
+        let admin_id = seed_admin(&st, "root", "ta");
         let (s, r) = call(
             &st,
             "POST",
@@ -1612,6 +1654,8 @@ mod tests {
         let (s, r) = call(&st, "GET", "/api/admin/trade/kill-switch", "ta", None).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(r["on"], true);
+        assert_eq!(r["by"], admin_id, "总开关留痕操作人");
+        assert!(r["updated_at"].is_string(), "留痕时间");
 
         // 普通用户 overview 的 kill_switch 应为 true(全局开关)。
         let (_, ov) = call(&st, "GET", "/api/trade/overview", "t", None).await;

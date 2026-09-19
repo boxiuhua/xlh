@@ -106,6 +106,10 @@ pub fn manual_fill(
         return Ok(Err(FillError::PaperNotAllowed));
     }
     let invalid = |msg: String| Ok(Err(FillError::Validation(msg)));
+    // 4a 终审遗留:账户资金行不存在时,此前会落到 `record_fill_in` 内的 `add_cash` 报错(500)。
+    if store::get_account(&tx, user_id, t.account)?.is_none() {
+        return invalid("未设置账户资金,请先在「风控设置」里设置总资金".into());
+    }
     if !(price.is_finite() && price > 0.0) || qty == 0 {
         return invalid("成交价与数量必须为正数".into());
     }
@@ -480,7 +484,7 @@ mod tests {
             confirm_ticket(&c, 2, id, true, at(10, 0, 5)).unwrap(),
             Err(ConfirmError::NotFound)
         );
-        crate::trade::settings::set_kill_switch(&c, true, at(10, 0, 0)).unwrap();
+        crate::trade::settings::set_kill_switch(&c, true, None, at(10, 0, 0)).unwrap();
         assert_eq!(
             confirm_ticket(&c, 1, id, true, at(10, 0, 5)).unwrap(),
             Err(ConfirmError::KillSwitch)
@@ -853,6 +857,77 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "被拒的回填不落库"
+        );
+    }
+
+    /// 4a 终审遗留:账户资金行不存在时,人工回填此前会落到 `add_cash` 报错(500);
+    /// 现应在预校验阶段就返回业务拒绝(400)。用户没有 `trade_accounts` 行,
+    /// 但有实盘持仓(`calibrate_position` 造)与一张已确认的实盘卖出工单
+    /// (直接用 `ticket::create_ticket` 写入 `status = Confirmed`,绕开需要账户资金的信号出单)。
+    #[test]
+    fn manual_fill_without_account_row_is_validation_error() {
+        let mut c = Connection::open_in_memory().unwrap();
+        store::migrate(&c).unwrap();
+        assert!(
+            store::get_account(&c, 1, Account::Real).unwrap().is_none(),
+            "未设置账户资金"
+        );
+        calibrate_position(
+            &mut c,
+            1,
+            &Calibration {
+                code: "600000".into(),
+                qty: 1000,
+                avg_cost: 10.0,
+                reason: "对账".into(),
+            },
+            at(9, 30, 0),
+        )
+        .unwrap();
+        let sid = ticket::insert_signal(
+            &c,
+            &NewSignal {
+                user_id: 1,
+                source: SignalSource::Manual,
+                strategy_id: None,
+                code: "600000".into(),
+                name: None,
+                side: Direction::Sell,
+                scope: AccountScope::RealOnly,
+                ref_price: 10.0,
+                reason: "t".into(),
+                ai_note: None,
+                dedup_key: "no-account".into(),
+                suggest_cash: None,
+                suggest_qty: Some(100),
+            },
+            at(10, 0, 0),
+        )
+        .unwrap()
+        .unwrap();
+        let real = ticket::create_ticket(
+            &c,
+            &ticket::NewTicket {
+                user_id: 1,
+                signal_id: sid,
+                account: Account::Real,
+                code: "600000".into(),
+                side: Direction::Sell,
+                suggest_price: 10.0,
+                qty: 100,
+                expires_at: at(10, 30, 0),
+                deviation_th: 0.015,
+                status: TicketStatus::Confirmed,
+                urgency: 0,
+                created_at: at(10, 0, 0),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            manual_fill(&mut c, 1, real, 10.0, 100, at(10, 0, 5)).unwrap(),
+            Err(FillError::Validation(
+                "未设置账户资金,请先在「风控设置」里设置总资金".into()
+            ))
         );
     }
 

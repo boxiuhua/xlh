@@ -735,6 +735,21 @@ pub fn signal_source(conn: &Connection, signal_id: i64) -> Result<Option<SignalS
     s.as_deref().map(SignalSource::parse).transpose()
 }
 
+/// 信号的 AI 备注与来源策略(工单列表展示用,4b);一次查询取齐,信号不存在时两者为 `None`。
+pub fn signal_ai_note_and_strategy(
+    conn: &Connection,
+    signal_id: i64,
+) -> Result<(Option<String>, Option<i64>)> {
+    Ok(conn
+        .query_row(
+            "SELECT ai_note, strategy_id FROM trade_signals WHERE id = ?1",
+            [signal_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or((None, None)))
+}
+
 /// 被闸门拦下的信号(计划 4a:让用户看到「为什么没出工单」)。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RejectedSignal {
@@ -2037,5 +2052,69 @@ mod tests {
                 .is_some(),
             "回收后应能重新入队"
         );
+    }
+
+    /// `signal_ai_note_and_strategy` 一次查询取齐 `ai_note` / `strategy_id`;
+    /// 信号不存在时两者为 `None`,而非报错(4b)。
+    #[test]
+    fn signal_ai_note_and_strategy_reads_both_and_defaults_when_missing() {
+        use crate::event::Direction;
+        use crate::trade::ticket::insert_signal;
+
+        let c = db();
+        assert_eq!(
+            signal_ai_note_and_strategy(&c, 999).unwrap(),
+            (None, None),
+            "信号不存在"
+        );
+
+        let sid = insert_signal(
+            &c,
+            &NewSignal {
+                user_id: 1,
+                source: SignalSource::Strategy,
+                strategy_id: Some(7),
+                code: "600000".into(),
+                name: None,
+                side: Direction::Buy,
+                scope: AccountScope::RealOnly,
+                ref_price: 10.0,
+                reason: "策略触发".into(),
+                ai_note: Some("AI: 趋势向上".into()),
+                dedup_key: "ai-note-test".into(),
+                suggest_cash: Some(5_000.0),
+                suggest_qty: None,
+            },
+            at(15, 9, 0),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            signal_ai_note_and_strategy(&c, sid).unwrap(),
+            (Some("AI: 趋势向上".into()), Some(7))
+        );
+
+        let sid2 = insert_signal(
+            &c,
+            &NewSignal {
+                user_id: 1,
+                source: SignalSource::Manual,
+                strategy_id: None,
+                code: "600000".into(),
+                name: None,
+                side: Direction::Buy,
+                scope: AccountScope::RealOnly,
+                ref_price: 10.0,
+                reason: "手动".into(),
+                ai_note: None,
+                dedup_key: "ai-note-test-2".into(),
+                suggest_cash: Some(5_000.0),
+                suggest_qty: None,
+            },
+            at(15, 9, 1),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(signal_ai_note_and_strategy(&c, sid2).unwrap(), (None, None));
     }
 }

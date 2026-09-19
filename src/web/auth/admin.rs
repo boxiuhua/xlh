@@ -1,14 +1,14 @@
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
 
 use super::model::{renew_expiry, LicenseStatus};
 use super::store::{self, CodeFilter};
-use super::{json_error, AuthState};
+use super::{json_error, AuthState, CurrentUser};
 
 const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // 去掉易混 O0I1
 
@@ -334,11 +334,11 @@ async function showPush(id){const r=await fetch('/api/admin/push-history/'+id);i
 ov();loadCodes('unused');loadUsers();loadPushHistory();
 </script></body></html>"##;
 
-/// 交易管理员总开关(计划 4a §8):打开后所有来源的信号都被拦,确认接口返回 409。
+/// 交易管理员总开关(计划 4a §8,4b 补留痕):打开后所有来源的信号都被拦,确认接口返回 409。
 pub async fn get_kill_switch(State(st): State<AuthState>) -> Response {
     let conn = st.db.lock().unwrap();
-    match crate::trade::settings::kill_switch(&conn) {
-        Ok(on) => Json(json!({ "on": on })).into_response(),
+    match crate::trade::settings::kill_switch_state(&conn) {
+        Ok(s) => Json(s).into_response(),
         Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None),
     }
 }
@@ -348,13 +348,15 @@ pub struct KillSwitchReq {
     pub on: bool,
 }
 
+/// 操作人取自登录态(`require_login` 已注入 `Extension<CurrentUser>`),留痕于 `kill_switch_by`。
 pub async fn set_kill_switch(
     State(st): State<AuthState>,
+    Extension(user): Extension<CurrentUser>,
     Json(req): Json<KillSwitchReq>,
 ) -> Response {
     let now = chrono::Local::now().naive_local();
     let conn = st.db.lock().unwrap();
-    match crate::trade::settings::set_kill_switch(&conn, req.on, now) {
+    match crate::trade::settings::set_kill_switch(&conn, req.on, Some(user.id), now) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None),
     }
