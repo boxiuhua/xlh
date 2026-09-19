@@ -221,6 +221,7 @@ fn run_loop(db_path: PathBuf, cfg: TradeCfg) {
     };
     println!("策略评估线程已启动(轮询 {} 秒)", cfg.eval.poll_secs);
     let mut state = seed_tick_state(&conn);
+    let mut signal_state = crate::trade::daily_signals::ComputeState::default();
     loop {
         let now = chrono::Local::now().naive_local();
         // 单轮 panic 只记日志、照常进入下一轮;线程退出等于评估静默停摆。
@@ -233,6 +234,36 @@ fn run_loop(db_path: PathBuf, cfg: TradeCfg) {
                 admission: &cfg.admission,
                 eval: &cfg.eval,
             };
+            // 日线信号需要**今天**的 K 线,与前推回测的 `end`(昨天,见下)不同;
+            // `load_or_fetch` 在缓存不含今天时会联网重抓,K 线还没更新则由
+            // `compute` 判为待重试,按 `retry_minutes` 节奏再来。
+            let today = now.date();
+            let sig_start = today - chrono::Duration::days(cfg.walk_forward.train_days + 30);
+            if let Some(r) = crate::trade::daily_signals::run_compute(
+                &conn,
+                &cfg.signals,
+                deps.wf,
+                &mut signal_state,
+                now,
+                |code| {
+                    crate::stock::data::cache::load_or_fetch(
+                        code,
+                        std::path::Path::new(".cache/stock"),
+                        sig_start,
+                        today,
+                    )
+                },
+            ) {
+                for e in &r.errors {
+                    eprintln!("[trade] 日线信号: {e}");
+                }
+                if r.planned + r.idle > 0 {
+                    println!(
+                        "[trade] 日线信号:计划 {} 条、无操作 {} 条、待重试 {} 条",
+                        r.planned, r.idle, r.pending
+                    );
+                }
+            }
             // 前推回测要尽可能长的历史(准入的数据年限关默认 3 年,训练窗还要再往前推),
             // 统一取 12 年。`end` 必须退一天:收盘前当天没有 K 线,非交易日(周末/
             // 节假日)更是永远没有,`end = now.date()` 会让 `cache::covers` 永远

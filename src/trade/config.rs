@@ -126,6 +126,42 @@ impl Default for EvalCfg {
     }
 }
 
+/// 日线策略信号配置(计划 3e):收盘后计算、次日开盘发出。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SignalCfg {
+    /// 是否计算并发出日线策略信号
+    pub enabled: bool,
+    /// 收盘后开始计算的时刻
+    pub compute_hour: u32,
+    pub compute_minute: u32,
+    /// 计算截止(整点,不含):到点后当日不再重试
+    pub cutoff_hour: u32,
+    /// K 线未更新时的重试间隔(分钟)
+    pub retry_minutes: i64,
+    /// 次日发出窗口 [emit, emit_end)
+    pub emit_hour: u32,
+    pub emit_minute: u32,
+    pub emit_end_hour: u32,
+    pub emit_end_minute: u32,
+}
+
+impl Default for SignalCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            compute_hour: 15,
+            compute_minute: 30,
+            cutoff_hour: 21,
+            retry_minutes: 10,
+            emit_hour: 9,
+            emit_minute: 25,
+            emit_end_hour: 10,
+            emit_end_minute: 30,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TradeCfg {
@@ -142,6 +178,7 @@ pub struct TradeCfg {
     pub slippage: f64,
     pub walk_forward: WalkForwardTuning,
     pub eval: EvalCfg,
+    pub signals: SignalCfg,
 }
 
 impl Default for TradeCfg {
@@ -155,6 +192,7 @@ impl Default for TradeCfg {
             slippage: 0.001,
             walk_forward: WalkForwardTuning::default(),
             eval: EvalCfg::default(),
+            signals: SignalCfg::default(),
         }
     }
 }
@@ -350,6 +388,45 @@ pub fn from_toml_str(text: &str) -> Result<TradeCfg> {
             "[trade.eval] monthly_day 须在 1..=28,当前 {}",
             e.monthly_day
         ));
+    }
+    let s = &cfg.signals;
+    if [s.compute_hour, s.cutoff_hour, s.emit_hour, s.emit_end_hour]
+        .iter()
+        .any(|h| *h > 23)
+    {
+        return Err(anyhow!("[trade.signals] 小时须在 0..=23"));
+    }
+    if [s.compute_minute, s.emit_minute, s.emit_end_minute]
+        .iter()
+        .any(|m| *m > 59)
+    {
+        return Err(anyhow!("[trade.signals] 分钟须在 0..=59"));
+    }
+    if s.cutoff_hour * 60 <= s.compute_hour * 60 + s.compute_minute {
+        return Err(anyhow!(
+            "[trade.signals] cutoff_hour 须晚于开始计算时刻 {:02}:{:02},当前 {}",
+            s.compute_hour,
+            s.compute_minute,
+            s.cutoff_hour
+        ));
+    }
+    if !(1..=120).contains(&s.retry_minutes) {
+        return Err(anyhow!(
+            "[trade.signals] retry_minutes 须在 1..=120,当前 {}",
+            s.retry_minutes
+        ));
+    }
+    let emit = s.emit_hour * 60 + s.emit_minute;
+    // 09:25 集合竞价出结果之前,快照里没有当天报价
+    if emit < 9 * 60 + 25 {
+        return Err(anyhow!(
+            "[trade.signals] 发出窗口须不早于 09:25,当前 {:02}:{:02}",
+            s.emit_hour,
+            s.emit_minute
+        ));
+    }
+    if s.emit_end_hour * 60 + s.emit_end_minute <= emit {
+        return Err(anyhow!("[trade.signals] 发出窗口结束须晚于开始"));
     }
     Ok(cfg)
 }
@@ -586,5 +663,32 @@ mod tests {
         );
         assert!(from_toml_str("[trade.admission]\nwin_rate_sigma = -1.0\n").is_err());
         assert!(from_toml_str("[trade.admission]\nwatchdog_window = 0\n").is_err());
+    }
+
+    #[test]
+    fn signals_section_defaults_and_validation() {
+        let cfg = from_toml_str("").unwrap();
+        assert_eq!(cfg.signals, SignalCfg::default());
+        assert!(cfg.signals.enabled);
+        assert_eq!(
+            (cfg.signals.compute_hour, cfg.signals.compute_minute),
+            (15, 30)
+        );
+        assert_eq!((cfg.signals.emit_hour, cfg.signals.emit_minute), (9, 25));
+        let cfg = from_toml_str("[trade.signals]\nenabled = false\nretry_minutes = 5").unwrap();
+        assert!(!cfg.signals.enabled);
+        assert_eq!(cfg.signals.retry_minutes, 5);
+        for bad in [
+            "[trade.signals]\ncompute_hour = 24",
+            "[trade.signals]\ncompute_minute = 60",
+            "[trade.signals]\ncutoff_hour = 15", // 截止必须晚于开始
+            "[trade.signals]\nretry_minutes = 0",
+            "[trade.signals]\nretry_minutes = 121",
+            "[trade.signals]\nemit_end_hour = 9\nemit_end_minute = 25", // 窗口为空
+            "[trade.signals]\nemit_hour = 8",                           // 早于集合竞价结束
+            "[trade.signals]\nunknown = 1",
+        ] {
+            assert!(from_toml_str(bad).is_err(), "{bad}");
+        }
     }
 }

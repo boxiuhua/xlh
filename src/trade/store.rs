@@ -160,6 +160,26 @@ CREATE TABLE IF NOT EXISTS trade_calendar (
   is_open    INTEGER NOT NULL,
   checked_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS trade_strategy_plans (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id      INTEGER NOT NULL,
+  strategy_id  INTEGER NOT NULL,
+  version_hash TEXT NOT NULL,
+  code         TEXT NOT NULL,
+  side         TEXT,
+  cash         REAL,
+  basis_date   TEXT NOT NULL,
+  reason       TEXT NOT NULL,
+  status       TEXT NOT NULL,
+  note         TEXT,
+  created_at   TEXT NOT NULL,
+  settled_at   TEXT
+);
+-- 每个策略每只股票每个基准日只算一次:重启、重试都靠它幂等
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_strategy_plans_key
+  ON trade_strategy_plans(strategy_id, code, basis_date);
+CREATE INDEX IF NOT EXISTS idx_trade_strategy_plans_status ON trade_strategy_plans(status, basis_date);
 "#;
 
 /// 表已存在但缺列时补建:`CREATE TABLE IF NOT EXISTS` 对已存在的旧表是空操作,
@@ -1335,7 +1355,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 13);
+        assert_eq!(n, 14);
     }
 
     #[test]
