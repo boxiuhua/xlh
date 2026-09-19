@@ -2,6 +2,7 @@ pub mod auth;
 pub mod page;
 pub mod stock;
 pub mod trade;
+pub mod trade_page;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
@@ -390,6 +391,7 @@ pub fn router(state: AuthState) -> Router {
         .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/login", get(page::login_html_handler))
+        .route("/trade", get(trade_page::trade_page))
         .route("/api/auth/register", post(auth::handlers::register))
         .route("/api/auth/login", post(auth::handlers::login))
         .merge(trade::public_routes());

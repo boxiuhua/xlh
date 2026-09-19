@@ -48,6 +48,7 @@ button.del{color:#c0392b;border-color:#e8b9b3}
   <span style="flex:1"></span>
   <input id="xlh-code" placeholder="授权码" style="padding:4px 8px;border-radius:6px;border:1px solid #374151;background:#0b1220;color:#e5e7eb">
   <button onclick="xlhActivate()" style="padding:4px 10px;border:0;border-radius:6px;background:#3b82f6;color:#fff;cursor:pointer">激活/续期</button>
+  <a href="/trade" style="color:#fca5a5">交易</a>
   <a id="xlh-admin" href="/admin" style="display:none;color:#93c5fd">管理后台</a>
   <button onclick="xlhPwOpen()" style="padding:4px 10px;border:0;border-radius:6px;background:#374151;color:#fff;cursor:pointer">修改密码</button>
   <button onclick="xlhLogout()" style="padding:4px 10px;border:0;border-radius:6px;background:#374151;color:#fff;cursor:pointer">退出</button>
