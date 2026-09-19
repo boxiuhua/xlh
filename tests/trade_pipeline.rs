@@ -149,6 +149,9 @@ fn signal_to_stop_loss_sell_ticket() {
     // 7. 同一日再跑一次(9.05):当日同一规则只触发一次,不产生新的实盘工单
     let tick3_time = at(24, 10, 2, 0);
     let r3 = run_tick(&mut c, &Fixed(vec![quote(9.05, tick3_time)]), tick3_time).unwrap();
+    // 实盘持仓在卖出工单成交前仍在,每轮都会重新判定并计入 exit_signals(过期重发依赖这一点),
+    // 但信号按 dedup_key 查重为 Duplicate、已有挂起工单不重发;模拟盘已平仓,不再计数。
+    assert_eq!(r3.exit_signals, 1, "只剩实盘持仓被重新判定: {:?}", r3);
     assert!(
         r3.new_real_tickets.is_empty(),
         "同日重复触发不应再出新单: {:?}",

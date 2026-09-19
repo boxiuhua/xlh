@@ -180,6 +180,45 @@ pub fn send_daily_reports(
     Ok(sent)
 }
 
+/// 日报调度(设计裁决 1、3):开启时在 [配置时刻, 18:00) 窗口内每个交易日执行一次。
+/// 休市日只把 `last` 记为当日(当日不再判断),不写持久标记;交易日执行后 `last`
+/// 记为当日并写心跳 `trade-daily-report`(守护重启时从它读回 `last`,同日不重发)。
+/// 任何错误只记日志。
+pub fn run_daily_report(
+    conn: &Connection,
+    notifier: &dyn Notifier,
+    cfg: &TradeCfg,
+    now: NaiveDateTime,
+    last: &mut Option<NaiveDate>,
+) {
+    if !cfg.daily_report
+        || !due_daily_window(
+            now,
+            (cfg.daily_report_hour, cfg.daily_report_minute),
+            (18, 0),
+            *last,
+        )
+    {
+        return;
+    }
+    match crate::trade::calendar::is_trading_day(conn, now.date()) {
+        Ok(false) => *last = Some(now.date()), // 休市日不发,当日不再判断
+        Ok(true) => match send_daily_reports(conn, notifier, now.date()) {
+            Ok(n) => {
+                // n 只是 notify 返回成功的用户数:未配置推送渠道或授权失效的用户,
+                // Notifier 会静默跳过并同样返回成功,故这里说「已处理」而非「已推送」。
+                println!("[trade] 已处理交易日报 {n} 份(未配置推送渠道或授权失效的用户会被跳过)");
+                *last = Some(now.date());
+                if let Err(e) = store::beat(conn, "trade-daily-report", now) {
+                    eprintln!("[trade] 日报标记写入失败: {e:#}");
+                }
+            }
+            Err(e) => eprintln!("[trade] 交易日报失败: {e:#}"),
+        },
+        Err(e) => eprintln!("[trade] 交易日历读取失败: {e:#}"),
+    }
+}
+
 /// 监听中断告警:推送给所有持有实盘仓位的用户(模拟盘持仓无需线下操作),返回推送用户数。
 pub fn alert_holders(conn: &Connection, notifier: &dyn Notifier, minutes: i64) -> Result<usize> {
     let (title, md) = render_monitor_down(minutes);
@@ -409,29 +448,7 @@ fn run_loop(
                 eprintln!("[trade] 作废过期信号计划失败: {e:#}");
             }
 
-            if cfg.daily_report
-                && due_daily_window(
-                    now,
-                    (cfg.daily_report_hour, cfg.daily_report_minute),
-                    (18, 0),
-                    last_report,
-                )
-            {
-                match crate::trade::calendar::is_trading_day(&conn, now.date()) {
-                    Ok(false) => last_report = Some(now.date()), // 休市日不发,当日不再判断
-                    Ok(true) => match send_daily_reports(&conn, notifier.as_ref(), now.date()) {
-                        Ok(n) => {
-                            println!("[trade] 已推送交易日报 {n} 份");
-                            last_report = Some(now.date());
-                            if let Err(e) = store::beat(&conn, "trade-daily-report", now) {
-                                eprintln!("[trade] 日报标记写入失败: {e:#}");
-                            }
-                        }
-                        Err(e) => eprintln!("[trade] 交易日报失败: {e:#}"),
-                    },
-                    Err(e) => eprintln!("[trade] 交易日历读取失败: {e:#}"),
-                }
-            }
+            run_daily_report(&conn, notifier.as_ref(), &cfg, now, &mut last_report);
             delay
         }))
         .unwrap_or_else(|_| {
@@ -635,5 +652,84 @@ mod tests {
         let sent = send_daily_reports(&c, &notifier, today).unwrap();
         assert_eq!(sent, 1, "用户 1 推送失败;用户 2 成功;用户 3 无活动不发");
         assert_eq!(*notifier.calls.borrow(), vec![2]);
+    }
+
+    /// 用户 1 有一只实盘持仓 —— 任一交易日都有日报可发。
+    fn db_with_holder() -> Connection {
+        let c = db();
+        let mut pos = Position::empty(1, Account::Real, "600002");
+        pos.qty = 100;
+        pos.avg_cost = 10.0;
+        store::upsert_position(&c, &pos, at(20, 9, 0)).unwrap();
+        c
+    }
+
+    fn report_marker(c: &Connection) -> Option<NaiveDateTime> {
+        store::last_beat(c, "trade-daily-report").unwrap()
+    }
+
+    #[test]
+    fn daily_report_skips_holidays_without_persisting_marker() {
+        let c = db_with_holder();
+        let d23 = NaiveDate::from_ymd_opt(2026, 9, 23).unwrap();
+        crate::trade::calendar::mark_day(&c, d23, false, at(23, 9, 31)).unwrap();
+        let notifier = FailingRecorder::default();
+        let mut last = None;
+        run_daily_report(
+            &c,
+            &notifier,
+            &TradeCfg::default(),
+            at(23, 15, 40),
+            &mut last,
+        );
+        assert!(notifier.calls.borrow().is_empty(), "休市日不发");
+        assert_eq!(last, Some(d23), "当日不再判断");
+        assert_eq!(report_marker(&c), None, "休市日不写持久标记");
+    }
+
+    #[test]
+    fn daily_report_sends_once_per_trading_day_and_survives_restart() {
+        let c = db_with_holder();
+        let cfg = TradeCfg::default();
+        let d23 = NaiveDate::from_ymd_opt(2026, 9, 23).unwrap();
+        let notifier = FailingRecorder::default();
+        let mut last = None;
+
+        run_daily_report(&c, &notifier, &cfg, at(23, 15, 40), &mut last);
+        assert_eq!(*notifier.calls.borrow(), vec![1]);
+        assert_eq!(last, Some(d23));
+        assert_eq!(report_marker(&c), Some(at(23, 15, 40)));
+
+        // 同日再调用:不重发,标记不变
+        run_daily_report(&c, &notifier, &cfg, at(23, 16, 0), &mut last);
+        assert_eq!(*notifier.calls.borrow(), vec![1]);
+        assert_eq!(report_marker(&c), Some(at(23, 15, 40)));
+
+        // 模拟重启:从持久标记读回 last,同日不重发
+        let mut restored = report_marker(&c).map(|t| t.date());
+        let fresh = FailingRecorder::default();
+        run_daily_report(&c, &fresh, &cfg, at(23, 17, 0), &mut restored);
+        assert!(fresh.calls.borrow().is_empty(), "重启后同日不重发");
+    }
+
+    #[test]
+    fn daily_report_only_runs_inside_the_window_and_when_enabled() {
+        let c = db_with_holder();
+        let cfg = TradeCfg::default();
+        let notifier = FailingRecorder::default();
+        let mut last = None;
+        run_daily_report(&c, &notifier, &cfg, at(23, 15, 34), &mut last);
+        run_daily_report(&c, &notifier, &cfg, at(23, 18, 0), &mut last);
+        assert!(notifier.calls.borrow().is_empty(), "窗口外不发");
+        assert_eq!(last, None);
+        assert_eq!(report_marker(&c), None);
+
+        let off = TradeCfg {
+            daily_report: false,
+            ..TradeCfg::default()
+        };
+        run_daily_report(&c, &notifier, &off, at(23, 15, 40), &mut last);
+        assert!(notifier.calls.borrow().is_empty(), "关闭日报不发");
+        assert_eq!(last, None);
     }
 }
