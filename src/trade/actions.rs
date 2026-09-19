@@ -245,7 +245,20 @@ pub enum SubmitStrategyOutcome {
 
 /// 提交策略评估:草稿 / 未通过 / 已暂停 → 排队前推回测;异动类直接进观察期。
 /// 跨用户或不存在一律 `NotFound`,不泄露存在性。
+/// 状态转换与入队在同一个事务里:入队失败时状态一并回滚,策略不会停在「回测中」却没有任务。
 pub fn submit_strategy(
+    conn: &Connection,
+    user_id: i64,
+    id: i64,
+    now: NaiveDateTime,
+) -> Result<SubmitStrategyOutcome> {
+    let tx = conn.unchecked_transaction()?;
+    let out = submit_strategy_in(&tx, user_id, id, now)?;
+    tx.commit()?;
+    Ok(out)
+}
+
+fn submit_strategy_in(
     conn: &Connection,
     user_id: i64,
     id: i64,
@@ -254,7 +267,7 @@ pub fn submit_strategy(
     let Some(s) = store::get_strategy(conn, user_id, id)? else {
         return Ok(SubmitStrategyOutcome::NotFound);
     };
-    match state::submit_for_backtest(conn, user_id, id, now)? {
+    match state::submit_for_backtest_in(conn, user_id, id, now)? {
         Transition::AlreadyHandled => Ok(SubmitStrategyOutcome::AlreadyHandled),
         Transition::Applied => {
             if s.kind == "mover" {
@@ -831,6 +844,17 @@ mod tests {
             cancel_job(&c, 1, job_id, at(9, 4, 0)).unwrap(),
             CancelOutcome::NotCancellable
         );
+    }
+
+    /// 入队失败时状态转换一并回滚,策略不会停在「回测中」却没有任务。
+    #[test]
+    fn submit_rolls_back_the_status_change_when_enqueue_fails() {
+        let c = db();
+        let id = trend_strategy(&c);
+        c.execute_batch("DROP TABLE trade_eval_jobs").unwrap();
+        assert!(submit_strategy(&c, 1, id, at(9, 1, 0)).is_err());
+        let s = store::get_strategy(&c, 1, id).unwrap().unwrap();
+        assert_eq!(s.status, crate::trade::model::StrategyStatus::Draft);
     }
 
     #[test]

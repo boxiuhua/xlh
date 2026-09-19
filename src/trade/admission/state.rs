@@ -92,6 +92,20 @@ pub fn submit_for_backtest(
     id: i64,
     now: NaiveDateTime,
 ) -> Result<Transition> {
+    let tx = conn.unchecked_transaction()?;
+    let transition = submit_for_backtest_in(&tx, user_id, id, now)?;
+    tx.commit()?;
+    Ok(transition)
+}
+
+/// `submit_for_backtest` 的事务内版本:调用方持有事务并负责提交,
+/// 供 `actions::submit_strategy` 把状态转换与入队放进同一个事务。
+pub fn submit_for_backtest_in(
+    conn: &Connection,
+    user_id: i64,
+    id: i64,
+    now: NaiveDateTime,
+) -> Result<Transition> {
     let Some(s) = store::get_strategy(conn, user_id, id)? else {
         return Ok(Transition::AlreadyHandled);
     };
@@ -111,7 +125,7 @@ pub fn submit_for_backtest(
         StrategyStatus::Suspended,
     ] {
         if s.status == expect {
-            return update_status(conn, user_id, id, expect, to, reason, now);
+            return transition_status(conn, user_id, id, expect, to, reason, now);
         }
     }
     Ok(Transition::AlreadyHandled)
