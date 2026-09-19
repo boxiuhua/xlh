@@ -405,6 +405,9 @@ pub struct ManualOrder {
     pub ai_note: Option<String>,
 }
 
+/// 手动卖出股数上限(防止离谱输入溢出下游计算)。
+pub const MANUAL_MAX_QTY: u64 = 1_000_000_000;
+
 /// 手动工单字段校验(design decision 1/2:与自动信号同路径,只是入口不同)。
 pub fn validate_manual(o: &ManualOrder) -> Result<()> {
     if o.request_id.is_empty()
@@ -421,6 +424,10 @@ pub fn validate_manual(o: &ManualOrder) -> Result<()> {
     }
     if o.code.len() != 6 || !o.code.bytes().all(|b| b.is_ascii_digit()) {
         return Err(anyhow!("股票代码须为 6 位数字: {}", o.code));
+    }
+    // 北交所等取不到腾讯行情的市场:提前拒绝,而不是联网后报「无行情」。
+    if crate::trade::quotes::tencent_symbol(&o.code).is_none() {
+        return Err(anyhow!("暂不支持该市场(仅沪深)"));
     }
     if let Some(n) = &o.name {
         if n.trim().chars().count() > 20 {
@@ -445,6 +452,9 @@ pub fn validate_manual(o: &ManualOrder) -> Result<()> {
             if let Some(q) = o.qty {
                 if q == 0 {
                     return Err(anyhow!("卖出股数必须大于 0"));
+                }
+                if q > MANUAL_MAX_QTY {
+                    return Err(anyhow!("卖出股数过大(最多 {MANUAL_MAX_QTY} 股)"));
                 }
             }
         }
@@ -472,12 +482,14 @@ pub enum ManualOutcome {
     },
     Rejected(GateReject),
     Duplicate,
-    /// 无今日行情(盘前 / 休市 / 停牌),或行情代码与工单不符。
+    /// 非交易时段,或无今日新鲜行情(盘前 / 休市 / 停牌 / 超过 `QUOTE_MAX_AGE_SECS`),
+    /// 或行情代码与工单不符。
     NoQuote,
 }
 
 /// 手动 / AI 工单入口(design decision 1-3):与自动信号同一闸门(`submit_signal`),
-/// 只在有今日行情时放行,`request_id` 映射为 `dedup_key` 做幂等。
+/// 只在交易时段内、且有今日同代码新鲜行情时放行(与确认同一口径,终审 I1:
+/// 否则收盘后 / 午休生成的工单永远无法确认),`request_id` 映射为 `dedup_key` 做幂等。
 pub fn submit_manual(
     conn: &mut Connection,
     user_id: i64,
@@ -486,7 +498,12 @@ pub fn submit_manual(
     now: NaiveDateTime,
 ) -> Result<ManualOutcome> {
     validate_manual(o)?;
-    let Some(q) = quote.filter(|q| q.ts.date() == now.date() && q.code == o.code) else {
+    if !crate::trade::monitor::is_session(now) {
+        return Ok(ManualOutcome::NoQuote);
+    }
+    let Some(q) = quote
+        .filter(|q| q.ts.date() == now.date() && q.code == o.code && !quote_is_stale(q.ts, now))
+    else {
         return Ok(ManualOutcome::NoQuote);
     };
     // name / ai_note:去空白后空串视为 None(brief 校验表)。
@@ -1326,6 +1343,74 @@ mod tests {
         );
     }
 
+    /// 终审 I1:生成与确认同一口径——只在交易时段内、且行情为今日同代码且不陈旧时放行。
+    #[test]
+    fn manual_needs_trading_session_and_fresh_quote() {
+        let mut c = db();
+        let o = manual(Direction::Buy, "req-sess");
+        // 收盘后:15:00 的今日行情,16:00 提交
+        assert_eq!(
+            submit_manual(
+                &mut c,
+                1,
+                &o,
+                Some(&quote(10.0, at(15, 0, 0))),
+                at(16, 0, 0)
+            )
+            .unwrap(),
+            ManualOutcome::NoQuote,
+            "收盘后不生成工单"
+        );
+        // 午休:行情看起来新鲜也不行
+        assert_eq!(
+            submit_manual(
+                &mut c,
+                1,
+                &o,
+                Some(&quote(10.0, at(12, 0, 0))),
+                at(12, 0, 0)
+            )
+            .unwrap(),
+            ManualOutcome::NoQuote,
+            "午休不生成工单"
+        );
+        // 盘中但行情 61 秒前
+        assert_eq!(
+            submit_manual(
+                &mut c,
+                1,
+                &o,
+                Some(&quote(10.0, at(10, 0, 0))),
+                at(10, 1, 1)
+            )
+            .unwrap(),
+            ManualOutcome::NoQuote,
+            "陈旧行情不生成工单"
+        );
+        // 周六(2026-09-26)
+        let sat = NaiveDate::from_ymd_opt(2026, 9, 26)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        assert_eq!(
+            submit_manual(&mut c, 1, &o, Some(&quote(10.0, sat)), sat).unwrap(),
+            ManualOutcome::NoQuote,
+            "周末不生成工单"
+        );
+        // 边界:盘中、恰好 60 秒 → 放行
+        assert!(matches!(
+            submit_manual(
+                &mut c,
+                1,
+                &o,
+                Some(&quote(10.0, at(14, 59, 0))),
+                at(15, 0, 0)
+            )
+            .unwrap(),
+            ManualOutcome::Ticketed { .. }
+        ));
+    }
+
     #[test]
     fn manual_goes_through_the_gate() {
         let mut c = db();
@@ -1419,9 +1504,38 @@ mod tests {
                 qty: Some(0),
                 ..ok.clone()
             },
+            ManualOrder {
+                side: Direction::Sell,
+                amount: None,
+                qty: Some(1_000_000_001),
+                ..ok.clone()
+            },
+            ManualOrder {
+                code: "830799".into(),
+                ..ok.clone()
+            },
+            ManualOrder {
+                code: "920819".into(),
+                ..ok.clone()
+            },
         ];
         for b in bad {
             assert!(validate_manual(&b).is_err(), "{b:?}");
         }
+        let max_sell = ManualOrder {
+            side: Direction::Sell,
+            amount: None,
+            qty: Some(1_000_000_000),
+            ..ok.clone()
+        };
+        assert!(validate_manual(&max_sell).is_ok(), "股数上限含端点");
+        let bse = ManualOrder {
+            code: "830799".into(),
+            ..ok.clone()
+        };
+        assert_eq!(
+            validate_manual(&bse).unwrap_err().to_string(),
+            "暂不支持该市场(仅沪深)"
+        );
     }
 }
