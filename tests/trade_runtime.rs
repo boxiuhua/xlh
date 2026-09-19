@@ -141,3 +141,137 @@ fn monitor_down_alert_goes_to_position_holders_only() {
     );
     assert_eq!(rec.0.borrow()[0].0, 2);
 }
+
+/// 以 `last` 为最后一天、往前连续工作日的 K 线(开高低收同价)。
+fn bars_until(last: NaiveDate, prices: &[f64]) -> Vec<xlh::stock::data::StockBar> {
+    use chrono::Datelike;
+    let mut dates = Vec::new();
+    let mut day = last;
+    while dates.len() < prices.len() {
+        if !matches!(day.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) {
+            dates.push(day);
+        }
+        day -= chrono::Duration::days(1);
+    }
+    dates.reverse();
+    dates
+        .into_iter()
+        .zip(prices)
+        .map(|(date, p)| xlh::stock::data::StockBar {
+            date,
+            open: *p,
+            high: *p,
+            low: *p,
+            close: *p,
+            volume: 1.0,
+            adj_close: *p,
+        })
+        .collect()
+}
+
+/// 观察期的 trend 策略,oos 基线里每只股票都带实盘参数(短 5 / 长 20 / 每次 10 万)。
+fn running_trend_strategy(c: &Connection, pool: &[&str]) -> i64 {
+    use xlh::trade::admission::{judge::Verdict, state, walk_forward};
+    let id = store::create_strategy(
+        c,
+        &xlh::trade::model::NewStrategy {
+            user_id: 1,
+            name: "趋势".into(),
+            kind: "trend".into(),
+            grid_toml: "short_window = [5]\nlong_window = [20]\namount = [100000.0]".into(),
+            pool: pool.iter().map(|s| s.to_string()).collect(),
+        },
+        at(1, 9, 0),
+    )
+    .unwrap();
+    state::submit_for_backtest(c, 1, id, at(1, 9, 1)).unwrap();
+    let metrics = walk_forward::aggregate(
+        pool.iter()
+            .map(|code| walk_forward::CodeMetrics {
+                code: code.to_string(),
+                windows: 1,
+                oos_return: 0.1,
+                oos_annualized: 0.1,
+                oos_sharpe: 1.0,
+                oos_max_drawdown: 0.1,
+                oos_trades: 10,
+                is_sharpe: 1.0,
+                years: 1.0,
+                data_years: 4.0,
+                buy_hold_return: 0.0,
+                trade_baseline: Default::default(),
+                window_details: Vec::new(),
+                data_from: None,
+                data_to: None,
+                live_params: Some(toml::Value::Table(
+                    "short_window = 5\nlong_window = 20\namount = 100000.0"
+                        .parse()
+                        .unwrap(),
+                )),
+            })
+            .collect(),
+    );
+    let verdict = Verdict {
+        passed: true,
+        reasons: Vec::new(),
+    };
+    let day = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    state::apply_backtest_verdict(c, 1, id, &metrics, &verdict, day, day, at(1, 9, 2)).unwrap();
+    assert_eq!(
+        store::get_strategy(c, 1, id).unwrap().unwrap().status,
+        xlh::trade::model::StrategyStatus::Paper
+    );
+    id
+}
+
+#[test]
+fn daily_strategy_signal_flows_from_close_to_paper_fill() {
+    use xlh::trade::admission::walk_forward::WalkForwardCfg;
+    use xlh::trade::config::SignalCfg;
+    use xlh::trade::daily_signals;
+
+    // 1. 内存库 + 实盘资金
+    let mut c = Connection::open_in_memory().unwrap();
+    store::migrate(&c).unwrap();
+    store::set_capital(&c, 1, Account::Real, 1_000_000.0, at(1, 9, 0)).unwrap();
+    // 2. 观察期 trend 策略,oos 基线带实盘参数
+    let sid = running_trend_strategy(&c, &["600000"]);
+    // 3. 周五收盘后计算:最后一根 K 线(周五)金叉
+    let friday = NaiveDate::from_ymd_opt(2026, 9, 18).unwrap();
+    let mut prices: Vec<f64> = (0..80).map(|i| 20.0 - i as f64 * 0.1).collect();
+    prices.extend([12.2, 12.3, 12.4, 12.5, 25.0]);
+    let r = daily_signals::compute(&c, at(18, 15, 30), &WalkForwardCfg::default(), |_| {
+        Ok(bars_until(friday, &prices))
+    })
+    .unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.planned, 1);
+    // 4. 下周一开盘窗口内发出,报价为周一 09:25 的集合竞价价
+    let quotes = Fixed(vec![Quote {
+        code: "600000".into(),
+        price: 25.0,
+        limit_up: Some(27.5),
+        limit_down: Some(22.5),
+        ts: at(21, 9, 25),
+    }]);
+    let r = daily_signals::emit_due(&mut c, &quotes, &SignalCfg::default(), at(21, 9, 26)).unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(r.submitted, 1);
+    assert!(r.new_real_tickets.is_empty(), "观察期只进模拟盘");
+    // 5. 模拟盘即时成交,且观察期统计能数到这笔成交
+    let paper_buys: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM trade_fills WHERE account = 'paper' AND side = 'buy' AND code = '600000'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(paper_buys, 1);
+    let fills =
+        xlh::trade::admission::stats::strategy_fills(&c, 1, sid, Account::Paper, None).unwrap();
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].side, xlh::event::Direction::Buy);
+    // 模拟盘按开盘报价加滑点成交,落在周一
+    assert!((25.0..25.5).contains(&fills[0].price), "{}", fills[0].price);
+    assert_eq!(fills[0].filled_at.date(), at(21, 9, 26).date());
+}

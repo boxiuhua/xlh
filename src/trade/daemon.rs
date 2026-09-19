@@ -195,6 +195,7 @@ fn run_loop(
     let mut backoff = Backoff::default();
     let mut last_cancel: Option<NaiveDate> = None;
     let mut last_remind: Option<NaiveDate> = None;
+    let mut last_probe: Option<NaiveDate> = None;
 
     loop {
         // 心跳、异动转发、每日任务用这个较早的时刻;真正拉报价前再重新取一次(见下),
@@ -240,6 +241,40 @@ fn run_loop(
                     }
                     Err(e) => eprintln!("[trade] 撤销未回填工单失败: {e:#}"),
                 }
+            }
+
+            // 交易日历自证:每个工作日开盘后探一次,直到得出结论(见 trade::calendar)。
+            if due_daily(now, 9, 31, last_probe) {
+                match crate::trade::calendar::probe(&conn, &source, now) {
+                    Ok(Some(open)) => {
+                        last_probe = Some(now.date());
+                        if !open {
+                            println!("[trade] {} 休市(开盘后行情仍非今日)", now.date());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("[trade] 交易日历自证失败: {e:#}"),
+                }
+            }
+
+            // 日线策略信号:窗口内每轮都尝试(无可发计划时只是一次本地查询)。
+            match crate::trade::daily_signals::emit_due(&mut conn, &source, &cfg.signals, now) {
+                Ok(r) => {
+                    notify_new_tickets(&conn, notifier.as_ref(), &r.new_real_tickets);
+                    for e in &r.errors {
+                        eprintln!("[trade] 日线信号发出: {e}");
+                    }
+                    if r.submitted + r.dropped > 0 {
+                        println!(
+                            "[trade] 日线信号:发出 {} 条、作废 {} 条",
+                            r.submitted, r.dropped
+                        );
+                    }
+                }
+                Err(e) => eprintln!("[trade] 日线信号发出失败: {e:#}"),
+            }
+            if let Err(e) = crate::trade::daily_signals::drop_unsent(&conn, &cfg.signals, now) {
+                eprintln!("[trade] 作废过期信号计划失败: {e:#}");
             }
             // 只在 15:05–16:00 窗口内跑;过了 16:00 才轮到的话说明这一轮严重滞后,
             // 「即将撤单」提醒已无意义,不该在深夜甚至次日凌晨补发。

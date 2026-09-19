@@ -5,13 +5,16 @@ use crate::stock::data::StockBar;
 use crate::trade::admission::walk_forward::{PoolMetrics, WalkForwardCfg};
 use crate::trade::calendar;
 use crate::trade::config::SignalCfg;
-use crate::trade::model::StrategyStatus;
+use crate::trade::model::{AccountScope, NewSignal, Quote, SignalSource, StrategyStatus};
 use crate::trade::plans::{self, NewPlan, PlanStatus};
+use crate::trade::quotes::QuoteSource;
+use crate::trade::service::{submit_signal, SubmitContext, SubmitOutcome};
 use crate::trade::store;
 use crate::trade::strategy_signal;
 use anyhow::{Context, Result};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use rusqlite::Connection;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ComputeReport {
@@ -185,6 +188,142 @@ where
         st.done_for = Some(now.date());
     }
     Some(r)
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EmitReport {
+    pub submitted: usize,
+    pub dropped: usize,
+    /// 无今日报价,留待下一轮
+    pub waiting: usize,
+    /// 本轮新建的实盘工单,供推送
+    pub new_real_tickets: Vec<i64>,
+    pub errors: Vec<String>,
+}
+
+fn in_emit_window(now: NaiveDateTime, cfg: &SignalCfg) -> bool {
+    let t = now.time();
+    t >= hm(cfg.emit_hour, cfg.emit_minute) && t < hm(cfg.emit_end_hour, cfg.emit_end_minute)
+}
+
+/// 开盘窗口内把到期计划按今日报价提交为信号(设计裁决 7)。
+/// 只要今天时间戳的报价;没有就留到下一轮,由 `drop_unsent` 在窗口结束后兜底。
+pub fn emit_due(
+    conn: &mut Connection,
+    source: &dyn QuoteSource,
+    cfg: &SignalCfg,
+    now: NaiveDateTime,
+) -> Result<EmitReport> {
+    let today = now.date();
+    let mut r = EmitReport::default();
+    if !cfg.enabled
+        || crate::stock::realtime::calendar::is_weekend(today)
+        || !in_emit_window(now, cfg)
+        || calendar::day_status(conn, today)? == Some(false)
+    {
+        return Ok(r);
+    }
+    let mut live = Vec::new();
+    for p in plans::due_plans(conn, today)? {
+        let why = match store::get_strategy(conn, p.user_id, p.strategy_id)? {
+            None => Some("策略已删除"),
+            Some(s) if s.version_hash != p.version_hash => Some("策略定义已变更"),
+            Some(s) if !matches!(s.status, StrategyStatus::Paper | StrategyStatus::Admitted) => {
+                Some("策略已不在观察期 / 已准入状态")
+            }
+            Some(_) => None,
+        };
+        match why {
+            Some(note) => {
+                if plans::settle_plan(conn, p.id, PlanStatus::Dropped, note, now)? {
+                    r.dropped += 1;
+                }
+            }
+            None => live.push(p),
+        }
+    }
+    if live.is_empty() {
+        return Ok(r);
+    }
+    let mut codes: Vec<String> = live.iter().map(|p| p.code.clone()).collect();
+    codes.sort();
+    codes.dedup();
+    let fresh: Vec<Quote> = source
+        .fetch(&codes)?
+        .into_iter()
+        .filter(|q| q.ts.date() == today)
+        .collect();
+    store::upsert_quotes(conn, &fresh, now)?;
+    let quotes: HashMap<&str, &Quote> = fresh.iter().map(|q| (q.code.as_str(), q)).collect();
+    for p in live {
+        let Some(q) = quotes.get(p.code.as_str()) else {
+            r.waiting += 1;
+            continue;
+        };
+        let Some(side) = p.side else { continue };
+        let sig = NewSignal {
+            user_id: p.user_id,
+            source: SignalSource::Strategy,
+            strategy_id: Some(p.strategy_id),
+            code: p.code.clone(),
+            name: None,
+            side,
+            scope: AccountScope::Both,
+            ref_price: q.price,
+            reason: p.reason.clone(),
+            ai_note: None,
+            dedup_key: format!("strategy-{}-{}-{}", p.strategy_id, p.code, p.basis_date),
+            suggest_cash: p.cash,
+            suggest_qty: None,
+        };
+        // 单个计划失败(如写锁超时)不影响其余计划;计划保持 planned,下一轮重试
+        let note = match submit_signal(
+            conn,
+            &sig,
+            &SubmitContext {
+                quote: Some(q),
+                now,
+            },
+        ) {
+            Ok(SubmitOutcome::Ticketed { real_ticket, .. }) => {
+                r.new_real_tickets.extend(real_ticket);
+                "已生成工单".to_string()
+            }
+            Ok(SubmitOutcome::Rejected { reason, .. }) => format!("闸门拒绝: {}", reason.as_str()),
+            Ok(SubmitOutcome::Duplicate) => "信号已存在".to_string(),
+            Err(e) => {
+                r.errors.push(format!("计划 {} 提交失败: {e:#}", p.id));
+                continue;
+            }
+        };
+        if plans::settle_plan(conn, p.id, PlanStatus::Submitted, &note, now)? {
+            r.submitted += 1;
+        }
+    }
+    Ok(r)
+}
+
+/// 已证实开市的日子过了发出窗口仍未发出的计划作废;未证实 / 休市的日子不动(设计裁决 7)。
+pub fn drop_unsent(conn: &Connection, cfg: &SignalCfg, now: NaiveDateTime) -> Result<usize> {
+    let today = now.date();
+    if now.time() < hm(cfg.emit_end_hour, cfg.emit_end_minute)
+        || calendar::day_status(conn, today)? != Some(true)
+    {
+        return Ok(0);
+    }
+    let mut n = 0;
+    for p in plans::due_plans(conn, today)? {
+        if plans::settle_plan(
+            conn,
+            p.id,
+            PlanStatus::Dropped,
+            "开盘窗口内无有效报价,可能停牌",
+            now,
+        )? {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -447,5 +586,140 @@ mod tests {
         .unwrap();
         assert_eq!(r.planned, 1);
         assert_eq!(st.done_for, Some(d(9, 18)));
+    }
+
+    use crate::trade::model::{Account, Quote};
+    use crate::trade::quotes::QuoteSource;
+
+    struct Stub(Vec<Quote>);
+    impl QuoteSource for Stub {
+        fn fetch(&self, codes: &[String]) -> Result<Vec<Quote>> {
+            Ok(self
+                .0
+                .iter()
+                .filter(|q| codes.contains(&q.code))
+                .cloned()
+                .collect())
+        }
+    }
+    fn q(code: &str, price: f64, ts: NaiveDateTime) -> Quote {
+        Quote {
+            code: code.into(),
+            price,
+            limit_up: Some(price * 1.1),
+            limit_down: Some(price * 0.9),
+            ts,
+        }
+    }
+
+    /// 周五收盘算出 600000 的买入计划,返回策略 id。
+    fn planned_buy(c: &Connection) -> i64 {
+        store::set_capital(c, 1, Account::Real, 1_000_000.0, at(9, 1, 9, 0)).unwrap();
+        let sid = running_trend_strategy(c, &["600000"], &["600000"]);
+        let r = compute(c, at(9, 18, 15, 30), &WalkForwardCfg::default(), |_| {
+            Ok(golden_cross(d(9, 18)))
+        })
+        .unwrap();
+        assert_eq!(r.planned, 1);
+        sid
+    }
+
+    #[test]
+    fn emit_waits_for_the_window_and_fresh_quotes_then_submits_once() {
+        let mut c = db();
+        planned_buy(&c);
+        let cfg = SignalCfg::default();
+        let fresh = Stub(vec![q("600000", 25.0, at(9, 21, 9, 25))]);
+        assert_eq!(
+            emit_due(&mut c, &fresh, &cfg, at(9, 21, 9, 20)).unwrap(),
+            EmitReport::default(),
+            "窗口前"
+        );
+        let stale = Stub(vec![q("600000", 25.0, at(9, 18, 15, 0))]);
+        let r = emit_due(&mut c, &stale, &cfg, at(9, 21, 9, 25)).unwrap();
+        assert_eq!((r.submitted, r.waiting), (0, 1), "报价仍是上周五的");
+        let r = emit_due(&mut c, &fresh, &cfg, at(9, 21, 9, 26)).unwrap();
+        assert_eq!(r.submitted, 1);
+        assert!(r.new_real_tickets.is_empty(), "观察期只进模拟盘");
+        let paper: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM trade_tickets WHERE account = 'paper'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(paper, 1);
+        let r = emit_due(&mut c, &fresh, &cfg, at(9, 21, 9, 27)).unwrap();
+        assert_eq!(r, EmitReport::default(), "计划已结,不重复发");
+    }
+
+    #[test]
+    fn admitted_strategy_emits_a_real_ticket() {
+        let mut c = db();
+        let sid = planned_buy(&c);
+        state::update_status(
+            &c,
+            1,
+            sid,
+            StrategyStatus::Paper,
+            StrategyStatus::Admitted,
+            "x",
+            at(9, 18, 16, 0),
+        )
+        .unwrap();
+        let fresh = Stub(vec![q("600000", 25.0, at(9, 21, 9, 25))]);
+        let r = emit_due(&mut c, &fresh, &SignalCfg::default(), at(9, 21, 9, 26)).unwrap();
+        assert_eq!(r.new_real_tickets.len(), 1);
+    }
+
+    #[test]
+    fn changed_or_stopped_strategy_drops_the_plan_without_fetching() {
+        let mut c = db();
+        let sid = planned_buy(&c);
+        state::update_status(
+            &c,
+            1,
+            sid,
+            StrategyStatus::Paper,
+            StrategyStatus::Failed,
+            "x",
+            at(9, 18, 16, 0),
+        )
+        .unwrap();
+        struct Boom;
+        impl QuoteSource for Boom {
+            fn fetch(&self, _: &[String]) -> Result<Vec<Quote>> {
+                panic!("无可发计划时不应拉报价")
+            }
+        }
+        let r = emit_due(&mut c, &Boom, &SignalCfg::default(), at(9, 21, 9, 26)).unwrap();
+        assert_eq!(r.dropped, 1);
+        assert!(plans::due_plans(&c, d(9, 21)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn holidays_keep_plans_and_confirmed_open_days_drop_leftovers_after_the_window() {
+        let mut c = db();
+        planned_buy(&c);
+        let cfg = SignalCfg::default();
+        // 周一被证实休市:不发、不丢
+        crate::trade::calendar::mark_day(&c, d(9, 21), false, at(9, 21, 9, 31)).unwrap();
+        let fresh_mon = Stub(vec![q("600000", 25.0, at(9, 21, 9, 25))]);
+        assert_eq!(
+            emit_due(&mut c, &fresh_mon, &cfg, at(9, 21, 9, 40)).unwrap(),
+            EmitReport::default()
+        );
+        assert_eq!(drop_unsent(&c, &cfg, at(9, 21, 11, 0)).unwrap(), 0);
+        // 周二开市但停牌(无报价),窗口过后作废
+        crate::trade::calendar::mark_day(&c, d(9, 22), true, at(9, 22, 9, 31)).unwrap();
+        let r = emit_due(&mut c, &Stub(Vec::new()), &cfg, at(9, 22, 9, 40)).unwrap();
+        assert_eq!(r.waiting, 1);
+        assert_eq!(
+            drop_unsent(&c, &cfg, at(9, 22, 10, 0)).unwrap(),
+            0,
+            "窗口未结束"
+        );
+        assert_eq!(drop_unsent(&c, &cfg, at(9, 22, 10, 30)).unwrap(), 1);
+        assert!(plans::due_plans(&c, d(9, 22)).unwrap().is_empty());
     }
 }
