@@ -79,7 +79,7 @@ fn diagnose_blocking(q: DiagnoseQuery) -> Result<StockDiagnosis> {
     let end = chrono::Local::now().date_naive();
     let start = end - chrono::Duration::days(800);
     let secid = data::resolve_secid(&q.code)?;
-    let fetched = cache::load_resolved(&secid, stock_cache(), start, end)
+    let fetched = cache::load_resolved(&secid, stock_cache(), start, end, None)
         .map_err(|e| anyhow!("加载行情失败: {e}"))?;
     let now = chrono::Utc::now();
     let bars = crate::stock::forecast_log::completed_bars(&fetched, now);

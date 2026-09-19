@@ -468,8 +468,10 @@ fn classify_one(code: &str, today: NaiveDate) -> Horizon {
     movers::classify(pe_pct, &trend, LOW_PE_PCT)
 }
 
-/// 收盘回填结局并汇总。由日线缓存算，**不依赖 ticks** ——
-/// 故 raw 数据 10 天后删除不影响回溯，亦可随时补算新口径（如 T+20）。
+/// 收盘回填结局并汇总。以库内 15:00–15:05 收盘快照为准（同源）；
+/// 已结束的交易日缺快照时回退到未复权日 K 收盘价（见 `outcomes::fill_missing`）。
+/// 只看最近 30 个自然日的信号、最近 10 个自然日的回退目标日，避免停牌股
+/// 每天收盘都在单线程推送循环里联网重试；更早的交给 CLI `repair-outcomes`。
 pub fn close_summary(conn: &Connection, day: NaiveDate) -> Result<String> {
     backfill_close(conn, day)?;
     let rows = store::signals_on(conn, day)?;
@@ -478,7 +480,25 @@ pub fn close_summary(conn: &Connection, day: NaiveDate) -> Result<String> {
 
 fn backfill_close(conn: &Connection, day: NaiveDate) -> Result<()> {
     super::outcomes::repair(conn, day)?;
+    super::outcomes::fill_missing(conn, day, daily_raw_closes)?;
     Ok(())
+}
+
+/// 未复权日收盘价，取自与 `classify_one` 同一个 `.cache/stock` 日 K 缓存。
+///
+/// 只会被问到已结束的交易日（`end` < 今天）；要求缓存写于 `end` 次日零点之后，
+/// 免得把某天盘中写入的、带着未走完那根 K 的缓存当收盘价用。取不到返回 None。
+fn daily_raw_closes(code: &str, start: NaiveDate, end: NaiveDate) -> Option<Vec<(NaiveDate, f64)>> {
+    let fresh_after = end.succ_opt()?.and_hms_opt(0, 0, 0)?;
+    let bars = crate::stock::data::cache::load_or_fetch_fresh(
+        code,
+        &std::path::Path::new(".cache").join("stock"),
+        start,
+        end,
+        fresh_after,
+    )
+    .ok()?;
+    Some(bars.iter().map(|b| (b.date, b.close)).collect())
 }
 
 /// 现在是否到了收盘汇总时刻（15:00 之后的第一个 tick 循环）。

@@ -21,7 +21,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 使用库内收盘快照修复收益标签；原值及依据永久写入审计表
+    /// 使用库内收盘快照全量核对并修复收益标签（含已填值）；原值及依据永久写入审计表
     RepairOutcomes {
         #[arg(long)]
         db: PathBuf,
@@ -122,7 +122,7 @@ fn main() -> Result<()> {
             anyhow::ensure!(db.is_file(), "数据库不存在: {}", db.display());
             let conn = xlh::stock::realtime::store::open(&db)?;
             let day = chrono::NaiveDate::parse_from_str(&through, "%Y-%m-%d")?;
-            let report = xlh::stock::realtime::outcomes::repair(&conn, day)?;
+            let report = xlh::stock::realtime::outcomes::repair_all(&conn, day)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }

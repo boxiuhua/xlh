@@ -99,14 +99,36 @@ fn load(
     fresh_after: Option<NaiveDateTime>,
 ) -> Result<Vec<StockBar>> {
     let secid = super::resolve_secid(input)?;
-    load_resolved(&secid, cache_dir, start, end)
+    load_resolved(&secid, cache_dir, start, end, fresh_after)
 }
 
+/// 已解析好 secid 的加载入口(美股等需在线解析的代码由调用方先解析)。
+/// `fresh_after` 语义同 `load_or_fetch_fresh`;传 `None` 等同 `load_or_fetch`。
 pub fn load_resolved(
     secid: &super::secid::Secid,
     cache_dir: &Path,
     start: NaiveDate,
     end: NaiveDate,
+    fresh_after: Option<NaiveDateTime>,
+) -> Result<Vec<StockBar>> {
+    load_resolved_with(
+        secid,
+        cache_dir,
+        start,
+        end,
+        fresh_after,
+        super::kline::fetch,
+    )
+}
+
+/// `load_resolved` 的实现,抓取函数可注入(测试不联网)。
+fn load_resolved_with(
+    secid: &super::secid::Secid,
+    cache_dir: &Path,
+    start: NaiveDate,
+    end: NaiveDate,
+    fresh_after: Option<NaiveDateTime>,
+    fetch: impl FnOnce(&super::secid::Secid) -> Result<Vec<StockBar>>,
 ) -> Result<Vec<StockBar>> {
     let path = cache_dir.join(format!("{}.csv", secid.cache_key()));
     let cached = if path.exists() {
@@ -119,14 +141,10 @@ pub fn load_resolved(
     let mut bars = match cached {
         Some(c) => c,
         None => {
-            let fresh = super::kline::fetch(secid)?;
+            let fresh = fetch(secid)?;
             write_csv(&path, &fresh)?;
             fresh
         }
-    } else {
-        let fresh = super::kline::fetch(&secid)?;
-        write_csv(&path, &fresh)?;
-        fresh
     };
     bars.retain(|b| b.date >= start && b.date <= end);
     bars.sort_by_key(|b| b.date);
@@ -180,6 +198,66 @@ mod tests {
         assert!(!cache_usable(false, Some(t(15, 30)), Some(t(15, 5))));
         // 读不出修改时间:当作不新鲜,宁可重抓
         assert!(!cache_usable(true, None, Some(t(15, 5))));
+    }
+
+    fn tmp_cache_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("xlh_stock_cache_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn load_resolved_refetches_stale_cache_when_fresh_after_is_later_than_mtime() {
+        let dir = tmp_cache_dir("stale");
+        let secid = super::super::secid::Secid {
+            market: 1,
+            code: "600000".into(),
+        };
+        let path = dir.join(format!("{}.csv", secid.cache_key()));
+        // 缓存覆盖窗口,但写入时刻早于 fresh_after(模拟盘中写入、收盘后要求新鲜)
+        write_csv(&path, &[bar(d(2024, 1, 2), 10.0), bar(d(2024, 1, 3), 11.0)]).unwrap();
+        let fresh_after = modified_at(&path).unwrap() + chrono::Duration::hours(1);
+        let mut fetched = false;
+        let got = load_resolved_with(
+            &secid,
+            &dir,
+            d(2024, 1, 2),
+            d(2024, 1, 3),
+            Some(fresh_after),
+            |_| {
+                fetched = true;
+                Ok(vec![bar(d(2024, 1, 2), 10.0), bar(d(2024, 1, 3), 12.5)])
+            },
+        )
+        .unwrap();
+        assert!(fetched, "陈旧缓存应触发重抓");
+        assert!((got[1].close - 12.5).abs() < 1e-9);
+        // 重抓结果已写回缓存
+        assert!((read_csv(&path).unwrap()[1].close - 12.5).abs() < 1e-9);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_resolved_uses_covering_cache_when_no_freshness_required_or_fresh() {
+        let dir = tmp_cache_dir("fresh");
+        let secid = super::super::secid::Secid {
+            market: 0,
+            code: "000001".into(),
+        };
+        let path = dir.join(format!("{}.csv", secid.cache_key()));
+        write_csv(&path, &[bar(d(2024, 1, 2), 10.0), bar(d(2024, 1, 3), 11.0)]).unwrap();
+        let mtime = modified_at(&path).unwrap();
+        for fa in [None, Some(mtime - chrono::Duration::hours(1))] {
+            let got = load_resolved_with(&secid, &dir, d(2024, 1, 2), d(2024, 1, 3), fa, |_| {
+                panic!("缓存可用时不应联网抓取")
+            })
+            .unwrap();
+            assert_eq!(got.len(), 2);
+            assert!((got[1].close - 11.0).abs() < 1e-9);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -351,13 +351,22 @@ pub fn verify_default(secid: &Secid, bars: &[StockBar]) -> Result<usize> {
 }
 
 /// Web maintenance loop calls this without generating any new predictions.
-/// Each downloaded batch is retained as evidence; missing network data stays pending.
+/// The latest downloaded batch per symbol is retained as evidence (older ones are
+/// pruned so the table stays bounded); missing network data stays pending.
 pub fn refresh_pending() -> Result<usize> {
     let path = default_path();
     if !path.exists() {
         return Ok(0);
     }
     let mut conn = open(&path)?;
+    refresh_pending_with(&mut conn, super::data::kline::fetch, Utc::now())
+}
+
+fn refresh_pending_with(
+    conn: &mut Connection,
+    mut fetch: impl FnMut(&Secid) -> Result<Vec<StockBar>>,
+    now: DateTime<Utc>,
+) -> Result<usize> {
     let symbols = {
         let mut stmt=conn.prepare("SELECT DISTINCT i.symbol FROM forecast_inputs i JOIN forecast_records r ON r.input_id=i.id WHERE r.status='pending'")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -369,19 +378,33 @@ pub fn refresh_pending() -> Result<usize> {
         let Some((market, code)) = symbol.split_once('.') else {
             continue;
         };
+        // 库里一条坏符号不能拖垮其余股票的核验:记错误,继续下一只
+        let market = match market.parse() {
+            Ok(m) => m,
+            Err(e) => {
+                errors.push(format!("{symbol}: 市场号无效: {e}"));
+                continue;
+            }
+        };
         let secid = Secid {
-            market: market.parse()?,
+            market,
             code: code.into(),
         };
         let attempt = (|| -> Result<usize> {
-            let bars = super::data::kline::fetch(&secid)?;
-            let now = Utc::now();
+            let bars = fetch(&secid)?;
             let snapshot=bars.iter().map(|b|serde_json::json!({"date":b.date,"open":b.open,"high":b.high,"low":b.low,"close":b.close,"volume":b.volume,"adj_close":b.adj_close})).collect::<Vec<_>>();
-            conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
                 "INSERT INTO forecast_price_batches(symbol,fetched_at,bars_json) VALUES (?1,?2,?3)",
                 params![symbol, now.to_rfc3339(), serde_json::to_string(&snapshot)?],
             )?;
-            verify(&mut conn, &secid, &bars, now)
+            // 只留本股最新一批:每 6 小时整段日线写一次,不清理会无限增长
+            tx.execute(
+                "DELETE FROM forecast_price_batches WHERE symbol=?1 AND id<>?2",
+                params![symbol, tx.last_insert_rowid()],
+            )?;
+            tx.commit()?;
+            verify(conn, &secid, &bars, now)
         })();
         match attempt {
             Ok(n) => settled += n,
@@ -394,4 +417,110 @@ pub fn refresh_pending() -> Result<usize> {
         errors.join("；")
     );
     Ok(settled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn day(i: i64) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2025, 1, 1).unwrap() + chrono::Duration::days(i)
+    }
+    fn at(i: i64) -> DateTime<Utc> {
+        day(i).and_hms_opt(12, 0, 0).unwrap().and_utc()
+    }
+    fn bars(n: usize) -> Vec<StockBar> {
+        (0..n)
+            .map(|i| {
+                let p = 100.0 + i as f64;
+                StockBar {
+                    date: day(i as i64),
+                    open: p,
+                    high: p,
+                    low: p,
+                    close: p,
+                    adj_close: p * 2.0,
+                    volume: 10.0,
+                }
+            })
+            .collect()
+    }
+    fn secid(market: u16) -> Secid {
+        Secid {
+            market,
+            code: "600519".into(),
+        }
+    }
+    fn db_with_pending(secids: &[Secid]) -> Connection {
+        let mut c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        let b = bars(80);
+        let f = crate::stock::forecast::forecast(&b).unwrap();
+        for s in secids {
+            record(&mut c, s, &b, &f, at(80)).unwrap();
+        }
+        c
+    }
+    fn batches(c: &Connection) -> Vec<(String, String)> {
+        c.prepare("SELECT symbol,fetched_at FROM forecast_price_batches ORDER BY symbol,id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn refresh_keeps_only_the_latest_price_batch_per_symbol() {
+        let mut c = db_with_pending(&[secid(1), secid(0)]);
+        // 两轮刷新都还结算不了(日线不够 5 日),每轮各写一批
+        for i in [81, 82] {
+            refresh_pending_with(&mut c, |_| Ok(bars(82)), at(i)).unwrap();
+        }
+        assert_eq!(
+            batches(&c),
+            vec![
+                ("0.600519".to_string(), at(82).to_rfc3339()),
+                ("1.600519".to_string(), at(82).to_rfc3339()),
+            ]
+        );
+    }
+
+    #[test]
+    fn bad_stored_symbol_is_reported_without_aborting_the_others() {
+        let mut c = db_with_pending(&[secid(1)]);
+        // 库里混进一条市场号不合法的记录
+        c.execute(
+            "UPDATE forecast_inputs SET symbol='x9.000001' WHERE id=1",
+            [],
+        )
+        .unwrap();
+        record(
+            &mut c,
+            &secid(1),
+            &bars(80),
+            &crate::stock::forecast::forecast(&bars(80)).unwrap(),
+            at(80),
+        )
+        .unwrap();
+        let err = refresh_pending_with(&mut c, |_| Ok(bars(86)), at(86))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("x9.000001"), "{err}");
+        assert!(err.contains("已核验1条"), "{err}");
+        // 正常的那只照常抓取、结算
+        assert_eq!(
+            batches(&c),
+            vec![("1.600519".to_string(), at(86).to_rfc3339())]
+        );
+        let settled: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM forecast_records r JOIN forecast_inputs i ON i.id=r.input_id
+                 WHERE i.symbol='1.600519' AND r.status<>'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(settled, 1);
+    }
 }
